@@ -1,0 +1,12 @@
+# Rust build output (compiled binaries live here — never commit them)
+/target
+**/target/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Stray compiled artifacts / captured data (belt-and-braces: keep binaries out)
+*.o
+*.bin
+*.csv

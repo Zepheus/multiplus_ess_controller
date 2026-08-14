@@ -1,0 +1,19 @@
+[package]
+name = "multiplus_ess_controller"
+version = "0.1.0"
+edition = "2021"
+description = "Mode-3 ESS controller for Victron Venus GX — runs our own grid-setpoint loop"
+
+# std-only, zero dependencies: guarantees a clean static musl cross-compile.
+# dbus I/O is done via the device's own `dbus`/`dbus-send` CLIs (see src/dbus.rs).
+
+[[bin]]
+name = "multiplus_ess_controller"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"     # small binary
+lto = true
+codegen-units = 1
+panic = "abort"     # a panic must not leave us mid-write; abort -> watchdog -> passthru
+strip = true
