@@ -299,6 +299,10 @@ fn main() {
     let mut shore = shore::ShoreLimiter::new(1);
     let mut pv = pv::PvLimiter::new(&bus);
     let mut socguard = socguard::SocGuard::new(&bus);
+    // The grid-meter guard's grace/staleness counters are in 2.5 s presence-ticks, so
+    // run it at that cadence and cache its decision between ticks. (Review Finding 3.)
+    let mut gm_cached = gridmeter.tick(&bus);
+    let mut gm_next = Instant::now() + gridmeter::PRESENCE_TICK;
 
     // Record original mode so we can always restore it.
     let orig_mode = bus.get_f64(SETTINGS, P_HUB4MODE).unwrap_or(1.0) as i32;
@@ -401,7 +405,14 @@ fn main() {
 
         // 1. Effective target: DESS scheduled-setpoint override + PV feed-forward.
         let dess_out = dess.tick(&bus);
-        let pv_out = pv.tick(&bus, pv::PvContext::default());
+        // pv.tick() can write Ac/PowerLimit to real PV inverters — only let it actuate
+        // when WE own control in live mode; otherwise use the inert stub so shadow (and
+        // handed-back live) stay strictly read-only. (Review Finding 1.)
+        let pv_out = if args.live && owner_us {
+            pv.tick(&bus, pv::PvContext::default())
+        } else {
+            pv::PvOut::STUB
+        };
         let target = dess_out.target(s.target) + pv_out.pv_offset_w;
 
         // 2. Control law (the integral fix), clamped to the live battery bounds.
@@ -429,13 +440,25 @@ fn main() {
             cmd = cmd.min(0.0);
         }
 
-        // 5. Generator gating (grid = no-op), shore limit (dormant here), meter guard.
+        // 5. Generator gating + genset back-feed protection.
         let gen = generator.tick(&bus, generator::ForceChargeCtx::default());
-        let gmg = gridmeter.tick(&bus);
+        if gen.disable_export || feed.force_flat() {
+            // Never export/discharge toward a genset, nor in feed-in force-flat mode
+            // (covers degraded firmware without TPIMFI reinterpretation). (Finding 2.)
+            cmd = cmd.max(0.0);
+        }
+
+        // Grid-meter guard at its native 2.5 s cadence; reuse the cached decision between.
+        if now >= gm_next {
+            gm_cached = gridmeter.tick(&bus);
+            gm_next = now + gridmeter::PRESENCE_TICK;
+        }
+
+        // Shore limit (dormant on this install: AcInputLimit = -1).
         let shore_out = shore.tick_from_bus(
             &bus,
             shore::read_ac_input_limit(&bus),
-            gmg.usable,
+            gm_cached.usable,
             shore::read_always_peak_shave(&bus),
             s.soc > args.min_soc,
             sg.force_charge,
@@ -446,7 +469,7 @@ fn main() {
 
         // --- actuate (live only; gated by ownership AND the meter guard) --------
         let (owner_str, cmd_str) = if owner_us {
-            if args.live && gmg.should_write_setpoint {
+            if args.live && gm_cached.should_write_setpoint {
                 if let Err(e) = bus.set_f64(VEBUS, P_HUB4_SETPOINT, cmd) {
                     eprintln!("setpoint write failed: {e} (Multi will passthru if persistent)");
                 }
@@ -459,7 +482,7 @@ fn main() {
             ("hub4", format!("({cmd:7.0})"))
         };
         // Reference remaining module outputs (publishing layer / diagnostics).
-        let _ = (&gen, pv_out.pv_disable, feed.mode, gmg.alarm_no_grid_meter);
+        let _ = (pv_out.pv_disable, feed.mode, gm_cached.alarm_no_grid_meter);
 
         // Shadow fidelity: how close is our proposal to the stock ESS loop's actual command?
         let note_buf = if !args.live {
