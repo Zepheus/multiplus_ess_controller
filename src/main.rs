@@ -3,7 +3,7 @@
 //! Modes
 //!   shadow (default): READ-ONLY. Reads live dbus, computes what it WOULD command,
 //!                     prints it. Never writes, never changes Hub4Mode.
-//!   live            : Sets Hub4Mode=3 (takes the setpoint loop from the stock hub4 service),
+//!   live            : Sets Hub4Mode=3 (takes the setpoint loop from the stock ESS loop),
 //!                     writes /Hub4/L1/AcPowerSetpoint each tick, restores Hub4Mode
 //!                     on exit. DOUBLE-GATED: requires `--mode live` AND the env var
 //!                     VENUS_ESS_LIVE=I_UNDERSTAND, or it refuses to run.
@@ -11,7 +11,7 @@
 //! Safety envelope (live):
 //!   * We only ever discharge/idle within limits. We NEVER force-charge.
 //!   * Below the SOC floor, or on an explicit recharge state, we hand control back
-//!     to the stock hub4 service (Hub4Mode=1) so SocGuard/sustain/scheduling still work.
+//!     to the stock ESS loop (Hub4Mode=1) so SocGuard/sustain/scheduling still work.
 //!   * Commands are clamped to the configured charge/discharge power limits and a
 //!     hard sanity bound.
 //!   * If the process dies for any reason, it stops writing; the Multi reverts to
@@ -21,6 +21,16 @@
 mod battery_limits;
 mod control;
 mod dbus;
+mod dess;
+mod feedin;
+mod generator;
+mod gridmeter;
+mod hub4_service;
+mod pv;
+mod shore;
+mod socguard;
+#[cfg(test)]
+mod testbus;
 
 use control::{Controller, Kind};
 use dbus::*;
@@ -281,6 +291,15 @@ fn main() {
     let mut broker = battery_limits::BatteryBroker::new(&bus);
     let mut logged_clamp = false;
 
+    // Full-replacement subsystem modules (composed each tick below).
+    let mut dess = dess::Dess::new(&bus);
+    let mut feedin = feedin::FeedIn::new(&bus);
+    let mut generator = generator::Generator::new(&bus);
+    let mut gridmeter = gridmeter::GridMeterGuard::new();
+    let mut shore = shore::ShoreLimiter::new(1);
+    let mut pv = pv::PvLimiter::new(&bus);
+    let mut socguard = socguard::SocGuard::new(&bus);
+
     // Record original mode so we can always restore it.
     let orig_mode = bus.get_f64(SETTINGS, P_HUB4MODE).unwrap_or(1.0) as i32;
 
@@ -363,17 +382,15 @@ fn main() {
                 s.soc, s.state, s.grid
             );
             if !owner_us {
-                ctrl.reset(); // avoid integral windup while the stock hub4 service drives
+                ctrl.reset(); // avoid integral windup while the stock ESS loop drives
             }
         }
 
-        // --- control -----------------------------------------------------------
-        // Live BMS-derived clamp (tracks the battery's dynamic charge/discharge
-        // limits), bounded by the outer envelope. Safety-critical per-tick limit.
+        // --- control: full composed subsystem path -----------------------------
+        // Battery limits -> the per-tick command clamp (design-capacity bounded).
         let tr = broker.tick(&bus);
         let (lo, hi) = battery_limits::clamp_bounds(tr.enforced, env_lo, env_hi);
         if !logged_clamp {
-            // One-time on-device self-check: our published limit vs the stock hub4 service's live value.
             let hub4_live = bus.get_f64("com.victronenergy.hub4", "/MaxDischargePower");
             eprintln!(
                 "BMS clamp: lo={lo:.0}W hi={hi:.0}W  our_published_maxdis={:.0}W hub4_live={hub4_live:?}  (env [{env_lo:.0},{env_hi:.0}])",
@@ -381,20 +398,70 @@ fn main() {
             );
             logged_clamp = true;
         }
-        let cmd = ctrl.update(s.grid, s.reported, s.target, dt, lo, hi);
+
+        // 1. Effective target: DESS scheduled-setpoint override + PV feed-forward.
+        let dess_out = dess.tick(&bus);
+        let pv_out = pv.tick(&bus, pv::PvContext::default());
+        let target = dess_out.target(s.target) + pv_out.pv_offset_w;
+
+        // 2. Control law (the integral fix), clamped to the live battery bounds.
+        let mut cmd = ctrl.update(s.grid, s.reported, target, dt, lo, hi);
+
+        // 3. SocGuard: discharge inhibit, force-charge override, state-6 floor.
+        let sg = socguard.tick(&bus);
+        cmd = cmd.max(-sg.max_discharge_w); // inhibit (INF => no-op; 0 => no discharge)
+        if let Some(fc) = sg.cmd_override {
+            // force charge
+            cmd = if sg.tpimf { cmd.max(0.0).min(fc) } else { fc };
+        }
+        if sg.charge_floor_w > 0.0 {
+            // minimum-charge floor ONLY when set (BL state 6); 0 must not zero discharge.
+            cmd = cmd.max(sg.charge_floor_w);
+        }
+
+        // 4. Feed-in: DC-overvoltage charge-stop tightens the command; flags written live.
+        feedin.set_overrides(feedin::Overrides {
+            feed_in_excess: dess_out.feed_in_excess,
+            force_charge: sg.force_charge,
+        });
+        let feed = feedin.tick(&bus);
+        if feed.block_charge() {
+            cmd = cmd.min(0.0);
+        }
+
+        // 5. Generator gating (grid = no-op), shore limit (dormant here), meter guard.
+        let gen = generator.tick(&bus, generator::ForceChargeCtx::default());
+        let gmg = gridmeter.tick(&bus);
+        let shore_out = shore.tick_from_bus(
+            &bus,
+            shore::read_ac_input_limit(&bus),
+            gmg.usable,
+            shore::read_always_peak_shave(&bus),
+            s.soc > args.min_soc,
+            sg.force_charge,
+        );
+
+        // 6. Final safety clamp (NaN-safe, design capacity).
+        let cmd = control::clamp(cmd, lo, hi);
+
+        // --- actuate (live only; gated by ownership AND the meter guard) --------
         let (owner_str, cmd_str) = if owner_us {
-            if args.live {
+            if args.live && gmg.should_write_setpoint {
                 if let Err(e) = bus.set_f64(VEBUS, P_HUB4_SETPOINT, cmd) {
                     eprintln!("setpoint write failed: {e} (Multi will passthru if persistent)");
                 }
+                let _ = feed.write(&bus);
+                let _ = shore.write(&bus, &shore_out);
             }
             ("US", format!("{cmd:9.1}"))
         } else {
-            ctrl.reset(); // don't wind up the integral while the stock hub4 service drives
+            ctrl.reset();
             ("hub4", format!("({cmd:7.0})"))
         };
+        // Reference remaining module outputs (publishing layer / diagnostics).
+        let _ = (&gen, pv_out.pv_disable, feed.mode, gmg.alarm_no_grid_meter);
 
-        // Shadow fidelity: how close is our proposal to the stock hub4 service's actual command?
+        // Shadow fidelity: how close is our proposal to the stock ESS loop's actual command?
         let note_buf = if !args.live {
             bus.get_f64(VEBUS, P_HUB4_SETPOINT)
                 .map(|actual| format!("actual={actual:.0} Δ={:.0}", actual - cmd))

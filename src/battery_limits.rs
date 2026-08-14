@@ -75,15 +75,6 @@ pub struct BatteryBroker {
     bms_service: Option<String>,
 }
 
-fn nan_min(a: f64, b: f64) -> f64 {
-    match (a.is_finite(), b.is_finite()) {
-        (true, true) => a.min(b),
-        (true, false) => a,
-        (false, true) => b,
-        _ => f64::NAN,
-    }
-}
-
 fn keep_charged(i: &Inputs) -> bool {
     i.bl_state == 9 || i.bl_min_soc > 99.0
 }
@@ -210,7 +201,7 @@ impl BatteryBroker {
                 if i.s_charge_pct <= 100.0 && cp.is_finite() {
                     cp *= i.s_charge_pct.clamp(0.0, 100.0) / 100.0;
                 }
-                nan_min(cp, i.s_max_charge_power)
+                cp.min(i.s_max_charge_power)
             }
         };
 
@@ -260,7 +251,7 @@ impl BatteryBroker {
             }
         };
         if !keep_charged(i) {
-            dp = nan_min(dp, i.s_max_discharge_power);
+            dp = dp.min(i.s_max_discharge_power); // f64::min ignores NaN
         }
         if i.sustain || i.bl_state == 7 {
             dp = 0.0;
@@ -276,7 +267,7 @@ impl BatteryBroker {
     }
 
     /// Read live inputs and recompute limits. Returns both the PUBLISHED limits
-    /// (what the stock hub4 service puts on `/MaxChargePower` / `/MaxDischargePower`, pre-
+    /// (what the stock ESS loop puts on `/MaxChargePower` / `/MaxDischargePower`, pre-
     /// tightening — used for golden regression) and the ENFORCED clamp for the
     /// ControlLoop (discharge additionally zeroed in BatteryLife discharged states
     /// {5,6,8,11,12}). Reads are cheap; call once per tick, not the control hot path.
@@ -481,7 +472,7 @@ mod tests {
         }
     }
 
-    // ---- GOLDEN REPLAY: real captured snapshots vs the stock hub4 service's actual output ----
+    // ---- GOLDEN REPLAY: real captured snapshots vs the stock ESS loop's actual output ----
 
     #[test]
     fn golden_replay_matches_hub4_maxdischarge() {

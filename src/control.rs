@@ -28,7 +28,7 @@ pub fn clamp(x: f64, lo: f64, hi: f64) -> f64 {
 
 #[derive(Clone, Copy, Debug)]
 pub enum Kind {
-    /// Exact reproduction of the stock hub4 service: `command = target - grid + reported`.
+    /// Exact reproduction of the stock ESS loop: `command = target - grid + reported`.
     /// No integral -> leaks (1-k)*load.  Used to prove shadow fidelity.
     Stock,
     /// One-line fix: integrate on our OWN previous command, not `reported`,
