@@ -3,7 +3,7 @@
 //! Modes
 //!   shadow (default): READ-ONLY. Reads live dbus, computes what it WOULD command,
 //!                     prints it. Never writes, never changes Hub4Mode.
-//!   live            : Sets Hub4Mode=3 (takes the setpoint loop from the stock ESS loop),
+//!   live            : Sets Hub4Mode=3 (takes the setpoint loop from the stock hub4 service),
 //!                     writes /Hub4/L1/AcPowerSetpoint each tick, restores Hub4Mode
 //!                     on exit. DOUBLE-GATED: requires `--mode live` AND the env var
 //!                     VENUS_ESS_LIVE=I_UNDERSTAND, or it refuses to run.
@@ -11,13 +11,14 @@
 //! Safety envelope (live):
 //!   * We only ever discharge/idle within limits. We NEVER force-charge.
 //!   * Below the SOC floor, or on an explicit recharge state, we hand control back
-//!     to the stock ESS loop (Hub4Mode=1) so SocGuard/sustain/scheduling still work.
+//!     to the stock hub4 service (Hub4Mode=1) so SocGuard/sustain/scheduling still work.
 //!   * Commands are clamped to the configured charge/discharge power limits and a
 //!     hard sanity bound.
 //!   * If the process dies for any reason, it stops writing; the Multi reverts to
 //!     passthru within 60 s (safe: house runs on grid, battery idle). On clean exit
 //!     or SIGINT/SIGTERM we additionally restore Hub4Mode=1.
 
+mod battery_limits;
 mod control;
 mod dbus;
 
@@ -112,7 +113,13 @@ const STATE_RECHARGE: i64 = 258;
 
 // Hard sanity bound on any command (W), regardless of settings. Two MultiPlus-II
 // 48/5000 in parallel ~ 8 kW continuous; leave margin.
-const HARD_CLAMP_W: f64 = 8000.0;
+// Absolute command clamp = inverter-pair DESIGN CAPACITY with a safety margin.
+// 2x MultiPlus-II 48/5000: continuous output ~3700 W each @ 40 C => 7400 W pair.
+// 5% margin => ~7030 W. We must NEVER command past this in either direction, so no
+// over-generation beyond the inverters' continuous design capacity.
+const INVERTER_CONT_PAIR_W: f64 = 7400.0;
+const CAPACITY_MARGIN: f64 = 0.95;
+const HARD_CLAMP_W: f64 = INVERTER_CONT_PAIR_W * CAPACITY_MARGIN;
 
 struct Args {
     live: bool,
@@ -266,24 +273,25 @@ fn main() {
         None => None,
     };
 
-    // Resolve power limits.
-    let max_dis = pick_limit(args.max_discharge, bus.get_f64(SETTINGS, P_MAXDISCHARGE), 5000.0);
-    let max_chg = pick_limit(args.max_charge, bus.get_f64(SETTINGS, P_MAXCHARGE), 5000.0);
-    let lo = -max_dis; // most-negative command = full discharge
-    let hi = max_chg.min(HARD_CLAMP_W);
-    let lo = lo.max(-HARD_CLAMP_W);
+    // Outer envelope (defence in depth): CLI --max-* if given, else the hard sanity
+    // clamp. The battery broker supplies the live BMS-derived ceiling per tick on top
+    // of this, so the effective clamp tracks the battery's dynamic limits.
+    let env_lo = -pick_limit(args.max_discharge, None, HARD_CLAMP_W).min(HARD_CLAMP_W);
+    let env_hi = pick_limit(args.max_charge, None, HARD_CLAMP_W).min(HARD_CLAMP_W);
+    let mut broker = battery_limits::BatteryBroker::new(&bus);
+    let mut logged_clamp = false;
 
     // Record original mode so we can always restore it.
     let orig_mode = bus.get_f64(SETTINGS, P_HUB4MODE).unwrap_or(1.0) as i32;
 
     eprintln!(
-        "mode={} controller={} interval={}s min_soc={}% clamp=[{:.0}..{:.0}]W orig_hub4mode={}",
+        "mode={} controller={} interval={}s min_soc={}% envelope=[{:.0}..{:.0}]W orig_hub4mode={}",
         if args.live { "LIVE" } else { "shadow" },
         ctrl.name(),
         args.interval,
         args.min_soc,
-        lo,
-        hi,
+        env_lo,
+        env_hi,
         orig_mode
     );
     if args.live {
@@ -355,11 +363,24 @@ fn main() {
                 s.soc, s.state, s.grid
             );
             if !owner_us {
-                ctrl.reset(); // avoid integral windup while the stock ESS loop drives
+                ctrl.reset(); // avoid integral windup while the stock hub4 service drives
             }
         }
 
         // --- control -----------------------------------------------------------
+        // Live BMS-derived clamp (tracks the battery's dynamic charge/discharge
+        // limits), bounded by the outer envelope. Safety-critical per-tick limit.
+        let tr = broker.tick(&bus);
+        let (lo, hi) = battery_limits::clamp_bounds(tr.enforced, env_lo, env_hi);
+        if !logged_clamp {
+            // One-time on-device self-check: our published limit vs the stock hub4 service's live value.
+            let hub4_live = bus.get_f64("com.victronenergy.hub4", "/MaxDischargePower");
+            eprintln!(
+                "BMS clamp: lo={lo:.0}W hi={hi:.0}W  our_published_maxdis={:.0}W hub4_live={hub4_live:?}  (env [{env_lo:.0},{env_hi:.0}])",
+                tr.published.max_discharge_power
+            );
+            logged_clamp = true;
+        }
         let cmd = ctrl.update(s.grid, s.reported, s.target, dt, lo, hi);
         let (owner_str, cmd_str) = if owner_us {
             if args.live {
@@ -369,11 +390,11 @@ fn main() {
             }
             ("US", format!("{cmd:9.1}"))
         } else {
-            ctrl.reset(); // don't wind up the integral while the stock ESS loop drives
+            ctrl.reset(); // don't wind up the integral while the stock hub4 service drives
             ("hub4", format!("({cmd:7.0})"))
         };
 
-        // Shadow fidelity: how close is our proposal to the stock ESS loop's actual command?
+        // Shadow fidelity: how close is our proposal to the stock hub4 service's actual command?
         let note_buf = if !args.live {
             bus.get_f64(VEBUS, P_HUB4_SETPOINT)
                 .map(|actual| format!("actual={actual:.0} Δ={:.0}", actual - cmd))

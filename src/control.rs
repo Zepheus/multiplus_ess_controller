@@ -9,6 +9,14 @@
 //!   dt       : seconds since previous tick
 
 pub fn clamp(x: f64, lo: f64, hi: f64) -> f64 {
+    // Fail-safe: a non-finite command (NaN/inf from a bad sensor read) becomes idle
+    // (0) — never written to the inverter as garbage.
+    if !x.is_finite() {
+        return 0.0;
+    }
+    // Defensive: if bounds ever invert (lo > hi), collapse to the safe tighter bound
+    // so we never return a value outside an intended range.
+    let hi = hi.max(lo);
     if x < lo {
         lo
     } else if x > hi {
@@ -20,7 +28,7 @@ pub fn clamp(x: f64, lo: f64, hi: f64) -> f64 {
 
 #[derive(Clone, Copy, Debug)]
 pub enum Kind {
-    /// Exact reproduction of the stock ESS loop: `command = target - grid + reported`.
+    /// Exact reproduction of the stock hub4 service: `command = target - grid + reported`.
     /// No integral -> leaks (1-k)*load.  Used to prove shadow fidelity.
     Stock,
     /// One-line fix: integrate on our OWN previous command, not `reported`,
