@@ -4,12 +4,16 @@ version = "0.1.0"
 edition = "2021"
 description = "Mode-3 ESS controller for Victron Venus GX — runs our own grid-setpoint loop"
 
-# std-only, zero dependencies: guarantees a clean static musl cross-compile.
-# dbus I/O is done via the device's own `dbus`/`dbus-send` CLIs (see src/dbus.rs).
+# Native D-Bus via zbus (pure Rust, no libdbus C dependency) so the static musl
+# cross-compile stays clean. A persistent system-bus connection replaces the old
+# fork+exec-per-call transport. See src/dbus.rs.
 
 [[bin]]
 name = "multiplus_ess_controller"
 path = "src/main.rs"
+
+[dependencies]
+zbus = "4"
 
 [profile.release]
 opt-level = "z"     # small binary

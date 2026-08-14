@@ -1,4 +1,4 @@
-//! venus-ess-controller — run our own grid-setpoint loop on a Victron Venus GX.
+//! multiplus_ess_controller — run our own grid-setpoint loop on a Victron Venus GX.
 //!
 //! Modes
 //!   shadow (default): READ-ONLY. Reads live dbus, computes what it WOULD command,
@@ -181,7 +181,7 @@ fn parse_args() -> Result<Args, String> {
 
 fn help() -> String {
     "\
-venus-ess-controller [--mode shadow|live] [--controller stock|pi|true-integral]
+multiplus_ess_controller [--mode shadow|live] [--controller stock|pi|true-integral]
   [--ki F] [--i-max F] [--interval S] [--min-soc %] [--max-discharge W]
   [--max-charge W] [--seconds N] [--confirm] [--quiet] [--telemetry PATH]
 
@@ -236,11 +236,17 @@ fn main() {
     }
 
     unsafe {
-        signal(2, on_signal as usize); // SIGINT
-        signal(15, on_signal as usize); // SIGTERM
+        signal(2, on_signal as *const () as usize); // SIGINT
+        signal(15, on_signal as *const () as usize); // SIGTERM
     }
 
-    let bus = DbusSend;
+    let bus = match SystemBus::connect() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("dbus connect failed: {e}");
+            std::process::exit(5);
+        }
+    };
     let mut ctrl = Controller::new(args.kind);
 
     // Optional RAM-backed telemetry (bounded, never flash). Cap per file; with one

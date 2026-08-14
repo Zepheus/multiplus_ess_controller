@@ -86,12 +86,11 @@ Controllers: `stock` (reference), `true-integral`, `pi` (default).
 
 ## Implementation note — D-Bus transport
 
-The v0 talks to Venus D-Bus by invoking the device's `dbus-send` CLI, behind a small
-`Bus` trait. This was a deliberate trade-off: **zero external crates**, so the static
-musl cross-compile is trivially reproducible and the binary stays tiny and auditable.
-A native pure-Rust D-Bus client (`zbus`) is the more canonical approach and is the
-planned next step; the trait boundary exists so it can be swapped in without touching
-the control logic.
+Talks to Venus D-Bus over a **native pure-Rust `zbus`** client — a single persistent
+system-bus connection reused for every GetValue/SetValue, behind a small `Bus` trait.
+`zbus` needs no `libdbus` C dependency, so the whole stack still cross-compiles to a
+fully static musl binary (~1 MB). The `Bus` trait keeps the transport isolated from the
+control logic.
 
 ## Status
 
