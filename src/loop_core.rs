@@ -231,9 +231,17 @@ pub struct Decision {
 
 /// The composed control law: integral fix → SocGuard → feed-in → generator → design clamp.
 /// Pure; factored out so both `decide()` and its unit tests exercise the exact same math.
-pub fn composed_command(snap: &Snapshot, ctrl: &mut Controller) -> f64 {
+pub fn composed_command(snap: &Snapshot, ctrl: &mut Controller, actuating: bool) -> f64 {
     let s = &snap.s;
-    let mut cmd = ctrl.update(s.grid, s.reported, snap.effective_target, snap.dt, snap.lo, snap.hi);
+    let mut cmd = ctrl.update(
+        s.grid,
+        s.reported,
+        snap.effective_target,
+        snap.dt,
+        snap.lo,
+        snap.hi,
+        actuating,
+    );
     // SocGuard: discharge inhibit (INF => no-op; 0 => no discharge).
     cmd = cmd.max(-snap.sg.max_discharge_w);
     if let Some(fc) = snap.sg.cmd_override {
@@ -316,7 +324,11 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
     }
 
     // 2. Composed command — always computed (used for display, and to write in takeover).
-    let cmd = composed_command(snap, &mut st.ctrl);
+    // The adaptive controller may only LEARN when its command actually drives the plant:
+    // takeover stage, we own the loop, and the grid meter is usable/writable. In shadow
+    // and trim our command is not actuated, so learning would train on a phantom regime.
+    let actuating = st.owner_us && matches!(cfg.stage, Stage::Takeover) && snap.gm_should_write;
+    let cmd = composed_command(snap, &mut st.ctrl, actuating);
 
     // 3. Per-stage RAW write target (pre-slew).
     let mut display_cmd = cmd;
@@ -555,7 +567,7 @@ mod tests {
             charge_floor_w: 0.0,
         };
         let mut ctrl = Controller::new(Kind::Stock);
-        let cmd = composed_command(&sp, &mut ctrl);
+        let cmd = composed_command(&sp, &mut ctrl, false);
         assert_eq!(cmd, 4700.0);
     }
 

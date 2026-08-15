@@ -38,8 +38,11 @@ is a steady, avoidable import cost.
 
 This controller takes the setpoint loop (`Hub4Mode` 1 → 3) and runs a loop **with
 integral action**, driving the grid meter onto the setpoint regardless of the
-inverter's few-percent deficit. It only ever discharges/idles within limits and hands
-control back to the stock firmware for anything outside a safe envelope (see Safety).
+inverter's few-percent deficit. On top of the integral it can **learn your system's
+own leak-vs-load curve** and pre-compensate it, so the gap is corrected *instantly*
+after a load change instead of after the integral catches up (see *Tuning it to your
+system*). It only ever discharges/idles within limits and hands control back to the
+stock firmware for anything outside a safe envelope (see Safety).
 
 Two parts:
 
@@ -61,15 +64,120 @@ Produces a ~400 KB fully static musl binary that runs on any Venus OS regardless
 
 ```bash
 # shadow (default, READ-ONLY): compute & log what it WOULD command, never write
-./venus-ess-controller --mode shadow --controller stock  --seconds 30
-./venus-ess-controller --mode shadow --controller pi     --telemetry /run/ess.csv --quiet
+./multiplus_ess_controller --stage shadow --controller stock    --seconds 30
+./multiplus_ess_controller --stage shadow --controller adaptive --telemetry /run/ess.csv --quiet
 
 # live (double-gated): takes Hub4Mode=3 within the safety envelope, restores on exit
-VENUS_ESS_LIVE=I_UNDERSTAND ./venus-ess-controller --mode live --confirm \
-    --controller pi --seconds 900 --min-soc 20
+VENUS_ESS_LIVE=I_UNDERSTAND ./multiplus_ess_controller --stage takeover --confirm \
+    --controller adaptive --seconds 900 --min-soc 20
 ```
 
-Controllers: `stock` (reference), `true-integral`, `pi` (default).
+Controllers: `stock` (reference, no fix), `true-integral`, `pi`, and `adaptive`
+(`pi` + a self-learning feed-forward — see *Tuning it to your system* below).
+
+## Tuning it to your system
+
+Every ESS install leaks by a different amount — it depends on your inverter model, how
+many units, and your wiring (a system with two inverters is not the same as one). This
+tool does **not** assume any particular number. The `adaptive` controller discovers
+*your* leak on its own and needs no manual tuning.
+
+**1. Just run it (recommended).** The integral measures your grid error every tick and
+trims it out; on top of that, `adaptive` fits a two-number model of your leak versus load —
+a fixed offset and a percent-of-load slope — and feeds it forward so a sudden load change
+is corrected in the same tick instead of a few ticks later.
+
+```bash
+./multiplus_ess_controller --stage takeover --confirm --controller adaptive
+```
+
+It starts knowing nothing: with no data the model has no authority and it behaves like a
+plain integral (`pi`). As it gathers **clean, steady-state** samples it grows confident and
+takes over the bulk of the correction, leaving the integral to mop up the residual. The
+model **can only ever make it faster, never less correct** — if it is empty, uncertain, or
+wrong, the integral still holds the grid on target.
+
+*What it needs to learn:* ordinary household load variation over roughly **1–3 hours** — not
+a deliberate power sweep. It only needs to see your load at a *spread* of levels (e.g. quiet
+baseload and something heavier), not the full inverter range; because the model is a straight
+line it correctly extrapolates to loads it has never sat at. The slope is only trusted once it
+has seen enough spread to pin it down — until then the offset alone is used. A few hundred
+clean samples is plenty.
+
+**2. Seed it, if you already know your numbers.** If you have measured your offset (W) and
+slope (fraction of load) before, hand them over to skip the warm-up. It still keeps adapting.
+
+```bash
+./multiplus_ess_controller --stage takeover --confirm --controller adaptive \
+    --ff-a 25 --ff-b 0.04         # ~25 W fixed + 4 % of load
+```
+
+**3. Watch it learn without acting (`--ff-learn-only`).** Learn the model but actuate
+integral-only, so you can watch it converge before trusting the feed-forward. The learned
+model is printed periodically:
+
+```bash
+./multiplus_ess_controller --stage shadow --controller adaptive --ff-learn-only
+# ... MODEL: a=24.8W b=0.0391 (3.9% of load) conf=0.72 @load=1500W
+```
+
+Use `--ff-mode frozen` (with `--ff-a`/`--ff-b`) to pin a known-good model and stop learning —
+handy for reproducible A/B runs.
+
+### Reading the model line — is it working?
+
+Every ~minute the controller prints its current model:
+
+```
+MODEL: a=24.8W b=0.0391 (3.9% of load) conf=0.72 @load=1500W
+```
+
+- **`a`** — the fixed offset (watts) it will always add. Converges first (needs only a
+  settled reading at any load).
+- **`b`** — the slope, as a fraction of throughput (`3.9%` here). Needs a *spread* of loads
+  before it moves off zero; until then only `a` is applied.
+- **`conf`** — how much of the model is actually being actuated right now, `0`–`1`. This is
+  the important number: `conf` near `0` means "still learning, behaving like plain `pi`";
+  `conf` climbing past ~`0.5` means the feed-forward is carrying the bulk and load-step
+  recovery is now fast. In `--ff-learn-only` it shows what authority the model *would* take.
+- **`@load`** — the throughput the confidence was evaluated at (confidence is per-load; it is
+  high where you have data, low where you don't).
+
+You'll know it has converged when `a` and `b` settle near your leak (compare against the live
+gap the plain `pi`/`stock` controllers show in shadow) and `conf` sits high across your usual
+load range. If `conf` never rises, your load isn't varying enough to pin the slope — that's
+fine, the offset + integral still hold target.
+
+### Suggested rollout
+
+1. **Shadow, learn-only** for an evening — watch the `MODEL:` line converge, confirm `a`/`b`
+   match the leak you measured with `stock`, no writes:
+   `--stage shadow --controller adaptive --ff-learn-only`
+2. **Seed a live run** from those learned numbers so it starts sharp:
+   `--stage takeover --confirm --controller adaptive --ff-a <a> --ff-b <b>`
+3. Thereafter just run `--controller adaptive` (optionally seeded); it keeps adapting.
+
+### Advanced knobs (rarely needed — defaults are sensible)
+
+| flag | default | what it does / when to touch |
+|------|---------|------------------------------|
+| `--ki` | `0.05` | Integral gain. Higher = the residual/backstop integral corrects faster but is twitchier. Leave unless steady-state convergence feels slow. |
+| `--ff-lambda` | `0.999` | RLS forgetting factor; memory ≈ `1/(1-λ)` samples (~1000). Lower it (e.g. `0.99`) to adapt faster to a *changed* system (inverter swap) at the cost of more noise; raise toward `1` for a rock-steady plant. |
+| `--ff-conf-scale-w` | `20` | The prediction-σ (W) at which the model is given 50 % authority. Lower = stricter (waits for more certainty before acting); higher = trusts the model sooner. |
+| `--i-max` | `300` | Clamp on the integral term (W). |
+
+All are optional overrides; none need setting for normal use.
+
+**Memory.** The model lives entirely in RAM — nothing is written to the eMMC flash. It resets
+if the process restarts, but that is harmless: the integral holds the grid on target the whole
+time and the model re-converges within an hour or two. (The Venus GX itself rarely reboots; the
+process restarts mainly when you deploy a new build.)
+
+**Safety.** Everything the model does is bounded and still passes through the same hard clamps,
+slew-rate limit, and sanity supervisor as every other command (see Safety). The learning layer
+**cannot widen its own safety envelope** — those limits are derived from the inverter's design
+power and are independent of anything learned. A corrupt or diverging estimate is caught
+downstream and cannot leave the envelope.
 
 ## Safety model
 
@@ -92,8 +200,20 @@ system-bus connection reused for every GetValue/SetValue, behind a small `Bus` t
 fully static musl binary (~1 MB). The `Bus` trait keeps the transport isolated from the
 control logic.
 
+## Tested against
+
+Developed and validated on:
+
+- **Venus OS v3.75** (kernel `6.12.90-venus-2`, `armv7l`) on a Venus GX.
+- 2 × MultiPlus-II in an ESS, grid-metered.
+
+Other Venus hardware/firmware and inverter counts should work — nothing is hardcoded to
+the above (the leak and safety limits are learned/derived per system) — but this is the
+only configuration it has actually run on. Treat anything else as untested.
+
 ## Status
 
 Experimental. Built and validated in **shadow mode** on real hardware; the stock law
-reproduces the device's actual commands within a few watts. **Not run live** in this
+reproduces the device's actual commands within a few watts, and the leak it corrects is
+confirmed live (~20 W fixed + ~4 % of load on the test system). **Not run live** in this
 initial cut — the mode-1→3 cutover is intended to be done supervised.

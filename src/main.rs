@@ -207,6 +207,12 @@ fn parse_args() -> Result<Args, String> {
     let mut ki: Option<f64> = None;
     let mut i_max = 300.0;
     let mut ctrl = String::from("pi");
+    // Adaptive feed-forward knobs (only consulted for --controller adaptive).
+    let mut ff_a: Option<f64> = None;
+    let mut ff_b: Option<f64> = None;
+    let mut ff_mode = String::from("apply");
+    let mut ff_lambda: Option<f64> = None;
+    let mut ff_conf_scale: Option<f64> = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut val = || it.next().ok_or_else(|| format!("{arg} needs a value"));
@@ -231,6 +237,15 @@ fn parse_args() -> Result<Args, String> {
             "--controller" => ctrl = val()?,
             "--ki" => ki = Some(val()?.parse().map_err(|_| "bad --ki")?),
             "--i-max" => i_max = val()?.parse().map_err(|_| "bad --i-max")?,
+            "--ff-a" => ff_a = Some(val()?.parse().map_err(|_| "bad --ff-a")?),
+            "--ff-b" => ff_b = Some(val()?.parse().map_err(|_| "bad --ff-b")?),
+            "--ff-mode" => ff_mode = val()?,
+            // Convenience alias for --ff-mode observe (learn but don't actuate).
+            "--ff-learn-only" => ff_mode = String::from("observe"),
+            "--ff-lambda" => ff_lambda = Some(val()?.parse().map_err(|_| "bad --ff-lambda")?),
+            "--ff-conf-scale-w" => {
+                ff_conf_scale = Some(val()?.parse().map_err(|_| "bad --ff-conf-scale-w")?)
+            }
             "--interval" => a.interval = val()?.parse().map_err(|_| "bad --interval")?,
             "--min-soc" => a.min_soc = val()?.parse().map_err(|_| "bad --min-soc")?,
             "--max-discharge" => a.max_discharge = val()?.parse().map_err(|_| "bad")?,
@@ -250,6 +265,40 @@ fn parse_args() -> Result<Args, String> {
         "stock" => Kind::Stock,
         "true-integral" => Kind::TrueIntegral { ki: ki.unwrap_or(1.0) },
         "pi" => Kind::Pi { ki: ki.unwrap_or(0.05), i_max },
+        "adaptive" => {
+            let mode = match ff_mode.as_str() {
+                "apply" => control::FfMode::Apply,
+                "observe" | "learn-only" => control::FfMode::Observe,
+                "frozen" => control::FfMode::Frozen,
+                o => return Err(format!("bad --ff-mode {o} (want apply|observe|frozen)")),
+            };
+            let mut c = control::AdaptiveCfg::tuned();
+            c.ki = ki.unwrap_or(c.ki);
+            c.i_max = i_max;
+            c.mode = mode;
+            // A supplied seed (either coefficient) tightens the prior so it is trusted.
+            c.seeded = ff_a.is_some() || ff_b.is_some();
+            c.a0 = ff_a.unwrap_or(0.0);
+            c.b0 = ff_b.unwrap_or(0.0);
+            if !c.a0.is_finite() || !c.b0.is_finite() {
+                return Err("--ff-a / --ff-b must be finite".into());
+            }
+            if let Some(l) = ff_lambda {
+                // λ ∈ (0,1]; NaN/≤0 would make the RLS never learn (denom never > 0).
+                if !(l.is_finite() && l > 0.0 && l <= 1.0) {
+                    return Err("--ff-lambda must be in (0, 1]".into());
+                }
+                c.lambda = l;
+            }
+            if let Some(s) = ff_conf_scale {
+                // Must be > 0: conf = scale/(scale+σ) only stays in (0,1] for positive scale.
+                if !(s.is_finite() && s > 0.0) {
+                    return Err("--ff-conf-scale-w must be > 0".into());
+                }
+                c.conf_scale_w = s;
+            }
+            Kind::Adaptive(c)
+        }
         o => return Err(format!("unknown controller {o}")),
     };
     Ok(a)
@@ -257,10 +306,21 @@ fn parse_args() -> Result<Args, String> {
 
 fn help() -> String {
     "\
-venus-ess-controller [--stage shadow|trim|takeover] [--controller stock|pi|true-integral]
+venus-ess-controller [--stage shadow|trim|takeover] [--controller stock|pi|true-integral|adaptive]
   [--ki F] [--i-max F] [--trim-ki F] [--slew-w-per-s F] [--sanity-band-w F] [--interval S]
   [--min-soc %] [--max-discharge W] [--max-charge W] [--seconds N] [--confirm] [--quiet]
   [--telemetry PATH]
+
+adaptive: PI + a continuously-learned feed-forward leak(throughput) ~= a + b*|reported|
+  (RLS, in-memory, no persistence). The model is taught by the integral and earns actuation
+  authority only as its confidence grows, so a cold start behaves like pi and a low-data run
+  never over-trusts. Options:
+  [--ff-a W] [--ff-b FRAC] seed initial coefficients (tightens the prior so they are used
+    from tick one); [--ff-mode apply|observe|frozen] (observe == --ff-learn-only: keep
+    learning but actuate integral-only; frozen: apply the seed, never learn);
+  [--ff-lambda 0<L<=1] RLS forgetting (memory ~= 1/(1-L)); [--ff-conf-scale-w W] prediction-
+    sigma at which the model gets 50% authority. The learned model is logged periodically as
+    `MODEL: a=.. b=.. conf=..`; hard safety (write phase) is independent of anything learned.
 
 Live ESS settings (read every tick, UI/VRM/API-controlled — never hardcoded): the ownership
 floor is BatteryLife/MinimumSocLimit (--min-soc is only a fallback if that read fails); the
@@ -611,6 +671,7 @@ fn main() {
 
     let start = Instant::now();
     let mut prev = Instant::now();
+    let mut tick: u64 = 0;
 
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
@@ -670,6 +731,23 @@ fn main() {
             );
         }
         last_safety = dec.safety;
+
+        // Adaptive model: log the learned coefficients + current authority periodically so
+        // convergence is observable (essential in --ff-mode observe, where nothing else
+        // reveals what the model would do). Cheap: ~once/minute at a 1 s interval.
+        if let Some(ff) = st.ctrl.ff_snapshot(snap.s.reported) {
+            if tick == 0 || tick % 60 == 0 {
+                eprintln!(
+                    "[t={t:.0}] MODEL: a={:.1}W b={:.4} ({:.1}% of load) conf={:.2} @load={:.0}W",
+                    ff.a,
+                    ff.b,
+                    ff.b * 100.0,
+                    ff.conf,
+                    snap.s.reported.abs()
+                );
+            }
+        }
+        tick += 1;
 
         // Shadow fidelity: how close is our proposal to the stock ESS loop's actual command?
         let note_buf = if matches!(args.stage, Stage::Shadow) {
