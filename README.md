@@ -59,6 +59,7 @@ cargo build --release   # -> target/armv7-unknown-linux-musleabihf/release/multi
 ```
 
 Produces a ~1 MB fully static musl binary that runs on any Venus OS regardless of glibc.
+Needs Rust ≥ 1.87 (the `zbus` 5 MSRV); any current stable works.
 
 ## Run
 
@@ -198,7 +199,8 @@ downstream and cannot leave the envelope.
   scheduling still work.
 - **Clamps:** commands bounded by configured charge/discharge power and a hard sanity bound.
 - **Watchdog:** in `Hub4Mode 3` the inverter reverts to passthru if no setpoint arrives
-  within 60 s, so any crash/kill → passthru within a minute (house on grid, battery idle).
+  within 60 s (official docs for older firmware say as low as 10 s; 60 s is the conservative
+  upper bound), so any crash/kill → passthru within a minute (house on grid, battery idle).
   Clean exit / SIGINT / SIGTERM also restore `Hub4Mode`.
 - **Flash-safe logging:** never logs per-tick to eMMC. Per-tick telemetry goes only to a
   bounded RAM (tmpfs) file and refuses flash paths; `--quiet` silences per-tick stdout.

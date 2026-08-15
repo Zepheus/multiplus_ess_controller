@@ -13,7 +13,7 @@ name = "multiplus_ess_controller"
 path = "src/main.rs"
 
 [dependencies]
-zbus = "4"
+zbus = "5"
 
 [profile.release]
 opt-level = "z"     # small binary
