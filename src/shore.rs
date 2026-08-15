@@ -87,6 +87,7 @@ impl ShoreWrite {
 /// managing the limit (a finite `AcInputLimit` is configured AND we are the metering
 /// source); `false` when dormant (no limit / external meter) — in which case every
 /// `writes` entry is `None` and no path is touched.
+#[derive(Default)]
 pub struct ShoreOut {
     /// Resolved value for L1 in Amps — the filtered limit when imposing, or the
     /// `3270.0` sentinel when releasing. NaN means "L1 left untouched" (dormant, or no

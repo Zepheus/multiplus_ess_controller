@@ -25,6 +25,10 @@ pub struct Published {
     pub max_charge_power: Invalidatable,    // /MaxChargePower
     pub max_discharge_power: Invalidatable, // /MaxDischargePower
     pub alarms_no_grid_meter: i32,          // /Alarms/NoGridMeter
+    /// Our own safety-trip alarm, published on the SAME `/Alarms/*` surface the HA/VRM Victron
+    /// integration already reads (0 = ok, 1 = warning, 2 = alarm). Fed from `Decision.safety`
+    /// when we own the service (Tier-B); a sanity handback = 2, a slew/dt clamp = 1.
+    pub alarms_ess_safety: i32, // /Alarms/EssSafety
     pub overrides_force_charge: i32,        // /Overrides/ForceCharge
     pub overrides_setpoint: Invalidatable,  // /Overrides/Setpoint
     pub overrides_feed_in_excess: i32,      // /Overrides/FeedInExcess

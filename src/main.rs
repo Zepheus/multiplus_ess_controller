@@ -1,4 +1,4 @@
-//! multiplus_ess_controller — run our own grid-setpoint loop on a Victron Venus GX.
+//! venus-ess-controller — run our own grid-setpoint loop on a Victron Venus GX.
 //!
 //! Modes
 //!   shadow (default): READ-ONLY. Reads live dbus, computes what it WOULD command,
@@ -26,6 +26,7 @@ mod feedin;
 mod generator;
 mod gridmeter;
 mod hub4_service;
+mod loop_core;
 mod pv;
 mod shore;
 mod socguard;
@@ -68,7 +69,7 @@ impl Telemetry {
             .map_err(|e| format!("cannot open telemetry '{path}': {e}"))?;
         let mut t = Telemetry { path: path.to_string(), cap: cap_bytes, written: 0, file };
         let _ = t.write_line(
-            "t,grid,reported,target,soc,state,command,owner,actual,delta",
+            "t,grid,reported,target,soc,state,command,owner,actual,reason",
         );
         Ok(t)
     }
@@ -121,18 +122,51 @@ extern "C" fn on_signal(_sig: i32) {
 // Victron SystemState code we must react to: SocGuard force-charge -> hand back.
 const STATE_RECHARGE: i64 = 258;
 
-// Hard sanity bound on any command (W), regardless of settings. Two MultiPlus-II
-// 48/5000 in parallel ~ 8 kW continuous; leave margin.
-// Absolute command clamp = inverter-pair DESIGN CAPACITY with a safety margin.
-// 2x MultiPlus-II 48/5000: continuous output ~3700 W each @ 40 C => 7400 W pair.
-// 5% margin => ~7030 W. We must NEVER command past this in either direction, so no
-// over-generation beyond the inverters' continuous design capacity.
-const INVERTER_CONT_PAIR_W: f64 = 7400.0;
-const CAPACITY_MARGIN: f64 = 0.95;
-const HARD_CLAMP_W: f64 = INVERTER_CONT_PAIR_W * CAPACITY_MARGIN;
+// The design-capacity clamp + all derived safety params live in loop_core, anchored on the
+// one hardware number (`loop_core::HARD_CLAMP_W` = inverter pair continuous x margin).
+use loop_core::HARD_CLAMP_W;
+
+/// The rollout ladder, selected with `--stage` (see the rollout/failsafe design notes). Each rung
+/// is strictly larger-authority than the previous; `writes()` marks the ones that touch the
+/// live battery system and therefore require the double-gate.
+///   Shadow (0)   read-only: compute what we WOULD do, compare to stock, never write.
+///   Trim   (1)   mode 1 + /Overrides/Setpoint outer-integral trim. Stock keeps ALL safety
+///                (SocGuard, clamps, feed-in, meter failsafe); we only bias the grid target.
+///                Fail-safe = the 300 s override watchdog reverts to stock's own setpoint.
+///   Takeover (2) mode 1->3: WE own the whole loop (setpoint + every subsystem). Fail-safe =
+///                the 60 s VE.Bus watchdog reverts the Multi to passthru.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    Shadow,
+    Trim,
+    Takeover,
+}
+
+impl Stage {
+    fn parse(s: &str) -> Option<Stage> {
+        match s {
+            "shadow" | "0" => Some(Stage::Shadow),
+            "trim" | "1" => Some(Stage::Trim),
+            // `live` kept as a back-compat alias for the old --mode live (== full takeover).
+            "takeover" | "2" | "live" => Some(Stage::Takeover),
+            _ => None,
+        }
+    }
+    /// True for stages that write to the live system (require the double-gate).
+    fn writes(self) -> bool {
+        !matches!(self, Stage::Shadow)
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Stage::Shadow => "shadow(0)",
+            Stage::Trim => "trim(1)",
+            Stage::Takeover => "takeover(2)",
+        }
+    }
+}
 
 struct Args {
-    live: bool,
+    stage: Stage,
     kind: Kind,
     interval: f64,
     min_soc: f64,
@@ -144,11 +178,15 @@ struct Args {
     quiet: bool,
     telemetry: Option<String>,
     telemetry_max_mb: u64,
+    trim_ki: f64,
+    /// Safety overrides — None => derive from the design power (SafetyLimits::derive).
+    slew_w_per_s: Option<f64>,
+    sanity_band_w: Option<f64>,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut a = Args {
-        live: false,
+        stage: Stage::Shadow,
         kind: Kind::Pi { ki: 0.05, i_max: 300.0 },
         interval: 1.0,
         min_soc: 15.0,
@@ -160,6 +198,11 @@ fn parse_args() -> Result<Args, String> {
         quiet: false,
         telemetry: None,
         telemetry_max_mb: 4,
+        // Outer-integral gain for Stage-1 trim: override_delta = trim_ki * grid_error_W * dt_s.
+        // Small + slow — it only trims steady-state bias on top of stock's fast inner loop.
+        trim_ki: 0.02,
+        slew_w_per_s: None,
+        sanity_band_w: None,
     };
     let mut ki: Option<f64> = None;
     let mut i_max = 300.0;
@@ -168,7 +211,23 @@ fn parse_args() -> Result<Args, String> {
     while let Some(arg) = it.next() {
         let mut val = || it.next().ok_or_else(|| format!("{arg} needs a value"));
         match arg.as_str() {
-            "--mode" => a.live = matches!(val()?.as_str(), "live"),
+            "--stage" => {
+                let v = val()?;
+                a.stage = Stage::parse(&v).ok_or_else(|| format!("bad --stage {v} (want shadow|trim|takeover)"))?;
+            }
+            // Deprecated alias: --mode shadow|live maps onto --stage shadow|takeover.
+            "--mode" => {
+                let v = val()?;
+                a.stage = Stage::parse(&v)
+                    .ok_or_else(|| format!("bad --mode {v} (use --stage shadow|trim|takeover)"))?;
+            }
+            "--trim-ki" => a.trim_ki = val()?.parse().map_err(|_| "bad --trim-ki")?,
+            "--slew-w-per-s" => {
+                a.slew_w_per_s = Some(val()?.parse().map_err(|_| "bad --slew-w-per-s")?)
+            }
+            "--sanity-band-w" => {
+                a.sanity_band_w = Some(val()?.parse().map_err(|_| "bad --sanity-band-w")?)
+            }
             "--controller" => ctrl = val()?,
             "--ki" => ki = Some(val()?.parse().map_err(|_| "bad --ki")?),
             "--i-max" => i_max = val()?.parse().map_err(|_| "bad --i-max")?,
@@ -198,9 +257,29 @@ fn parse_args() -> Result<Args, String> {
 
 fn help() -> String {
     "\
-multiplus_ess_controller [--mode shadow|live] [--controller stock|pi|true-integral]
-  [--ki F] [--i-max F] [--interval S] [--min-soc %] [--max-discharge W]
-  [--max-charge W] [--seconds N] [--confirm] [--quiet] [--telemetry PATH]
+venus-ess-controller [--stage shadow|trim|takeover] [--controller stock|pi|true-integral]
+  [--ki F] [--i-max F] [--trim-ki F] [--slew-w-per-s F] [--sanity-band-w F] [--interval S]
+  [--min-soc %] [--max-discharge W] [--max-charge W] [--seconds N] [--confirm] [--quiet]
+  [--telemetry PATH]
+
+Live ESS settings (read every tick, UI/VRM/API-controlled — never hardcoded): the ownership
+floor is BatteryLife/MinimumSocLimit (--min-soc is only a fallback if that read fails); the
+charge/discharge power limits are MaxChargePower/MaxDischargePower, enforced per-tick by the
+battery broker alongside the live BMS DCL/CCL. --max-* set the fixed inverter design envelope.
+
+Safety (write stages) is DERIVED from the design power (the --max-* envelope, else the inverter
+design capacity) — no separate tuning: slew glitch-guard = full range / 2 s, sanity band = 15 %
+of design power (hand back if grid stays beyond it for 30 s), dt-clamp = 5x --interval. Override
+with --slew-w-per-s / --sanity-band-w. Every trip logs a stable `SAFETY:` prefix + a telemetry
+`reason` column; the hand-back itself is visible via Hub4Mode / Overrides (Tier-B also publishes
+/Alarms/EssSafety, the same /Alarms/* surface the HA/VRM Victron integration already reads).
+
+Rollout stages (--stage, see the rollout/failsafe design notes):
+  shadow (0)   READ-ONLY. Compute what we would command, compare to stock, never write.
+  trim   (1)   Mode 1 + /Overrides/Setpoint outer-integral trim. Stock keeps ALL safety;
+               we only bias the grid target. Reverts via the 300 s override watchdog.
+  takeover (2) Mode 1->3. WE own the whole loop. Reverts to passthru via the 60 s watchdog.
+  (--mode shadow|live is a deprecated alias: live == takeover.)
 
 Logging (flash-safe):
   Per-tick output goes to STDOUT (terminal) and, if --telemetry is set, to a
@@ -209,17 +288,12 @@ Logging (flash-safe):
   size-capped with rotation (<=8 MB total) and REFUSES flash paths (/data,
   /var/log). Rare events (takeover/handback/errors) always go to stderr.
 
-Default is shadow (read-only). Live also requires env VENUS_ESS_LIVE=I_UNDERSTAND."
+Default is shadow (read-only). trim and takeover also require --confirm AND env
+VENUS_ESS_LIVE=I_UNDERSTAND (they write to the live battery system)."
         .to_string()
 }
 
-struct Sensors {
-    grid: f64,
-    reported: f64,
-    target: f64,
-    soc: f64,
-    state: i64,
-}
+use loop_core::Sensors;
 
 fn read_sensors(bus: &dyn Bus) -> Option<Sensors> {
     Some(Sensors {
@@ -231,6 +305,157 @@ fn read_sensors(bus: &dyn Bus) -> Option<Sensors> {
     })
 }
 
+/// All stateful subsystem instances + the grid-meter presence cache, held together so the
+/// read phase (`sample`) can drive them and the write phase (`actuate`) can reach the two
+/// modules that own their own write side (`feedin`, `shore`).
+struct Subsystems {
+    broker: battery_limits::BatteryBroker,
+    dess: dess::Dess,
+    feedin: feedin::FeedIn,
+    generator: generator::Generator,
+    gridmeter: gridmeter::GridMeterGuard,
+    shore: shore::ShoreLimiter,
+    pv: pv::PvLimiter,
+    socguard: socguard::SocGuard,
+    /// Grid-meter guard decision, refreshed at the 2.5 s presence cadence and cached between.
+    gm_cached: gridmeter::GridMeterGuardOut,
+    gm_next: Instant,
+    logged_clamp: bool,
+    /// Most recent feed-in tick output — held so `actuate` can call its `.write()` (the
+    /// feed-in flags live on the tick output, not the `FeedIn` instance).
+    last_feed: Option<feedin::Output>,
+}
+
+/// The READ phase: every bus read for this tick, packed into a `Snapshot`. The only reader.
+#[allow(clippy::too_many_arguments)]
+fn sample(
+    bus: &dyn Bus,
+    sub: &mut Subsystems,
+    stage: Stage,
+    owner_us: bool,
+    env_lo: f64,
+    env_hi: f64,
+    min_soc_fallback: f64,
+    now: Instant,
+    dt: f64,
+    dt_clamped: bool,
+) -> Option<loop_core::Snapshot> {
+    let s = read_sensors(bus)?;
+
+    // LIVE ownership floor: the UI/VRM/API-controlled MinimumSocLimit (raised by the user's
+    // dispatch automation), read every tick. --min-soc is only the fallback if the read fails.
+    let min_soc = bus
+        .get_f64(SETTINGS, P_BL_MINSOC)
+        .filter(|v| v.is_finite())
+        .unwrap_or(min_soc_fallback);
+
+    // Battery limits -> the per-tick command clamp (design-capacity bounded).
+    let tr = sub.broker.tick(bus);
+    let (lo, hi) = battery_limits::clamp_bounds(tr.enforced, env_lo, env_hi);
+    if !sub.logged_clamp {
+        let hub4_live = bus.get_f64("com.victronenergy.hub4", "/MaxDischargePower");
+        eprintln!(
+            "BMS clamp: lo={lo:.0}W hi={hi:.0}W  our_published_maxdis={:.0}W hub4_live={hub4_live:?}  (env [{env_lo:.0},{env_hi:.0}])",
+            tr.published.max_discharge_power
+        );
+        sub.logged_clamp = true;
+    }
+
+    // Effective target = DESS scheduled-setpoint override + PV feed-forward. PV curtailment
+    // can WRITE to real PV inverters, so it runs only in full takeover while we own control
+    // (STUB — read-only — otherwise); this is the one subsystem that self-actuates.
+    let dess_out = sub.dess.tick(bus);
+    let pv_out = if matches!(stage, Stage::Takeover) && owner_us {
+        sub.pv.tick(bus, pv::PvContext::default())
+    } else {
+        pv::PvOut::STUB
+    };
+    let effective_target = dess_out.target(s.target) + pv_out.pv_offset_w;
+
+    // SocGuard first (its force_charge feeds the feed-in override).
+    let sg = sub.socguard.tick(bus);
+    sub.feedin.set_overrides(feedin::Overrides {
+        feed_in_excess: dess_out.feed_in_excess,
+        force_charge: sg.force_charge,
+    });
+    let feed = sub.feedin.tick(bus);
+    let feed_block_charge = feed.block_charge();
+    let feed_force_flat = feed.force_flat();
+    sub.last_feed = Some(feed); // held for actuate's write side
+    let gen = sub.generator.tick(bus, generator::ForceChargeCtx::default());
+
+    // Grid-meter guard at its native 2.5 s cadence; reuse the cached decision between.
+    if now >= sub.gm_next {
+        sub.gm_cached = sub.gridmeter.tick(bus);
+        sub.gm_next = now + gridmeter::PRESENCE_TICK;
+    }
+
+    let shore_out = sub.shore.tick_from_bus(
+        bus,
+        shore::read_ac_input_limit(bus),
+        sub.gm_cached.usable,
+        shore::read_always_peak_shave(bus),
+        s.soc > min_soc,
+        sg.force_charge,
+    );
+
+    // Keep the diagnostic-only module outputs "used".
+    let _ = (pv_out.pv_disable, sub.gm_cached.alarm_no_grid_meter);
+
+    Some(loop_core::Snapshot {
+        s,
+        dt,
+        dt_clamped,
+        min_soc,
+        lo,
+        hi,
+        effective_target,
+        sg,
+        feed_block_charge,
+        feed_force_flat,
+        gen_disable_export: gen.disable_export,
+        gm_should_write: sub.gm_cached.should_write_setpoint,
+        shore_out,
+        hub4_actual: bus.get_f64(VEBUS, P_HUB4_SETPOINT),
+    })
+}
+
+/// The WRITE phase: the single place every actuation happens. Write-phase safety checks
+/// belong here. `st` is `&mut` only so a Hub4Mode write-failure can fail safe to not-owner.
+fn actuate(
+    bus: &dyn Bus,
+    sub: &Subsystems,
+    snap: &loop_core::Snapshot,
+    dec: &loop_core::Decision,
+    st: &mut loop_core::LoopState,
+) {
+    if let Some(m) = dec.hub4mode {
+        if let Err(e) = bus.set_i32(SETTINGS, P_HUB4MODE, m) {
+            eprintln!("Hub4Mode set failed: {e}");
+            st.owner_us = false; // fail safe
+        }
+    }
+    match dec.write {
+        loop_core::Write::Setpoint(v) => {
+            if let Err(e) = bus.set_f64(VEBUS, P_HUB4_SETPOINT, v) {
+                eprintln!("setpoint write failed: {e} (Multi will passthru if persistent)");
+            }
+        }
+        loop_core::Write::Override(v) => {
+            if let Err(e) = bus.set_f64(socguard::HUB4, socguard::P_OVR_SETPOINT, v) {
+                eprintln!("override write failed: {e} (stock setpoint resumes after 300 s)");
+            }
+        }
+        loop_core::Write::Nothing => {}
+    }
+    if dec.feed_shore_write {
+        if let Some(f) = &sub.last_feed {
+            let _ = f.write(bus);
+        }
+        let _ = sub.shore.write(bus, &snap.shore_out);
+    }
+}
+
 fn main() {
     let args = match parse_args() {
         Ok(a) => a,
@@ -240,13 +465,14 @@ fn main() {
         }
     };
 
-    // Double-gate the live path.
-    if args.live {
+    // Double-gate any stage that writes to the live system (trim + takeover).
+    if args.stage.writes() {
         let env_ok = std::env::var("VENUS_ESS_LIVE").as_deref() == Ok("I_UNDERSTAND");
         if !env_ok || !args.confirm {
             eprintln!(
-                "REFUSING live: needs BOTH `--confirm` AND env VENUS_ESS_LIVE=I_UNDERSTAND.\n\
-                 This flips Hub4Mode 1->3 and writes setpoints to the Multis."
+                "REFUSING {}: needs BOTH `--confirm` AND env VENUS_ESS_LIVE=I_UNDERSTAND.\n\
+                 This writes to the live battery system.",
+                args.stage.name()
             );
             std::process::exit(3);
         }
@@ -264,8 +490,6 @@ fn main() {
             std::process::exit(5);
         }
     };
-    let mut ctrl = Controller::new(args.kind);
-
     // Optional RAM-backed telemetry (bounded, never flash). Cap per file; with one
     // rotation total footprint is at most 2x this. Default 4 MB/file (~48 h @ 1 Hz).
     let telemetry_cap: u64 = args.telemetry_max_mb * 1024 * 1024;
@@ -288,39 +512,95 @@ fn main() {
     // of this, so the effective clamp tracks the battery's dynamic limits.
     let env_lo = -pick_limit(args.max_discharge, None, HARD_CLAMP_W).min(HARD_CLAMP_W);
     let env_hi = pick_limit(args.max_charge, None, HARD_CLAMP_W).min(HARD_CLAMP_W);
-    let mut broker = battery_limits::BatteryBroker::new(&bus);
-    let mut logged_clamp = false;
 
-    // Full-replacement subsystem modules (composed each tick below).
-    let mut dess = dess::Dess::new(&bus);
-    let mut feedin = feedin::FeedIn::new(&bus);
-    let mut generator = generator::Generator::new(&bus);
-    let mut gridmeter = gridmeter::GridMeterGuard::new();
-    let mut shore = shore::ShoreLimiter::new(1);
-    let mut pv = pv::PvLimiter::new(&bus);
-    let mut socguard = socguard::SocGuard::new(&bus);
-    // The grid-meter guard's grace/staleness counters are in 2.5 s presence-ticks, so
-    // run it at that cadence and cache its decision between ticks. (Review Finding 3.)
-    let mut gm_cached = gridmeter.tick(&bus);
-    let mut gm_next = Instant::now() + gridmeter::PRESENCE_TICK;
+    // Design-power anchor for the safety layer: the explicit --max-* envelope if given, else the
+    // inverter design capacity. slew / sanity-band / dt-clamp all DERIVE from this (each still
+    // overridable via --slew-w-per-s / --sanity-band-w) — no independently hand-tuned constants.
+    let design_w = {
+        let m = args.max_charge.max(args.max_discharge);
+        if m > 0.0 { m.min(HARD_CLAMP_W) } else { HARD_CLAMP_W }
+    };
+    let safety = loop_core::SafetyLimits::derive(
+        design_w,
+        args.interval,
+        args.slew_w_per_s,
+        args.sanity_band_w,
+    );
+    eprintln!(
+        "safety (derived from design {:.0}W): slew={:.0}W/s{} sanity>{:.0}W for {:.0}s dt-clamp {:.1}s",
+        safety.design_w,
+        safety.slew_w_per_s,
+        if args.slew_w_per_s.is_some() { " (override)" } else { "" },
+        safety.sanity_band_w,
+        safety.sanity_secs,
+        safety.max_dt_s,
+    );
 
     // Record original mode so we can always restore it.
     let orig_mode = bus.get_f64(SETTINGS, P_HUB4MODE).unwrap_or(1.0) as i32;
 
+    // Subsystem instances (driven by `sample`; `feedin`/`shore` also written by `actuate`).
+    let mut gridmeter = gridmeter::GridMeterGuard::new();
+    let gm0 = gridmeter.tick(&bus); // seed the presence cache
+    let mut sub = Subsystems {
+        broker: battery_limits::BatteryBroker::new(&bus),
+        dess: dess::Dess::new(&bus),
+        feedin: feedin::FeedIn::new(&bus),
+        generator: generator::Generator::new(&bus),
+        gridmeter,
+        shore: shore::ShoreLimiter::new(1),
+        pv: pv::PvLimiter::new(&bus),
+        socguard: socguard::SocGuard::new(&bus),
+        gm_cached: gm0,
+        gm_next: Instant::now() + gridmeter::PRESENCE_TICK,
+        logged_clamp: false,
+        last_feed: None,
+    };
+
+    // Carried decision state + immutable per-run config for the pure `decide()`.
+    let mut st = loop_core::LoopState {
+        ctrl: Controller::new(args.kind),
+        owner_us: false,
+        last_flip_t: -60.0, // dwell already elapsed at boot
+        trim_override: None,
+        last_out: None,
+        oob_since: None,
+        prev_force_charge: false,
+    };
+    let cfg = loop_core::DecideCfg {
+        stage: args.stage,
+        soc_hyst: args.soc_hyst,
+        min_dwell_s: 30.0, // anti-thrash on ownership flips
+        trim_ki: args.trim_ki,
+        orig_mode,
+        state_recharge: STATE_RECHARGE,
+        slew_w_per_s: safety.slew_w_per_s,
+        sanity_band_w: safety.sanity_band_w,
+        sanity_secs: safety.sanity_secs,
+    };
+    // Edge-triggered safety logging state (only log a trip when it newly fires).
+    let mut last_safety = loop_core::Safety::default();
+
     eprintln!(
-        "mode={} controller={} interval={}s min_soc={}% envelope=[{:.0}..{:.0}]W orig_hub4mode={}",
-        if args.live { "LIVE" } else { "shadow" },
-        ctrl.name(),
+        "stage={} controller={} interval={}s min_soc_fallback={}% (live from BatteryLife/MinimumSocLimit) envelope=[{:.0}..{:.0}]W orig_hub4mode={}",
+        args.stage.name(),
+        st.ctrl.name(),
         args.interval,
         args.min_soc,
         env_lo,
         env_hi,
         orig_mode
     );
-    if args.live {
-        eprintln!("LIVE: will set Hub4Mode=3 inside the envelope and restore {orig_mode} on exit.");
-    } else {
-        eprintln!("shadow: READ-ONLY, no writes, no mode change.");
+    match args.stage {
+        Stage::Shadow => eprintln!("shadow: READ-ONLY, no writes, no mode change."),
+        Stage::Trim => eprintln!(
+            "TRIM: Hub4Mode stays {orig_mode}; writing /Overrides/Setpoint (trim_ki={}) — stock keeps \
+             all safety; 300 s override watchdog reverts us.",
+            args.trim_ki
+        ),
+        Stage::Takeover => eprintln!(
+            "TAKEOVER: will set Hub4Mode=3 inside the envelope and restore {orig_mode} on exit."
+        ),
     }
     if !args.quiet {
         println!(
@@ -331,23 +611,26 @@ fn main() {
 
     let start = Instant::now();
     let mut prev = Instant::now();
-    let mut owner_us = false; // do WE currently own control (Hub4Mode=3)?
-    let mut last_flip = Instant::now()
-        .checked_sub(Duration::from_secs(60))
-        .unwrap_or_else(Instant::now);
-    let min_dwell = Duration::from_secs(30); // anti-thrash on mode flips
 
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
             break;
         }
         let now = Instant::now();
-        let dt = (now - prev).as_secs_f64().max(0.001);
+        // Failsafe: clamp dt so a scheduler stall can't lurch the integrator on the catch-up
+        // tick. The clamp is itself a (warning-level) safety event.
+        let raw_dt = (now - prev).as_secs_f64();
+        let dt = raw_dt.clamp(0.001, safety.max_dt_s);
+        let dt_clamped = raw_dt > safety.max_dt_s;
         prev = now;
         let t = (now - start).as_secs_f64();
 
-        let s = match read_sensors(&bus) {
-            Some(s) => s,
+        // --- sample: every bus read for this tick -------------------------------
+        let snap = match sample(
+            &bus, &mut sub, args.stage, st.owner_us, env_lo, env_hi, args.min_soc, now, dt,
+            dt_clamped,
+        ) {
+            Some(snap) => snap,
             None => {
                 println!("{t:6.0} {:>8} read-fail: skipping tick (no write)", "");
                 sleep_or_break(args.interval);
@@ -355,152 +638,66 @@ fn main() {
             }
         };
 
-        // --- envelope decision -------------------------------------------------
-        // We may own control iff SOC is comfortably above the floor and we're not
-        // being asked to force-charge. Hysteresis + dwell prevent mode thrash.
-        let enter_ok = s.soc >= args.min_soc + args.soc_hyst && s.state != STATE_RECHARGE;
-        let exit_now = s.soc <= args.min_soc || s.state == STATE_RECHARGE;
-        let want_us = if owner_us { !exit_now } else { enter_ok };
+        // --- decide: pure composed law + ownership envelope + trim integral -----
+        let dec = loop_core::decide(&snap, &mut st, &cfg, t);
 
-        let dwell_ok = now - last_flip >= min_dwell;
-        let mut note = "";
-        if want_us != owner_us && (dwell_ok || !want_us) {
-            // Always allow immediate hand-BACK (safety); throttle only take-OVER.
-            owner_us = want_us;
-            last_flip = now;
-            if args.live {
-                let target_mode = if owner_us { 3 } else { orig_mode };
-                match bus.set_i32(SETTINGS, P_HUB4MODE, target_mode) {
-                    Ok(()) => note = if owner_us { "TOOK OVER (mode3)" } else { "handed back (mode1)" },
-                    Err(e) => {
-                        eprintln!("Hub4Mode set failed: {e}");
-                        owner_us = false; // fail safe
-                    }
-                }
-            } else {
-                note = if owner_us { "would take over" } else { "would hand back" };
-            }
-            // Rare event -> stderr, so a --quiet service still records transitions.
+        // --- actuate: the single write phase (writing stages only) --------------
+        if args.stage.writes() {
+            actuate(&bus, &sub, &snap, &dec, &mut st);
+        }
+
+        // Ownership transitions are rare events -> stderr, so a --quiet service records them.
+        if dec.flipped {
             eprintln!(
-                "[t={t:.0}] {note} (soc={:.0}% state={} grid={:.0}W)",
-                s.soc, s.state, s.grid
+                "[t={t:.0}] {} (soc={:.0}% state={} grid={:.0}W)",
+                dec.note, snap.s.soc, snap.s.state, snap.s.grid
             );
-            if !owner_us {
-                ctrl.reset(); // avoid integral windup while the stock ESS loop drives
-            }
         }
 
-        // --- control: full composed subsystem path -----------------------------
-        // Battery limits -> the per-tick command clamp (design-capacity bounded).
-        let tr = broker.tick(&bus);
-        let (lo, hi) = battery_limits::clamp_bounds(tr.enforced, env_lo, env_hi);
-        if !logged_clamp {
-            let hub4_live = bus.get_f64("com.victronenergy.hub4", "/MaxDischargePower");
+        // Safety trips: stderr on the RISING edge with a stable `SAFETY:` prefix (so a
+        // log/command-line HA sensor or VRM can detect it), plus the telemetry reason column
+        // below. The trip's *effect* is also visible through signals HA already reads: in
+        // takeover a sanity handback reverts Hub4Mode to 1; in trim it invalidates
+        // /Overrides/Setpoint. (Tier-B additionally publishes /Alarms/EssSafety.)
+        if dec.safety.any() && dec.safety != last_safety {
             eprintln!(
-                "BMS clamp: lo={lo:.0}W hi={hi:.0}W  our_published_maxdis={:.0}W hub4_live={hub4_live:?}  (env [{env_lo:.0},{env_hi:.0}])",
-                tr.published.max_discharge_power
+                "[t={t:.0}] SAFETY: {} (grid={:.0}W target={:.0}W soc={:.0}% alarm={})",
+                dec.safety.reason(),
+                snap.s.grid,
+                snap.s.target,
+                snap.s.soc,
+                dec.safety.alarm_level()
             );
-            logged_clamp = true;
         }
-
-        // 1. Effective target: DESS scheduled-setpoint override + PV feed-forward.
-        let dess_out = dess.tick(&bus);
-        // pv.tick() can write Ac/PowerLimit to real PV inverters — only let it actuate
-        // when WE own control in live mode; otherwise use the inert stub so shadow (and
-        // handed-back live) stay strictly read-only. (Review Finding 1.)
-        let pv_out = if args.live && owner_us {
-            pv.tick(&bus, pv::PvContext::default())
-        } else {
-            pv::PvOut::STUB
-        };
-        let target = dess_out.target(s.target) + pv_out.pv_offset_w;
-
-        // 2. Control law (the integral fix), clamped to the live battery bounds.
-        let mut cmd = ctrl.update(s.grid, s.reported, target, dt, lo, hi);
-
-        // 3. SocGuard: discharge inhibit, force-charge override, state-6 floor.
-        let sg = socguard.tick(&bus);
-        cmd = cmd.max(-sg.max_discharge_w); // inhibit (INF => no-op; 0 => no discharge)
-        if let Some(fc) = sg.cmd_override {
-            // force charge
-            cmd = if sg.tpimf { cmd.max(0.0).min(fc) } else { fc };
-        }
-        if sg.charge_floor_w > 0.0 {
-            // minimum-charge floor ONLY when set (BL state 6); 0 must not zero discharge.
-            cmd = cmd.max(sg.charge_floor_w);
-        }
-
-        // 4. Feed-in: DC-overvoltage charge-stop tightens the command; flags written live.
-        feedin.set_overrides(feedin::Overrides {
-            feed_in_excess: dess_out.feed_in_excess,
-            force_charge: sg.force_charge,
-        });
-        let feed = feedin.tick(&bus);
-        if feed.block_charge() {
-            cmd = cmd.min(0.0);
-        }
-
-        // 5. Generator gating + genset back-feed protection.
-        let gen = generator.tick(&bus, generator::ForceChargeCtx::default());
-        if gen.disable_export || feed.force_flat() {
-            // Never export/discharge toward a genset, nor in feed-in force-flat mode
-            // (covers degraded firmware without TPIMFI reinterpretation). (Finding 2.)
-            cmd = cmd.max(0.0);
-        }
-
-        // Grid-meter guard at its native 2.5 s cadence; reuse the cached decision between.
-        if now >= gm_next {
-            gm_cached = gridmeter.tick(&bus);
-            gm_next = now + gridmeter::PRESENCE_TICK;
-        }
-
-        // Shore limit (dormant on this install: AcInputLimit = -1).
-        let shore_out = shore.tick_from_bus(
-            &bus,
-            shore::read_ac_input_limit(&bus),
-            gm_cached.usable,
-            shore::read_always_peak_shave(&bus),
-            s.soc > args.min_soc,
-            sg.force_charge,
-        );
-
-        // 6. Final safety clamp (NaN-safe, design capacity).
-        let cmd = control::clamp(cmd, lo, hi);
-
-        // --- actuate (live only; gated by ownership AND the meter guard) --------
-        let (owner_str, cmd_str) = if owner_us {
-            if args.live && gm_cached.should_write_setpoint {
-                if let Err(e) = bus.set_f64(VEBUS, P_HUB4_SETPOINT, cmd) {
-                    eprintln!("setpoint write failed: {e} (Multi will passthru if persistent)");
-                }
-                let _ = feed.write(&bus);
-                let _ = shore.write(&bus, &shore_out);
-            }
-            ("US", format!("{cmd:9.1}"))
-        } else {
-            ctrl.reset();
-            ("hub4", format!("({cmd:7.0})"))
-        };
-        // Reference remaining module outputs (publishing layer / diagnostics).
-        let _ = (pv_out.pv_disable, feed.mode, gm_cached.alarm_no_grid_meter);
+        last_safety = dec.safety;
 
         // Shadow fidelity: how close is our proposal to the stock ESS loop's actual command?
-        let note_buf = if !args.live {
-            bus.get_f64(VEBUS, P_HUB4_SETPOINT)
-                .map(|actual| format!("actual={actual:.0} Δ={:.0}", actual - cmd))
+        let note_buf = if matches!(args.stage, Stage::Shadow) {
+            snap.hub4_actual
+                .map(|actual| format!("actual={actual:.0} Δ={:.0}", actual - dec.command))
         } else {
             None
         };
-        if let Some(ref nb) = note_buf {
-            note = nb;
-        }
+        let note: &str = note_buf.as_deref().unwrap_or(dec.note);
 
-        // Per-tick human table -> stdout (terminal in interactive runs; suppressed
-        // with --quiet so a persistent service emits nothing per-tick).
+        // Per-tick human table -> stdout (suppressed with --quiet for a persistent service).
         if !args.quiet {
+            let cmd_str = if dec.owner_us {
+                format!("{:9.1}", dec.display_cmd)
+            } else {
+                format!("({:7.0})", dec.command)
+            };
             println!(
                 "{:6.0} {:8.1} {:9.1} {:7.1} {:5.0} {:6} {:>9} {:>7} {:12}",
-                t, s.grid, s.reported, s.target, s.soc, s.state, cmd_str, owner_str, note
+                t,
+                snap.s.grid,
+                snap.s.reported,
+                snap.s.target,
+                snap.s.soc,
+                snap.s.state,
+                cmd_str,
+                dec.owner_str,
+                note
             );
         }
 
@@ -511,9 +708,16 @@ fn main() {
                 .and_then(|nb| nb.split("actual=").nth(1))
                 .and_then(|s| s.split_whitespace().next())
                 .unwrap_or("");
+            let reason = dec.safety.reason();
             let _ = tel.write_line(&format!(
-                "{t:.0},{:.1},{:.1},{:.1},{:.0},{},{:.1},{},{actual},",
-                s.grid, s.reported, s.target, s.soc, s.state, cmd, owner_str
+                "{t:.0},{:.1},{:.1},{:.1},{:.0},{},{:.1},{},{actual},{reason}",
+                snap.s.grid,
+                snap.s.reported,
+                snap.s.target,
+                snap.s.soc,
+                snap.s.state,
+                dec.display_cmd,
+                dec.owner_str
             ));
         }
 
@@ -523,21 +727,34 @@ fn main() {
         sleep_or_break(args.interval);
     }
 
-    // --- clean shutdown: restore original mode ---------------------------------
-    if args.live {
-        eprintln!("restoring Hub4Mode={orig_mode} ...");
-        for attempt in 1..=5 {
-            match bus.set_i32(SETTINGS, P_HUB4MODE, orig_mode) {
-                Ok(()) => {
-                    eprintln!("Hub4Mode restored to {orig_mode}.");
-                    break;
-                }
-                Err(e) => {
-                    eprintln!("restore attempt {attempt} failed: {e}");
-                    std::thread::sleep(Duration::from_millis(500));
+    // --- clean shutdown: hand the system back to stock -------------------------
+    match args.stage {
+        // Takeover: restore the original Hub4Mode (we flipped it to 3).
+        Stage::Takeover => {
+            eprintln!("restoring Hub4Mode={orig_mode} ...");
+            for attempt in 1..=5 {
+                match bus.set_i32(SETTINGS, P_HUB4MODE, orig_mode) {
+                    Ok(()) => {
+                        eprintln!("Hub4Mode restored to {orig_mode}.");
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("restore attempt {attempt} failed: {e}");
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
                 }
             }
         }
+        // Trim: neutralise our override so stock resumes immediately; the 300 s override
+        // watchdog is the backstop if this final write doesn't land.
+        Stage::Trim => {
+            let sp = bus.get_f64(SETTINGS, P_SETPOINT_SETTING).unwrap_or(0.0);
+            match bus.set_f64(socguard::HUB4, socguard::P_OVR_SETPOINT, sp) {
+                Ok(()) => eprintln!("trim override neutralised to {sp:.0}W (stock resumes)."),
+                Err(e) => eprintln!("override neutralise failed: {e} (reverts via 300 s watchdog)."),
+            }
+        }
+        Stage::Shadow => {}
     }
     eprintln!("stopped.");
 }

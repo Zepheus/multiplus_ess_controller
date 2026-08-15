@@ -53,6 +53,10 @@ pub const P_TPIMF: &str = "/Hub4/TargetPowerIsMaxFeedIn"; // VEBUS, bool/int
 /// uses. In shadow we read stock hub4's published value; in Tier-B, our own served one.
 pub const HUB4: &str = "com.victronenergy.hub4";
 pub const P_OVR_FORCECHARGE: &str = "/Overrides/ForceCharge"; // hub4, int→bool
+/// The DESS/schedule setpoint-override surface. Writing it (mode 1) lets the stock ESS loop
+/// keep full authority while we bias only the grid target — the Stage-1 "trim" path, guarded
+/// by the verified 300 s override watchdog. (Read/written by main's Trim stage.)
+pub const P_OVR_SETPOINT: &str = "/Overrides/Setpoint"; // hub4, f64 (invalid = no override)
 
 /// Discharge-inhibit set {5,6,8,11,12} = {BLDischarged, BLForceCharge, BLLowSocCharge,
 /// SocGuardDischarged, SocGuardLowSocCharge}. the stock ESS loop tests it with the literal
@@ -441,6 +445,69 @@ mod tests {
             override_force_charge: false,
         };
         assert_eq!(enact(&inp).cmd_override, Some(FORCE_CHARGE_SENTINEL_W));
+    }
+
+    /// Dispatch scenario: a Home-Assistant automation RAISES `MinimumSocLimit` when Octopus
+    /// grants a cheap car-charge window, so the ESS charges instead of discharging. Verified
+    /// on-device (2026-08-15): the stock ESS loop subscribes to NO battery-SOC dbus path —
+    /// `updateBatteryLimits()` fires only on state/minSoc/dcVoltage/max{Charge,Discharge}Power/
+    /// sustain — so it CANNOT compare SOC to MinSOC itself. That decision is made entirely by
+    /// `dbus-systemcalc-py` `batterylife.py` (which we do NOT replace) and delivered via
+    /// `BatteryLife/State`:
+    ///   SocGuardDefault(10) --SOC≤MinSOC--> SocGuardDischarged(11)
+    ///                       --SOC≤MinSOC-5--> SocGuardLowSocCharge(12)
+    ///                       --SOC≥MinSOC--> back to (11)/(10).
+    /// Our job is faithful ENACTMENT of whatever state systemcalc emits. This replays that exact
+    /// sequence and asserts we inhibit at 11 and force-charge at 12 — i.e. the HA automation
+    /// keeps working byte-for-byte under the rewrite.
+    #[test]
+    fn dispatch_minsoc_raise_charges_via_state_machine() {
+        let sg = |state: i32| {
+            enact(&Inputs {
+                bl_state: state,
+                min_soc: 80.0, // HA raised it; the stock/our path only cares about >99, inert here
+                charge_request: false,
+                dc_voltage: 52.0,
+                eff_max_charge_w: 4700.0,
+                multi_supports_tpimf: true,
+                override_force_charge: false,
+            })
+        };
+        // Before dispatch: SocGuardDefault, SOC above min → discharge free, no charge.
+        let d = sg(10);
+        assert!(!d.force_charge);
+        assert_eq!(d.max_discharge_w, f64::INFINITY);
+
+        // Dispatch raises MinSOC above SOC → systemcalc: SocGuardDischarged(11).
+        // We must STOP discharging (hold) but not yet actively charge.
+        let hold = sg(11);
+        assert!(!hold.force_charge, "state 11 holds, does not force-charge");
+        assert_eq!(hold.max_discharge_w, 0.0, "state 11 must inhibit discharge");
+
+        // SOC ≥5% below the raised min → systemcalc: SocGuardLowSocCharge(12).
+        // We must force-charge from grid AND keep discharge inhibited.
+        let chg = sg(12);
+        assert!(chg.force_charge, "state 12 must force-charge (the dispatch charge)");
+        assert_eq!(chg.max_discharge_w, 0.0);
+        assert_eq!(chg.cmd_override, Some(4700.0), "charge at the configured ceiling");
+        assert!(chg.tpimf, "modern firmware path drives TPIMF force-charge");
+
+        // MinSOC=100 edge (HA sets 100%): our own >99 KeepCharged path also charges,
+        // independent of systemcalc — matches the stock loop's only internal SOC-ish rule.
+        let kc = enact(&Inputs { min_soc: 100.0, bl_state: 10, ..dispatch_inp() });
+        assert!(kc.force_charge, "MinSOC>99 is KeepCharged even at state 10");
+    }
+
+    fn dispatch_inp() -> Inputs {
+        Inputs {
+            bl_state: 10,
+            min_soc: 80.0,
+            charge_request: false,
+            dc_voltage: 52.0,
+            eff_max_charge_w: 4700.0,
+            multi_supports_tpimf: true,
+            override_force_charge: false,
+        }
     }
 
     // Regression against REAL captured data: during scheduled charge (state 259) hub4
