@@ -8,7 +8,7 @@
 //! applies to the ControlLoop command (per-tick order step 5, after the control law).
 //!
 //! Recovered constants used faithfully (RE confidence [H] unless noted, see
-//! the design notes §4a/§5):
+//! ../../re/socguard-gridmeter.md §4a/§5):
 //!   - force-charge predicate: state∈{8,12} ∨ ChargeRequest ∨ KeepCharged
 //!     (state 9 ∨ MinSOC > 99.0)
 //!   - discharge-inhibit set {5,6,8,11,12} via the mask (s-5<8) && (0xCB>>(s-5))&1
@@ -48,6 +48,11 @@ const FORCE_CHARGE_FLOOR_A: f64 = 5.0;
 pub const P_CHARGE_REQUEST: &str = "/Info/ChargeRequest"; // BMS, int→bool
 /// On the vebus service; item *validity* = firmware supports the modern path.
 pub const P_TPIMF: &str = "/Hub4/TargetPowerIsMaxFeedIn"; // VEBUS, bool/int
+/// The external force-charge trigger. systemcalc's schedule/DESS delegate SetValues
+/// this (e.g. the scheduled off-peak charge window) — the same override surface DESS
+/// uses. In shadow we read stock hub4's published value; in Tier-B, our own served one.
+pub const HUB4: &str = "com.victronenergy.hub4";
+pub const P_OVR_FORCECHARGE: &str = "/Overrides/ForceCharge"; // hub4, int→bool
 
 /// Discharge-inhibit set {5,6,8,11,12} = {BLDischarged, BLForceCharge, BLLowSocCharge,
 /// SocGuardDischarged, SocGuardLowSocCharge}. the stock ESS loop tests it with the literal
@@ -83,6 +88,10 @@ pub struct Inputs {
     pub eff_max_charge_w: f64,
     /// VEBUS `/Hub4/TargetPowerIsMaxFeedIn` item present (firmware capability probe).
     pub multi_supports_tpimf: bool,
+    /// `com.victronenergy.hub4 /Overrides/ForceCharge` (int→bool): external force-charge
+    /// trigger from systemcalc's schedule/DESS delegate (e.g. scheduled off-peak
+    /// charging). Verified against captured state-259 data where it was the ONLY signal.
+    pub override_force_charge: bool,
 }
 
 /// Enactment the main loop applies to the ControlLoop command, in this order:
@@ -112,10 +121,13 @@ pub struct SocGuardOut {
 /// Pure enactment — no I/O, total over any `Inputs` (incl. NaN). Faithful to §4a and
 /// unit-testable in isolation; `SocGuard::tick` samples `Inputs` and calls this.
 pub fn enact(inp: &Inputs) -> SocGuardOut {
-    // (§4a-3) Force-charge predicate. Overrides/ForceCharge is the separate Tier-B
-    // external-control surface and is intentionally NOT part of this predicate.
+    // (§4a-3) Force-charge predicate, INCLUDING the external Overrides/ForceCharge
+    // trigger (schedule / DESS) so scheduled off-peak charging is actually enacted.
     let keep_charged = inp.bl_state == KEEP_CHARGED || inp.min_soc > MINSOC_KEEPCHARGED;
-    let force_charge = inp.charge_request || keep_charged || matches!(inp.bl_state, 8 | 12);
+    let force_charge = inp.override_force_charge
+        || inp.charge_request
+        || keep_charged
+        || matches!(inp.bl_state, 8 | 12);
 
     // (§4a-2) Discharge inhibit: effective MaxDischargePower forced to 0 in the set.
     let max_discharge_w = if is_discharged_set(inp.bl_state) {
@@ -207,6 +219,7 @@ impl SocGuard {
             dc_voltage: bus.get_f64(VEBUS, P_DC_VOLTAGE).unwrap_or(f64::NAN),
             eff_max_charge_w,
             multi_supports_tpimf: bus.get_f64(VEBUS, P_TPIMF).is_some(),
+            override_force_charge: bus.get_i32(HUB4, P_OVR_FORCECHARGE).unwrap_or(0) != 0,
         }
     }
 
@@ -411,6 +424,7 @@ mod tests {
             dc_voltage: 52.0,
             eff_max_charge_w: f64::NAN,
             multi_supports_tpimf: true,
+            override_force_charge: false,
         };
         assert!(!enact(&inp).force_charge);
     }
@@ -424,7 +438,50 @@ mod tests {
             dc_voltage: 52.0,
             eff_max_charge_w: f64::NAN,
             multi_supports_tpimf: false,
+            override_force_charge: false,
         };
         assert_eq!(enact(&inp).cmd_override, Some(FORCE_CHARGE_SENTINEL_W));
+    }
+
+    // Regression against REAL captured data: during scheduled charge (state 259) hub4
+    // force-charges via /Overrides/ForceCharge with NO BatteryLife/ChargeRequest signal
+    // (bl_state stays 10). Before the fix our socguard triggered on 0 of those rows.
+    #[test]
+    fn golden_scheduled_charge_is_enacted() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/golden-sample.csv");
+        let data = match std::fs::read_to_string(path) {
+            Ok(d) => d,
+            Err(_) => return, // fixture optional
+        };
+        let mut lines = data.lines();
+        let header: Vec<&str> = lines.next().unwrap().split(',').collect();
+        let ix = |n: &str| header.iter().position(|h| *h == n).expect(n);
+        let (i_fc, i_bls, i_blm) = (ix("h4_forcecharge"), ix("bl_state"), ix("bl_minsoc"));
+        let mut rows = 0;
+        let mut fc_rows = 0;
+        for line in lines {
+            let f: Vec<&str> = line.split(',').collect();
+            if f.len() < header.len() {
+                continue;
+            }
+            let hub4_fc = f[i_fc].trim() == "1";
+            let mut bus = MockBus::new();
+            bus.set(SETTINGS, P_BL_STATE, f[i_bls].parse().unwrap_or(0.0));
+            bus.set(SETTINGS, P_BL_MINSOC, f[i_blm].parse().unwrap_or(0.0));
+            bus.set(HUB4, P_OVR_FORCECHARGE, if hub4_fc { 1.0 } else { 0.0 });
+            bus.set(VEBUS, P_DC_VOLTAGE, 52.0);
+            let out = SocGuard::new(&bus).tick(&bus);
+            assert_eq!(
+                out.force_charge, hub4_fc,
+                "force-charge mismatch vs hub4 (bl_state={}): ours={}",
+                f[i_bls], out.force_charge
+            );
+            if hub4_fc {
+                fc_rows += 1;
+            }
+            rows += 1;
+        }
+        assert!(fc_rows > 0, "fixture had no force-charge rows to validate the fix");
+        eprintln!("scheduled-charge replay: {rows} rows, {fc_rows} force-charge, all matched hub4");
     }
 }
