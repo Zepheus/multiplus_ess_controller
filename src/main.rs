@@ -205,7 +205,7 @@ fn parse_args() -> Result<Args, String> {
         sanity_band_w: None,
     };
     let mut ki: Option<f64> = None;
-    let mut i_max = 300.0;
+    let mut i_max: f64 = 300.0;
     let mut ctrl = String::from("pi");
     // Adaptive feed-forward knobs (only consulted for --controller adaptive).
     let mut ff_a: Option<f64> = None;
@@ -261,6 +261,38 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown arg {other}\n{}", help())),
         }
     }
+    // Numeric-flag validation: a bad value must error LOUDLY at startup, never silently
+    // disable or invert a control/safety mechanism (e.g. NaN ki pins the integral at 0 ==
+    // silently reverting to the leaky stock law; negative i-max inverts the clamp range and
+    // pins the integral at +|i_max| == a permanent phantom-charge bias; interval <= 0
+    // busy-loops the shared GX; slew <= 0 freezes the actuated setpoint).
+    if let Some(k) = ki {
+        if !(k.is_finite() && k > 0.0) {
+            return Err("--ki must be finite and > 0".into());
+        }
+    }
+    if !(i_max.is_finite() && i_max > 0.0) {
+        return Err("--i-max must be finite and > 0".into());
+    }
+    if !(a.interval.is_finite() && (0.1..=3600.0).contains(&a.interval)) {
+        return Err("--interval must be within [0.1, 3600] seconds".into());
+    }
+    if !(a.trim_ki.is_finite() && a.trim_ki > 0.0) {
+        return Err("--trim-ki must be finite and > 0".into());
+    }
+    if !(a.min_soc.is_finite() && (0.0..=100.0).contains(&a.min_soc)) {
+        return Err("--min-soc must be within [0, 100]".into());
+    }
+    if let Some(s) = a.slew_w_per_s {
+        if !(s.is_finite() && s > 0.0) {
+            return Err("--slew-w-per-s must be finite and > 0".into());
+        }
+    }
+    if let Some(b) = a.sanity_band_w {
+        if !(b.is_finite() && b > 0.0) {
+            return Err("--sanity-band-w must be finite and > 0".into());
+        }
+    }
     a.kind = match ctrl.as_str() {
         "stock" => Kind::Stock,
         "true-integral" => Kind::TrueIntegral { ki: ki.unwrap_or(1.0) },
@@ -306,7 +338,7 @@ fn parse_args() -> Result<Args, String> {
 
 fn help() -> String {
     "\
-venus-ess-controller [--stage shadow|trim|takeover] [--controller stock|pi|true-integral|adaptive]
+multiplus_ess_controller [--stage shadow|trim|takeover] [--controller stock|pi|true-integral|adaptive]
   [--ki F] [--i-max F] [--trim-ki F] [--slew-w-per-s F] [--sanity-band-w F] [--interval S]
   [--min-soc %] [--max-discharge W] [--max-charge W] [--seconds N] [--confirm] [--quiet]
   [--telemetry PATH]
@@ -317,7 +349,11 @@ adaptive: PI + a continuously-learned feed-forward leak(throughput) ~= a + b*|re
   never over-trusts. Options:
   [--ff-a W] [--ff-b FRAC] seed initial coefficients (tightens the prior so they are used
     from tick one); [--ff-mode apply|observe|frozen] (observe == --ff-learn-only: keep
-    learning but actuate integral-only; frozen: apply the seed, never learn);
+    learning but actuate integral-only; frozen: apply the seed, never learn). NOTE:
+    learning requires ACTUATION (takeover + owning + usable meter) — in shadow/trim the
+    model deliberately stays null (MODEL: a=0 b=0), because a non-actuated loop would
+    train it on a phantom regime. So observe/learn-only is a TAKEOVER mode: it drives
+    with the plain integral while the model learns on the side;
   [--ff-lambda 0<L<=1] RLS forgetting (memory ~= 1/(1-L)); [--ff-conf-scale-w W] prediction-
     sigma at which the model gets 50% authority. The learned model is logged periodically as
     `MODEL: a=.. b=.. conf=..`; hard safety (write phase) is independent of anything learned.
@@ -626,6 +662,7 @@ fn main() {
         last_out: None,
         oob_since: None,
         prev_force_charge: false,
+        sanity_trips: 0,
     };
     let cfg = loop_core::DecideCfg {
         stage: args.stage,

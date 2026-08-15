@@ -58,7 +58,7 @@ rustup target add armv7-unknown-linux-musleabihf
 cargo build --release   # -> target/armv7-unknown-linux-musleabihf/release/multiplus_ess_controller… (static)
 ```
 
-Produces a ~400 KB fully static musl binary that runs on any Venus OS regardless of glibc.
+Produces a ~1 MB fully static musl binary that runs on any Venus OS regardless of glibc.
 
 ## Run
 
@@ -112,14 +112,22 @@ slope (fraction of load) before, hand them over to skip the warm-up. It still ke
     --ff-a 25 --ff-b 0.04         # ~25 W fixed + 4 % of load
 ```
 
-**3. Watch it learn without acting (`--ff-learn-only`).** Learn the model but actuate
-integral-only, so you can watch it converge before trusting the feed-forward. The learned
-model is printed periodically:
+**3. Watch it learn without trusting it (`--ff-learn-only`).** Drive with the plain
+integral while the model learns on the side, so you can watch it converge before letting
+the feed-forward act. The learned model is printed periodically:
 
 ```bash
-./multiplus_ess_controller --stage shadow --controller adaptive --ff-learn-only
+VENUS_ESS_LIVE=I_UNDERSTAND ./multiplus_ess_controller --stage takeover --confirm \
+    --controller adaptive --ff-learn-only
 # ... MODEL: a=24.8W b=0.0391 (3.9% of load) conf=0.72 @load=1500W
 ```
+
+> **Learning requires actuation.** The model only learns while this controller is *really
+> driving* the inverter (takeover, owning the loop, meter healthy) — a loop that isn't
+> actuating can't know what its corrections would have done, so training there would
+> poison the model. In `--stage shadow` (and trim) the model therefore deliberately stays
+> null (`MODEL: a=0.0 b=0.0000`) — that is by design, not a malfunction. Shadow is for
+> validating the *stock-law fidelity* (`--controller stock`), not for training.
 
 Use `--ff-mode frozen` (with `--ff-a`/`--ff-b`) to pin a known-good model and stop learning —
 handy for reproducible A/B runs.
@@ -150,12 +158,15 @@ fine, the offset + integral still hold target.
 
 ### Suggested rollout
 
-1. **Shadow, learn-only** for an evening — watch the `MODEL:` line converge, confirm `a`/`b`
-   match the leak you measured with `stock`, no writes:
-   `--stage shadow --controller adaptive --ff-learn-only`
-2. **Seed a live run** from those learned numbers so it starts sharp:
-   `--stage takeover --confirm --controller adaptive --ff-a <a> --ff-b <b>`
-3. Thereafter just run `--controller adaptive` (optionally seeded); it keeps adapting.
+1. **Shadow with `stock`** for an evening — no writes; confirm the reimplementation matches
+   your device's real commands and measure your leak (grid minus setpoint):
+   `--stage shadow --controller stock`
+2. **Supervised takeover with `--ff-learn-only`** — drives with the plain integral (already
+   fixes the steady-state leak) while the model learns on the side; watch the `MODEL:` line
+   converge and sanity-check `a`/`b` against the leak measured in step 1.
+3. **Let the feed-forward act** — either re-run with the learned numbers as a seed
+   (`--controller adaptive --ff-a <a> --ff-b <b>`) or simply run plain `--controller
+   adaptive` and let it re-learn; it keeps adapting either way.
 
 ### Advanced knobs (rarely needed — defaults are sensible)
 

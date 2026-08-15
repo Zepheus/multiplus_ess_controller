@@ -4,9 +4,9 @@
 //! `SetValue` writes on `/Overrides/*`.
 //!
 //! SAFETY / DEPLOYMENT: only ONE process may own `com.victronenergy.hub4`. On a live
-//! system stock the stock ESS loop owns it, so this server MUST NOT be started in shadow or
+//! system the stock ESS loop owns it, so this server MUST NOT be started in shadow or
 //! Tier-A co-exist mode (it would collide). It runs only after the supervised Tier-B
-//! cutover that stops stock the stock ESS loop. The pure logic below (override watchdog,
+//! cutover that stops the stock ESS loop. The pure logic below (override watchdog,
 //! value/invalid encoding) is unit-tested; the D-Bus serving is compile-verified and
 //! validated end-to-end at the cutover.
 
@@ -151,7 +151,7 @@ impl Default for Hub4Service {
 // --- D-Bus serving (Tier-B cutover only; compile-verified) -------------------------
 //
 // Registering the bus name and serving one `BusItem` object per path is done via the
-// zbus blocking object server. Because this can only run when stock the stock ESS loop is
+// zbus blocking object server. Because this can only run when the stock ESS loop is
 // stopped (single-owner name), it is behind `serve` and never invoked in shadow. The
 // value encoding uses the empty-array-invalid convention: `Some(x)` -> `double x`,
 // `None` -> an empty array (GUI renders "--").
@@ -159,7 +159,7 @@ impl Default for Hub4Service {
 pub mod serving {
     // Intentionally gated: the zbus object-server wiring is enabled with the
     // `hub4-server` feature for the Tier-B cutover build, so a shadow/Tier-A build
-    // never links a bus-name registration that would collide with stock the stock ESS loop.
+    // never links a bus-name registration that would collide with the stock ESS loop.
     // The BusItem interface (GetValue/GetText/SetValue/ItemsChanged) and
     // `Connection::request_name("com.victronenergy.hub4")` live here.
 }

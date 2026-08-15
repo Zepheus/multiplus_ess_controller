@@ -108,7 +108,7 @@ impl FeedMode {
 }
 
 /// Force-charge context from the (not-yet-built) force-charge / feed-in subsystem
-/// (see re/feedin-sustain.md). All-false `Default` yields grid `Normal`, which is the
+/// (see the feed-in/sustain design notes). All-false `Default` yields grid `Normal`, which is the
 /// correct grid-only stub for THIS install. The genset branch ignores every field.
 #[derive(Clone, Copy, Default)]
 pub struct ForceChargeCtx {

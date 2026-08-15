@@ -180,6 +180,11 @@ pub struct LoopState {
     /// Previous tick's force-charge flag — the sanity check is suppressed during force-charge
     /// (grid legitimately diverges then); using last tick avoids an ordering dependency.
     pub prev_force_charge: bool,
+    /// Sanity-trip latch: how many times the sanity supervisor has forced a hand-back this
+    /// run. Each trip DOUBLES the dwell required before re-takeover (capped), so a
+    /// persistently-wrong controller escalates to hour-scale retries instead of flip-flopping
+    /// mode 3<->1 every `min_dwell_s`. Never reset within a run (a restart starts clean).
+    pub sanity_trips: u32,
 }
 
 /// Immutable per-run config for `decide()`.
@@ -272,21 +277,28 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
     // we're NOT in a (previous-tick) force-charge where grid legitimately diverges, require the
     // grid to stay within `sanity_band_w` of the setpoint. Beyond it for `sanity_secs` => trip,
     // which forces hand-back below. Catches a gross bug, not the small ~4 % leak.
+    // A NON-FINITE grid error also counts as out-of-band: if we cannot verify sanity while
+    // driving, hand back after `sanity_secs` and let stock + its meter guard deal with it
+    // (a NaN must not silently RESET the out-of-band timer).
+    let gerr = s.grid - s.target;
     let oob = st.owner_us
         && cfg.stage.writes()
         && snap.gm_should_write
         && !st.prev_force_charge
-        && (s.grid - s.target).abs() > cfg.sanity_band_w;
+        && (!gerr.is_finite() || gerr.abs() > cfg.sanity_band_w);
     st.oob_since = if oob { Some(st.oob_since.unwrap_or(t)) } else { None };
     let sanity_tripped = st.oob_since.is_some_and(|t0| t - t0 >= cfg.sanity_secs);
 
     // 1. Ownership envelope — may own iff SOC is comfortably above the floor and we're not in
     //    a recharge state. Hysteresis + dwell prevent thrash; hand-BACK is never throttled.
-    //    A sanity trip forces exit (hand back / neutralise) regardless of dwell.
+    //    A sanity trip forces exit (hand back / neutralise) regardless of dwell, and each trip
+    //    doubles the re-entry dwell (latch/backoff): a persistently-wrong controller escalates
+    //    to hour-scale retries instead of oscillating mode 3<->1 forever.
     let enter_ok = s.soc >= snap.min_soc + cfg.soc_hyst && s.state != cfg.state_recharge;
     let exit_now = s.soc <= snap.min_soc || s.state == cfg.state_recharge || sanity_tripped;
     let want_us = if st.owner_us { !exit_now } else { enter_ok };
-    let dwell_ok = t - st.last_flip_t >= cfg.min_dwell_s;
+    let backoff_s = cfg.min_dwell_s * f64::from(1u32 << st.sanity_trips.min(7)); // 30s .. ~64min
+    let dwell_ok = t - st.last_flip_t >= backoff_s;
 
     let mut note = "";
     let mut hub4mode = None;
@@ -296,6 +308,10 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
         st.owner_us = want_us;
         st.last_flip_t = t;
         flipped = true;
+        if !want_us && sanity_tripped {
+            // Trip-forced hand-back: latch it (doubles the re-entry dwell, see above).
+            st.sanity_trips = st.sanity_trips.saturating_add(1);
+        }
         match cfg.stage {
             // Takeover flips Hub4Mode 1<->3 so stock relinquishes / resumes the whole loop.
             Stage::Takeover => {
@@ -458,6 +474,7 @@ mod tests {
             last_out: None,
             oob_since: None,
             prev_force_charge: false,
+            sanity_trips: 0,
         }
     }
 
@@ -569,6 +586,115 @@ mod tests {
         let mut ctrl = Controller::new(Kind::Stock);
         let cmd = composed_command(&sp, &mut ctrl, false);
         assert_eq!(cmd, 4700.0);
+    }
+
+    /// End-to-end learn-gate test THROUGH decide(): identical steady discharge inputs must
+    /// leave the adaptive model untouched in shadow and trim (our command isn't actuated
+    /// there — learning would train on a phantom regime)...
+    #[test]
+    fn adaptive_gate_shadow_and_trim_never_learn_e2e() {
+        use crate::control::AdaptiveCfg;
+        for stage in [Stage::Shadow, Stage::Trim] {
+            let mut st = state(Kind::Adaptive(AdaptiveCfg::tuned()));
+            st.owner_us = true; // even while "owning" (trim active / shadow hypothetical)
+            let c = cfg(stage);
+            for i in 0..500 {
+                let mut sp = snap(true);
+                sp.s.grid = sp.s.target - 10.0; // steady small error => integral winds
+                sp.s.reported = -800.0; // steady discharge throughput
+                decide(&sp, &mut st, &c, i as f64);
+            }
+            let ff = st.ctrl.ff_snapshot(800.0).unwrap();
+            assert_eq!((ff.a, ff.b), (0.0, 0.0), "{} must not learn", stage.name());
+        }
+    }
+
+    /// ...and the SAME inputs in takeover (owning + meter usable) MUST learn. Together with
+    /// the test above this pins the `actuating` expression in decide() in both directions.
+    #[test]
+    fn adaptive_gate_takeover_learns_e2e() {
+        use crate::control::AdaptiveCfg;
+        let mut st = state(Kind::Adaptive(AdaptiveCfg::tuned()));
+        st.owner_us = true;
+        let c = cfg(Stage::Takeover);
+        for i in 0..500 {
+            let mut sp = snap(true);
+            sp.s.grid = sp.s.target - 10.0;
+            sp.s.reported = -800.0;
+            decide(&sp, &mut st, &c, i as f64);
+        }
+        let ff = st.ctrl.ff_snapshot(800.0).unwrap();
+        assert!(
+            ff.a != 0.0 || ff.b != 0.0,
+            "takeover + owning + usable meter must learn, got a={} b={}",
+            ff.a,
+            ff.b
+        );
+    }
+
+    /// Persistently NON-FINITE grid while driving counts as out-of-band: we cannot verify
+    /// sanity, so after sanity_secs we must trip and hand back (a NaN must never silently
+    /// reset the out-of-band timer).
+    #[test]
+    fn sanity_nan_grid_counts_out_of_band() {
+        let mut st = state(Kind::Pi { ki: 0.05, i_max: 300.0 });
+        st.owner_us = true;
+        let c = cfg(Stage::Takeover);
+        let mut trip_t = None;
+        for i in 0..100 {
+            let mut sp = snap(true);
+            sp.s.grid = f64::NAN;
+            let d = decide(&sp, &mut st, &c, i as f64);
+            if d.safety.sanity_tripped {
+                trip_t = Some(i);
+                // At the trip tick the supervisor must have forced the hand-back.
+                assert!(!st.owner_us, "trip must hand back immediately");
+                assert_eq!(st.sanity_trips, 1);
+                break;
+            }
+        }
+        let trip_t = trip_t.expect("persistent NaN grid must trip the sanity supervisor");
+        assert!(
+            (trip_t as f64) >= c.sanity_secs,
+            "trip only after the sanity dwell, got t={trip_t}"
+        );
+    }
+
+    /// Sanity-trip latch: each trip doubles the re-entry dwell, so a persistently-wrong
+    /// controller escalates instead of flip-flopping mode 3<->1 every min_dwell.
+    #[test]
+    fn sanity_trip_backoff_doubles_reentry_dwell() {
+        let mut st = state(Kind::Pi { ki: 0.05, i_max: 300.0 });
+        st.owner_us = true;
+        let c = cfg(Stage::Takeover);
+        let mut t = 0.0;
+        // Grossly out-of-band until the supervisor trips and hands back.
+        while st.owner_us {
+            let mut sp = snap(true);
+            sp.s.grid = sp.s.target + 5000.0;
+            decide(&sp, &mut st, &c, t);
+            t += 1.0;
+            assert!(t < 100.0, "should have tripped within sanity_secs");
+        }
+        assert_eq!(st.sanity_trips, 1);
+        let handback_t = t;
+        // Healthy again: re-entry must now wait 2x min_dwell, not 1x.
+        while !st.owner_us {
+            let mut sp = snap(true);
+            sp.s.grid = sp.s.target; // in band
+            decide(&sp, &mut st, &c, t);
+            if st.owner_us {
+                break;
+            }
+            t += 1.0;
+            assert!(t < handback_t + 500.0, "never re-entered");
+        }
+        let waited = t - handback_t;
+        assert!(
+            waited >= 2.0 * c.min_dwell_s - 1.0,
+            "after one trip re-entry must wait 2x dwell ({}s), waited {waited}s",
+            2.0 * c.min_dwell_s
+        );
     }
 
     // ---- write-phase safety features (each is observable via `Decision.safety`) ----

@@ -40,7 +40,10 @@ pub enum FfMode {
     /// Learn the model AND apply it (confidence-weighted). The continuous default.
     Apply,
     /// Learn-only: keep updating the model but actuate integral-only, so you can watch
-    /// it converge (via the periodic `MODEL:` log) before trusting it. Zero output effect.
+    /// it converge (via the periodic `MODEL:` log) before trusting it. Zero feed-forward
+    /// output effect. NOTE: learning still requires ACTUATION (takeover + owning) — the
+    /// integral must really be driving the plant for its value to mean anything. In
+    /// shadow/trim the model stays null by design (see the `learn` gate in `update`).
     Observe,
     /// Do not learn: apply the seeded `(a, b)` as a fixed feed-forward. For pinning a
     /// known-good model or reproducible A/B runs.
@@ -125,9 +128,10 @@ const B_ABS_MAX: f64 = 0.5; // slope within ±50 % of throughput
 
 // Prior parameter std-dev before any data. A WIDE prior (unseeded) makes early
 // predictions low-confidence, so the model contributes ~nothing until it has learned;
-// a SEED starts tighter so the supplied numbers are trusted from tick one. These also
-// serve as the covariance CAP: `P` may shrink below them as data arrives but never
-// inflate past them, which bounds the gain and kills low-excitation windup.
+// a SEED starts tighter so the supplied numbers are trusted from tick one. Their sum
+// also serves as the covariance TRACE cap: total covariance magnitude is bounded at
+// the prior trace (an individual element may transiently exceed its own prior within
+// that total), which bounds the RLS gain and prevents low-excitation overflow.
 const PRIOR_A_SD_WIDE: f64 = 500.0; // W
 const PRIOR_B_SD_WIDE: f64 = 0.5; // fraction of throughput
 const PRIOR_A_SD_SEED: f64 = 50.0;
@@ -212,10 +216,14 @@ impl RlsModel {
         if !self.p01.is_finite() {
             self.p01 = 0.0;
         }
-        // Anti-windup: bound the total covariance at the prior by scaling the WHOLE matrix
-        // (preserves PSD and the eigen-directions — unlike per-element caps). Without this,
-        // persistent low excitation inflates the null-space element by 1/λ per tick until
-        // it overflows and snaps the model back to ignorance.
+        // Anti-windup: bound the TOTAL covariance (trace) at the prior trace by scaling the
+        // WHOLE matrix (preserves PSD and the eigen-directions — unlike per-element caps,
+        // which broke PSD). Without this, persistent low excitation inflates the null-space
+        // element by 1/λ per tick until it overflows and snaps the model back to ignorance.
+        // Known trade-off while the cap is active (long single-load dwell): the identified
+        // direction's variance keeps shrinking, so `conf` reads optimistically and re-learning
+        // a drift AT THE SAME load is slow — the residual integral covers the difference, and
+        // a load CHANGE still adapts fast (null-direction variance stays high).
         let trace = self.p00 + self.p11;
         let trace_cap = self.p00_cap + self.p11_cap;
         if trace > trace_cap && trace.is_finite() {
@@ -307,6 +315,11 @@ impl Controller {
         match self.kind {
             Kind::Stock => clamp(target - grid + reported, lo, hi),
             Kind::TrueIntegral { ki } => {
+                // Hold the accumulated command through a non-finite reading (emit the safe
+                // idle command, resume from held state on recovery) — never wipe it to 0.
+                if !grid.is_finite() {
+                    return clamp(f64::NAN, lo, hi); // -> 0 (idle)
+                }
                 let c = self.cmd.unwrap_or(target - grid + reported);
                 let c = clamp(c - ki * (grid - target), lo, hi);
                 self.cmd = Some(c);
@@ -314,7 +327,12 @@ impl Controller {
             }
             Kind::Pi { ki, i_max } => {
                 let err = target - grid;
-                self.i = clamp(self.i + ki * err * dt, -i_max, i_max);
+                // Hold the integral on a non-finite reading rather than letting `clamp`
+                // silently zero it (same policy as the adaptive path below); the command
+                // itself still degrades to the safe idle 0 via the final clamp.
+                if err.is_finite() && dt > 0.0 {
+                    self.i = clamp(self.i + ki * err * dt, -i_max, i_max);
+                }
                 clamp((target - grid + reported) + self.i, lo, hi)
             }
             Kind::Adaptive(c) => {
@@ -365,8 +383,9 @@ impl Controller {
 
         // Learn (unless frozen) only when WE actuate and from clean steady-state
         // DISCHARGE/idle samples: settled grid error AND settled throughput. Load
-        // transients — and charging, which this envelope never does — are excluded, as
-        // they would poison the discharge load→leak fit.
+        // transients are excluded (they'd poison the fit), and so are charging samples
+        // (`reported > 0`, e.g. a force-charge/charge-floor episode) — the model is a
+        // DISCHARGE leak curve and charge efficiency differs.
         let steady = learn
             && err.abs() <= c.steady_band_w
             && self
