@@ -177,8 +177,10 @@ pub struct LoopState {
     pub last_out: Option<f64>,
     /// `t` when grid first went out of the sanity band while driving; None while in-band.
     pub oob_since: Option<f64>,
-    /// Previous tick's force-charge flag — the sanity check is suppressed during force-charge
-    /// (grid legitimately diverges then); using last tick avoids an ordering dependency.
+    /// Previous tick's "grid legitimately diverges" flag: force-charge OR an external
+    /// discharge cap (`/Overrides/MaxDischargePower` — schedule post-target hold — or a
+    /// BL discharged state). The sanity check is suppressed while it was set; using last
+    /// tick avoids an ordering dependency.
     pub prev_force_charge: bool,
     /// Sanity-trip latch: how many times the sanity supervisor has forced a hand-back this
     /// run. Each trip DOUBLES the dwell required before re-takeover (capped), so a
@@ -250,8 +252,12 @@ pub fn composed_command(snap: &Snapshot, ctrl: &mut Controller, actuating: bool)
     // SocGuard: discharge inhibit (INF => no-op; 0 => no discharge).
     cmd = cmd.max(-snap.sg.max_discharge_w);
     if let Some(fc) = snap.sg.cmd_override {
-        // force charge
-        cmd = if snap.sg.tpimf { cmd.max(0.0).min(fc) } else { fc };
+        // Force charge. TPIMF (mode 0): keep writing the normal-law value capped at
+        // Σ max-charge — the firmware charges maximally on its own and reinterprets the
+        // setpoint as a feed-in cap, so the value may legitimately go negative (live-
+        // verified 2026-08-16 across a full 6 h window: the stock daemon writes the raw
+        // normal law, median |Δ| 2.5 W). Legacy (mode 1): the setpoint IS the charge command.
+        cmd = if snap.sg.tpimf { cmd.min(fc) } else { fc };
     }
     if snap.sg.charge_floor_w > 0.0 {
         // minimum-charge floor ONLY when set (BL state 6); 0 must not zero discharge.
@@ -365,9 +371,15 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
             }
             Stage::Trim => {
                 // Outer integral on /Overrides/Setpoint; stock owns everything else. Suspend
-                // (hold neutral) while stock force-charges or the meter is unusable.
+                // (hold neutral) while stock force-charges, an external discharge cap is
+                // active (schedule post-target hold: stock deliberately lets grid diverge,
+                // trimming would only wind up and bite when the cap clears), or the meter
+                // is unusable.
                 let o = st.trim_override.get_or_insert(s.target);
-                if snap.sg.force_charge || !snap.gm_should_write {
+                if snap.sg.force_charge
+                    || snap.sg.max_discharge_w.is_finite()
+                    || !snap.gm_should_write
+                {
                     *o = s.target;
                 } else {
                     *o = crate::control::clamp(
@@ -414,8 +426,9 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
     let feed_shore_write =
         st.owner_us && matches!(cfg.stage, Stage::Takeover) && snap.gm_should_write;
 
-    // Remember force-charge for the next tick's sanity suppression.
-    st.prev_force_charge = snap.sg.force_charge;
+    // Remember force-charge / external discharge hold for the next tick's sanity
+    // suppression (both make the grid legitimately diverge from the setpoint).
+    st.prev_force_charge = snap.sg.force_charge || snap.sg.max_discharge_w.is_finite();
 
     Decision {
         command: cmd,
@@ -564,6 +577,39 @@ mod tests {
         assert_eq!(d.write, Write::Override(sp.s.target), "hold neutral, don't fight stock");
     }
 
+    /// The window-tail hold (live 2026-08-16): ForceCharge already 0, but
+    /// `/Overrides/MaxDischargePower` = 1 W pins the battery while a 1.9 kW load runs.
+    /// Trim must hold neutral — integrating against a deliberately-held battery only
+    /// winds the override up and bites when the hold clears at window end.
+    #[test]
+    fn trim_suspends_during_window_tail_hold() {
+        let mut st = state(Kind::Stock);
+        let mut sp = snap(true);
+        sp.sg.max_discharge_w = 1.0; // external hold, NOT force-charge
+        sp.s.grid = 1908.9;
+        let c = cfg(Stage::Trim);
+        decide(&sp, &mut st, &c, 0.0); // take over
+        let d = decide(&sp, &mut st, &c, 1.0);
+        assert_eq!(d.write, Write::Override(sp.s.target), "hold neutral during the tail hold");
+    }
+
+    #[test]
+    fn sanity_is_suppressed_during_window_tail_hold() {
+        // Same scenario in takeover: grid legitimately 1.9 kW off-target while the hold
+        // is active — must not accumulate toward a sanity trip / spurious hand-back.
+        let mut st = state(Kind::Stock);
+        st.owner_us = true;
+        st.prev_force_charge = true; // set by the previous tick's hold (see decide())
+        let mut sp = snap(true);
+        sp.sg.max_discharge_w = 1.0;
+        sp.s.grid = 1908.9;
+        let d = decide(&sp, &mut st, &cfg(Stage::Takeover), 100.0);
+        assert!(st.oob_since.is_none(), "hold must suppress the out-of-band timer");
+        assert!(d.owner_us, "no hand-back during the tail hold");
+        // And the flag re-arms for the next tick from the cap itself.
+        assert!(st.prev_force_charge);
+    }
+
     #[test]
     fn shadow_never_writes() {
         let mut st = state(Kind::Stock);
@@ -586,6 +632,58 @@ mod tests {
         let mut ctrl = Controller::new(Kind::Stock);
         let cmd = composed_command(&sp, &mut ctrl, false);
         assert_eq!(cmd, 4700.0);
+    }
+
+    /// Live capture 2026-08-16 ~04:15, scheduled-charge window MID (SystemState 259,
+    /// `/Overrides/ForceCharge`=1, TPIMF firmware): the stock daemon keeps writing the
+    /// raw normal-law value — observed `AcPowerSetpoint` = −230 W at grid 2 771.7 W /
+    /// reported +2 513 W / target 5 W (the firmware charges maximally on its own; the
+    /// setpoint only caps feed-in). Our first implementation clamped this to ≥ 0 and
+    /// deviated by ~house-loads (~+200 W median) for the whole 6 h window.
+    #[test]
+    fn golden_tpimf_force_charge_passes_normal_law_through() {
+        let mut sp = snap(true);
+        sp.s = Sensors { grid: 2771.7, reported: 2513.0, target: 5.0, soc: 73.0, state: 259 };
+        sp.effective_target = 5.0;
+        sp.sg = SocGuardOut {
+            force_charge: true,
+            max_discharge_w: f64::INFINITY, // schedule sets NO discharge cap while charging
+            cmd_override: Some(crate::socguard::FORCE_CHARGE_SENTINEL_W),
+            tpimf: true,
+            charge_floor_w: 0.0,
+        };
+        let mut ctrl = Controller::new(Kind::Stock);
+        let cmd = composed_command(&sp, &mut ctrl, false);
+        // Normal law: reported + (target − grid) = 2513 + 5 − 2771.7 = −253.7 W.
+        // The stock daemon wrote −230 W on this row (Δ = meter/tick noise).
+        assert!((cmd - (-253.7)).abs() < 1.0, "normal law must pass through, got {cmd}");
+        assert!((cmd - (-230.0)).abs() < 100.0, "must track the stock daemon's live write, got {cmd}");
+    }
+
+    /// Live capture 2026-08-16 ~04:30, scheduled-charge window TAIL: target SOC (90 %)
+    /// reached with the window still open. systemcalc drops `/Overrides/ForceCharge` to 0
+    /// and sets `/Overrides/MaxDischargePower` = max(1, 0.8·pv) = 1 W (no PV at night) —
+    /// "hold the charge". Stock held ~+48 W against a 1.9 kW morning load while the raw
+    /// normal law wanted −1 868 W. Without honoring the override we would have discharged
+    /// the freshly charged battery into the house for the remaining ~37 min of the window.
+    #[test]
+    fn golden_window_tail_discharge_hold_is_honored() {
+        let mut sp = snap(true);
+        sp.s = Sensors { grid: 1908.9, reported: 35.0, target: 5.0, soc: 90.0, state: 259 };
+        sp.effective_target = 5.0;
+        sp.sg = sg_free();
+        sp.sg.max_discharge_w = 1.0; // enact() of /Overrides/MaxDischargePower = 1
+        let mut ctrl = Controller::new(Kind::Stock);
+        let cmd = composed_command(&sp, &mut ctrl, false);
+        assert!(cmd >= -1.0 - 1e-9, "window tail must hold charge, got {cmd}");
+        assert!((cmd - 48.0).abs() < 100.0, "must track the stock daemon's live hold (~+48 W), got {cmd}");
+
+        // Same row with the override cleared (window exit, or an AllowDischarge schedule
+        // >1 % over target): normal discharge resumes.
+        sp.sg = sg_free();
+        let mut ctrl = Controller::new(Kind::Stock);
+        let cmd = composed_command(&sp, &mut ctrl, false);
+        assert!(cmd < -1500.0, "cleared override must discharge normally, got {cmd}");
     }
 
     /// End-to-end learn-gate test THROUGH decide(): identical steady discharge inputs must
@@ -896,7 +994,15 @@ mod tests {
                 d.command
             );
             if sg.force_charge {
-                assert!(d.command >= -1e-6, "row {n}: force-charge but command {} discharges", d.command);
+                // TPIMF: the setpoint is a feed-in cap while firmware charges maximally —
+                // the normal-law value passes through (may be negative), capped at Σ max-
+                // charge. Legacy: the setpoint IS the charge command and must not discharge.
+                let fc = sg.cmd_override.expect("force_charge implies cmd_override");
+                if sg.tpimf {
+                    assert!(d.command <= fc + 1e-6, "row {n}: TPIMF command {} above Σ max-charge {fc}", d.command);
+                } else {
+                    assert!(d.command >= -1e-6, "row {n}: legacy force-charge but command {} discharges", d.command);
+                }
             }
             if hub4_fc {
                 fc_rows += 1;

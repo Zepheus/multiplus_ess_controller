@@ -57,6 +57,14 @@ pub const P_OVR_FORCECHARGE: &str = "/Overrides/ForceCharge"; // hub4, int→boo
 /// keep full authority while we bias only the grid target — the Stage-1 "trim" path, guarded
 /// by the verified 300 s override watchdog. (Read/written by main's Trim stage.)
 pub const P_OVR_SETPOINT: &str = "/Overrides/Setpoint"; // hub4, f64 (invalid = no override)
+/// External discharge-power cap. Written by systemcalc's schedule delegate as the
+/// post-target hold: once a scheduled-charge window reaches its target SOC (< 100 %),
+/// it sets this to `max(1, 0.8..0.95 × DC-PV power)` — with no PV that is **1 W**, i.e.
+/// "hold the charge, don't discharge for the rest of the window". (DESS reuses the same
+/// surface as a dynamic cap.) < 0 or invalid = no cap. Live-verified 2026-08-16: during
+/// the window tail the stock daemon held ~+48 W against a 1.9 kW house load while the
+/// unclamped normal law wanted ≈ −1.86 kW.
+pub const P_OVR_MAXDISCHARGE: &str = "/Overrides/MaxDischargePower"; // hub4, f64
 
 /// Discharge-inhibit set {5,6,8,11,12} = {BLDischarged, BLForceCharge, BLLowSocCharge,
 /// SocGuardDischarged, SocGuardLowSocCharge}. the stock ESS loop tests it with the literal
@@ -96,12 +104,18 @@ pub struct Inputs {
     /// trigger from systemcalc's schedule/DESS delegate (e.g. scheduled off-peak
     /// charging). Verified against captured state-259 data where it was the ONLY signal.
     pub override_force_charge: bool,
+    /// `com.victronenergy.hub4 /Overrides/MaxDischargePower` (W): external discharge cap,
+    /// NaN (invalid/unread) or < 0 = none. Set by the schedule delegate to ~1 W during a
+    /// window's post-target hold — without honoring it we would discharge the freshly
+    /// charged battery back into the house for the rest of the window.
+    pub ovr_max_discharge_w: f64,
 }
 
 /// Enactment the main loop applies to the ControlLoop command, in this order:
 ///   1. discharge inhibit: `cmd = cmd.max(-max_discharge_w)` (no-op when +∞)
 ///   2. force charge: if `cmd_override` is `Some(fc)` —
-///        tpimf  → `set_i32(VEBUS, P_TPIMF, 1); cmd = cmd.max(0.0).min(fc)`
+///        tpimf  → `set_i32(VEBUS, P_TPIMF, 1); cmd = cmd.min(fc)` (normal law passes
+///                 through as the firmware's feed-in cap; may be negative)
 ///        legacy → `set_i32(VEBUS, P_TPIMF, 0); cmd = fc`
 ///      else `set_i32(VEBUS, P_TPIMF, 0)`
 ///   3. state-6 slow-charge floor: `cmd = cmd.max(charge_floor_w)`
@@ -133,12 +147,20 @@ pub fn enact(inp: &Inputs) -> SocGuardOut {
         || keep_charged
         || matches!(inp.bl_state, 8 | 12);
 
-    // (§4a-2) Discharge inhibit: effective MaxDischargePower forced to 0 in the set.
-    let max_discharge_w = if is_discharged_set(inp.bl_state) {
+    // (§4a-2) Discharge inhibit: effective MaxDischargePower forced to 0 in the set,
+    // AND capped by the external /Overrides/MaxDischargePower (ephemeral override —
+    // schedule post-target hold / DESS). Most restrictive wins.
+    let state_inhibit = if is_discharged_set(inp.bl_state) {
         0.0
     } else {
         f64::INFINITY
     };
+    let ovr_cap = if inp.ovr_max_discharge_w.is_finite() && inp.ovr_max_discharge_w >= 0.0 {
+        inp.ovr_max_discharge_w
+    } else {
+        f64::INFINITY
+    };
+    let max_discharge_w = state_inhibit.min(ovr_cap);
 
     // (§4a-4, state-6 special case) +5 A × Vdc slow-charge floor. NaN Vdc → 0 (safe).
     let charge_floor_w = if inp.bl_state == BL_FORCE_CHARGE {
@@ -224,6 +246,7 @@ impl SocGuard {
             eff_max_charge_w,
             multi_supports_tpimf: bus.get_f64(VEBUS, P_TPIMF).is_some(),
             override_force_charge: bus.get_i32(HUB4, P_OVR_FORCECHARGE).unwrap_or(0) != 0,
+            ovr_max_discharge_w: bus.get_f64(HUB4, P_OVR_MAXDISCHARGE).unwrap_or(f64::NAN),
         }
     }
 
@@ -278,6 +301,48 @@ mod tests {
                 assert_eq!(out.max_discharge_w, f64::INFINITY, "state {s} free");
             }
         }
+    }
+
+    // ---- /Overrides/MaxDischargePower (schedule post-target hold / DESS cap) ----
+
+    #[test]
+    fn discharge_override_caps_max_discharge() {
+        // schedule.py post-target hold: max(1, 0.8·pvpower) => 1 W with no PV overnight.
+        let mut bus = base();
+        bus.set(HUB4, P_OVR_MAXDISCHARGE, 1.0);
+        assert_eq!(SocGuard::new(&bus).tick(&bus).max_discharge_w, 1.0);
+        // Daytime tail with PV: pass through ~80-95 % of PV instead.
+        bus.set(HUB4, P_OVR_MAXDISCHARGE, 800.0);
+        assert_eq!(SocGuard::new(&bus).tick(&bus).max_discharge_w, 800.0);
+    }
+
+    #[test]
+    fn discharge_override_negative_or_unset_means_unlimited() {
+        // systemcalc writes -1 to clear (window exit / AllowDischarge windows).
+        let mut bus = base();
+        bus.set(HUB4, P_OVR_MAXDISCHARGE, -1.0);
+        assert_eq!(
+            SocGuard::new(&bus).tick(&bus).max_discharge_w,
+            f64::INFINITY
+        );
+        bus.clear(HUB4, P_OVR_MAXDISCHARGE); // item invalid/absent
+        assert_eq!(
+            SocGuard::new(&bus).tick(&bus).max_discharge_w,
+            f64::INFINITY
+        );
+    }
+
+    #[test]
+    fn discharge_override_combines_with_state_inhibit_most_restrictive() {
+        // BL state 11 inhibits (0 W) regardless of a looser 500 W override...
+        let mut bus = base();
+        bus.set(SETTINGS, P_BL_STATE, 11.0);
+        bus.set(HUB4, P_OVR_MAXDISCHARGE, 500.0);
+        assert_eq!(SocGuard::new(&bus).tick(&bus).max_discharge_w, 0.0);
+        // ...and a 0 W override inhibits even in a free state.
+        bus.set(SETTINGS, P_BL_STATE, 10.0);
+        bus.set(HUB4, P_OVR_MAXDISCHARGE, 0.0);
+        assert_eq!(SocGuard::new(&bus).tick(&bus).max_discharge_w, 0.0);
     }
 
     // ---- each force-charge trigger (§4a-3) ----
@@ -429,6 +494,7 @@ mod tests {
             eff_max_charge_w: f64::NAN,
             multi_supports_tpimf: true,
             override_force_charge: false,
+            ovr_max_discharge_w: f64::NAN,
         };
         assert!(!enact(&inp).force_charge);
     }
@@ -443,6 +509,7 @@ mod tests {
             eff_max_charge_w: f64::NAN,
             multi_supports_tpimf: false,
             override_force_charge: false,
+            ovr_max_discharge_w: f64::NAN,
         };
         assert_eq!(enact(&inp).cmd_override, Some(FORCE_CHARGE_SENTINEL_W));
     }
@@ -471,6 +538,7 @@ mod tests {
                 eff_max_charge_w: 4700.0,
                 multi_supports_tpimf: true,
                 override_force_charge: false,
+                ovr_max_discharge_w: f64::NAN,
             })
         };
         // Before dispatch: SocGuardDefault, SOC above min → discharge free, no charge.
@@ -507,6 +575,7 @@ mod tests {
             eff_max_charge_w: 4700.0,
             multi_supports_tpimf: true,
             override_force_charge: false,
+            ovr_max_discharge_w: f64::NAN,
         }
     }
 

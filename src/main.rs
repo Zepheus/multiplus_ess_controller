@@ -69,7 +69,7 @@ impl Telemetry {
             .map_err(|e| format!("cannot open telemetry '{path}': {e}"))?;
         let mut t = Telemetry { path: path.to_string(), cap: cap_bytes, written: 0, file };
         let _ = t.write_line(
-            "t,grid,reported,target,soc,state,command,owner,actual,reason",
+            "t,grid,reported,target,soc,state,command,owner,actual,fc,maxdis,reason",
         );
         Ok(t)
     }
@@ -824,15 +824,24 @@ fn main() {
                 .and_then(|s| s.split_whitespace().next())
                 .unwrap_or("");
             let reason = dec.safety.reason();
+            // maxdis: effective discharge cap (state inhibit ∧ /Overrides/MaxDischargePower);
+            // empty = unlimited. fc: the force-charge regime. Both exist so a charge-window
+            // capture is replayable as a golden fixture without a separate capture tool.
+            let maxdis = if snap.sg.max_discharge_w.is_finite() {
+                format!("{:.0}", snap.sg.max_discharge_w)
+            } else {
+                String::new()
+            };
             let _ = tel.write_line(&format!(
-                "{t:.0},{:.1},{:.1},{:.1},{:.0},{},{:.1},{},{actual},{reason}",
+                "{t:.0},{:.1},{:.1},{:.1},{:.0},{},{:.1},{},{actual},{},{maxdis},{reason}",
                 snap.s.grid,
                 snap.s.reported,
                 snap.s.target,
                 snap.s.soc,
                 snap.s.state,
                 dec.display_cmd,
-                dec.owner_str
+                dec.owner_str,
+                snap.sg.force_charge as u8
             ));
         }
 
