@@ -577,6 +577,154 @@ mod tests {
         assert_eq!(d.write, Write::Override(sp.s.target), "hold neutral, don't fight stock");
     }
 
+    /// Live capture 2026-08-16 ~08:07 — an Octopus Intelligent Go dispatch: an HA
+    /// automation raised `BatteryLife/MinimumSocLimit` 10 % → 90 % for one minute.
+    /// Replayed row-for-row (real telemetry values) through the REAL socguard::enact +
+    /// decide(). The captured sequence, which this test pins tick-exactly:
+    ///   t=19460  the min-SOC raise lands (BL state still 10, SystemState still 256):
+    ///            hand-back fires THAT tick — min-SOC is sampled live, soc 77 ≤ 90 —
+    ///            before batterylife/systemcalc publish state 12 / 258 at all.
+    ///   t=19461  BL state 12 arrives (force-charge + discharge inhibit); state still 256.
+    ///   t=..19530 SystemState 258; firmware TPIMF-charges at ~5 kW (grid peaks 7.1 kW,
+    ///            both hub4 override items stay inert — this path is pure BL-state);
+    ///            we must stay handed-back throughout (soc 77 < 90+hyst, state 258).
+    ///   t=19531  BL reverts to 10 (fc=0) but SystemState is STILL 258 — the state-258
+    ///            gate blocks re-entry for exactly this one tick.
+    ///   t=19532  SystemState 252: re-take (72 s since hand-back > 30 s dwell).
+    ///   t=19534  one-tick meter lag (reported collapses 4999 → 1252 while grid is still
+    ///            5.3 kW): raw law −4053 W — the slew guard caps the actuated step.
+    #[test]
+    fn golden_octopus_dispatch_minsoc_raise_sequence() {
+        use crate::socguard;
+        // (t, grid, reported, soc, sysstate, bl_state, min_soc) — from the live capture.
+        #[rustfmt::skip]
+        let rows: &[(f64, f64, f64, f64, i64, i32, f64)] = &[
+            (19456.0,   49.9, -1867.0, 78.0, 256, 10, 10.0),
+            (19457.0,   32.1, -1835.0, 78.0, 256, 10, 10.0),
+            (19458.0,   82.0, -1851.0, 78.0, 256, 10, 10.0),
+            (19459.0,   59.6, -1843.0, 78.0, 256, 10, 10.0),
+            (19460.0,   49.4, -1838.0, 77.0, 256, 10, 90.0), // raise lands -> hand back NOW
+            (19461.0,   74.4, -1848.0, 77.0, 256, 12, 90.0), // BL 12 leads SystemState
+            (19462.0,   54.0, -1820.0, 77.0, 258, 12, 90.0),
+            (19465.0, 3178.3,  4648.0, 77.0, 258, 12, 90.0), // charge ramp
+            (19470.0, 7015.0,  5097.0, 77.0, 258, 12, 90.0), // ~5 kW charge + 1.9 kW load
+            (19500.0, 6881.0,  4871.0, 78.0, 258, 12, 90.0),
+            (19520.0, 5423.1,  5090.0, 78.0, 258, 12, 90.0),
+            (19530.0, 5311.9,  4984.0, 78.0, 258, 12, 90.0),
+            (19531.0, 5293.3,  4987.0, 78.0, 258, 10, 10.0), // BL reverts first; 258 blocks
+            (19532.0, 5290.9,  4999.0, 78.0, 252, 10, 10.0), // re-take
+            (19534.0, 5310.4,  1252.0, 78.0, 252, 10, 10.0), // meter-lag transient
+            (19535.0,  786.4,   239.0, 78.0, 252, 10, 10.0),
+            (19536.0,  430.6,   -49.0, 78.0, 252, 10, 10.0),
+            (19538.0,  191.8,  -200.0, 78.0, 252, 10, 10.0),
+            (19540.0,   60.6,  -211.0, 78.0, 256, 10, 10.0),
+        ];
+        // Device-derived safety numbers (envelope 7030 W -> slew 3515 W/s), as live.
+        let sl = SafetyLimits::derive(7030.0, 1.0, None, None);
+        let c = DecideCfg {
+            stage: Stage::Takeover,
+            soc_hyst: 3.0,
+            min_dwell_s: 30.0,
+            trim_ki: 0.02,
+            orig_mode: 1,
+            state_recharge: 258,
+            slew_w_per_s: sl.slew_w_per_s,
+            sanity_band_w: sl.sanity_band_w,
+            sanity_secs: sl.sanity_secs,
+        };
+        let mut st = state(Kind::Stock);
+        st.owner_us = true; // had owned for hours before the dispatch
+        st.last_flip_t = 19000.0;
+        let mut last_setpoint: Option<f64> = None;
+
+        for &(t, grid, reported, soc, sysstate, bl, min_soc) in rows {
+            let sg = socguard::enact(&socguard::Inputs {
+                bl_state: bl,
+                min_soc,
+                charge_request: false,
+                dc_voltage: 52.0,
+                eff_max_charge_w: f64::NAN,
+                multi_supports_tpimf: true,
+                override_force_charge: false, // stayed 0 the whole event (watcher-verified)
+                ovr_max_discharge_w: f64::NAN, // idem
+            });
+            let snap = Snapshot {
+                s: Sensors { grid, reported, target: 5.0, soc, state: sysstate },
+                dt: 1.0,
+                dt_clamped: false,
+                min_soc,
+                lo: -7030.0,
+                hi: 7030.0,
+                effective_target: 5.0,
+                sg,
+                feed_block_charge: false,
+                feed_force_flat: false,
+                gen_disable_export: false,
+                gm_should_write: true,
+                shore_out: ShoreOut::default(),
+                hub4_actual: None,
+            };
+            let d = decide(&snap, &mut st, &c, t);
+
+            match t as i64 {
+                19456..=19459 => {
+                    assert!(d.owner_us, "t={t}: normal ESS, we own");
+                    assert!(matches!(d.write, Write::Setpoint(_)));
+                }
+                19460 => {
+                    assert!(d.flipped && !d.owner_us, "t={t}: raised floor must hand back THIS tick");
+                    assert_eq!(d.hub4mode, Some(1), "t={t}: restore stock mode");
+                    assert!(!sg.force_charge, "t={t}: BL still 10 — the floor alone triggered it");
+                }
+                19461..=19530 => {
+                    assert!(!d.owner_us, "t={t}: handed back for the whole dispatch");
+                    assert_eq!(d.write, Write::Nothing, "t={t}: no writes while handed back");
+                    assert_eq!(d.hub4mode, None, "t={t}: no mode flapping");
+                    assert!(sg.force_charge && sg.tpimf, "t={t}: BL-12 regime");
+                    assert_eq!(sg.max_discharge_w, 0.0, "t={t}: BL-12 inhibits discharge");
+                    if t >= 19470.0 {
+                        // Steady charge: law is negative, discharge-inhibited to 0 (matches
+                        // the captured telemetry cmd = -0.0 on every one of these rows). On
+                        // the ramp tick (19465) the law is legitimately +1474.7 — grid lags
+                        // the charge step — also matching the capture, so it is skipped here.
+                        assert!(d.command.abs() < 1e-9, "t={t}: cmd {}", d.command);
+                    }
+                }
+                19531 => {
+                    assert!(!d.owner_us, "t={t}: SystemState 258 must block re-entry this tick");
+                    assert!(!sg.force_charge, "t={t}: BL already back to 10");
+                }
+                19532 => {
+                    assert!(d.flipped && d.owner_us, "t={t}: re-take once 258 clears");
+                    assert_eq!(d.hub4mode, Some(3));
+                }
+                19534 => {
+                    // Meter-lag tick: raw law = 1252 + 5 − 5310.4 = −4053.4. The slew guard
+                    // must cap the step from the last actuated value.
+                    let prev = last_setpoint.expect("was writing before the transient");
+                    match d.write {
+                        Write::Setpoint(v) => {
+                            let max_step = c.slew_w_per_s * 1.0;
+                            assert!((v - prev).abs() <= max_step + 1e-6,
+                                "t={t}: slew must cap {prev} -> {v} (raw law −4053.4)");
+                            assert!(v > -4053.0, "t={t}: raw transient must not pass through");
+                        }
+                        w => panic!("t={t}: expected a setpoint write, got {w:?}"),
+                    }
+                    assert!(d.safety.slew_clamped, "t={t}: the clamp must be a visible safety event");
+                }
+                _ => {}
+            }
+            if let Write::Setpoint(v) = d.write {
+                last_setpoint = Some(v);
+            }
+        }
+        // Grid was back near target by the last rows: no sanity trip may be pending.
+        assert!(st.oob_since.is_none(), "recovered grid must clear the out-of-band timer");
+        assert!(st.owner_us, "we own again after the dispatch");
+        assert_eq!(st.sanity_trips, 0, "the dispatch must not count as a sanity trip");
+    }
+
     /// The window-tail hold (live 2026-08-16): ForceCharge already 0, but
     /// `/Overrides/MaxDischargePower` = 1 W pins the battery while a 1.9 kW load runs.
     /// Trim must hold neutral — integrating against a deliberately-held battery only
