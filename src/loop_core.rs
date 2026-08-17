@@ -124,6 +124,32 @@ fn slew_limit(prev: Option<f64>, desired: f64, max_rate_w_s: f64, dt: f64) -> f6
     }
 }
 
+/// Stock's setpoint write law (matched to the stock daemon's per-phase writer exactly): an EMA toward the
+/// command, `new = prev + gain·(cmd − prev)`, with
+///   gain = 0.5                                   for |Δ| < 10 W, or with `adaptive` off;
+///   gain = clamp(0.25·ln(|Δ|/10), 0.5, 1.1)      otherwise — a DELIBERATE overshoot up
+///          to 1.1× on large steps (plausibly countering the Multi's ~4 % under-tracking).
+/// Stock enables the adaptive variant only with a fast grid meter (< 250 ms updates) AND
+/// Multi firmware > 0x1C1FF; on this install the live traces (monotone hold convergence
+/// −160 → −80 → −38 → +30, no overshoot) show the flat-0.5 branch. First write (no prev)
+/// passes through. The result is rounded to the integer watt, half away from zero — stock
+/// writes integers (every live-captured setpoint is one). Pure.
+pub fn stock_write_ema(prev: Option<f64>, cmd: f64, adaptive: bool) -> f64 {
+    let v = match prev {
+        Some(p) if p.is_finite() => {
+            let delta = cmd - p;
+            let gain = if !adaptive || delta.abs() < 10.0 {
+                0.5
+            } else {
+                (0.25 * (delta.abs() / 10.0).ln()).clamp(0.5, 1.1)
+            };
+            p + gain * delta
+        }
+        _ => cmd,
+    };
+    v.round()
+}
+
 /// Live sensor scalars (grid/reported/target in W, soc in %, state = systemcalc code).
 #[derive(Clone, Copy, Debug)]
 pub struct Sensors {
@@ -206,6 +232,10 @@ pub struct DecideCfg {
     /// Sanity supervisor band (W) and dwell (s).
     pub sanity_band_w: f64,
     pub sanity_secs: f64,
+    /// Adaptive EMA gain in the write law (see `stock_write_ema`). Stock enables it only
+    /// with a fast grid meter (< 250 ms) + recent Multi firmware; false = flat 0.5 (this
+    /// install's live-observed behavior).
+    pub ema_adaptive: bool,
 }
 
 /// What `actuate()` should write this tick.
@@ -405,19 +435,27 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
                 }
                 Write::Override(*o)
             }
-            // Shadow never writes even when it "owns" hypothetically.
-            Stage::Shadow => Write::Nothing,
+            // Shadow never writes, but runs the FULL write path below (EMA + guards) so
+            // its displayed/telemetered value is directly comparable to stock's writes.
+            Stage::Shadow => Write::Setpoint(cmd),
         };
-        // 4. Glitch-guard slew on the live actuated value (records a trip in `safety`).
+        // 4. The write law, mimicking stock exactly: EMA toward the command (see
+        // `stock_write_ema`), then our W/s slew guard as a safety backstop (stock has only
+        // a ±138 kW sanity clamp there — with the EMA damping, the guard binds only on
+        // pathological steps), then the hard design envelope.
         match raw {
             Write::Setpoint(v) => {
-                let sv = slew_limit(st.last_out, v, cfg.slew_w_per_s, snap.dt);
-                safety.slew_clamped = (sv - v).abs() > 1e-6;
+                let ema = stock_write_ema(st.last_out, v, cfg.ema_adaptive);
+                let sv = slew_limit(st.last_out, ema, cfg.slew_w_per_s, snap.dt);
+                let sv = crate::control::clamp(sv, snap.lo, snap.hi);
+                safety.slew_clamped = (sv - ema).abs() > 1e-6;
                 st.last_out = Some(sv);
                 display_cmd = sv;
-                Write::Setpoint(sv)
+                if matches!(cfg.stage, Stage::Shadow) { Write::Nothing } else { Write::Setpoint(sv) }
             }
             Write::Override(v) => {
+                // NO EMA here: the trim override is stock's INPUT target — its own write
+                // EMA runs downstream of it. Smoothing both sides would double-filter.
                 let sv = slew_limit(st.last_out, v, cfg.slew_w_per_s, snap.dt);
                 safety.slew_clamped = (sv - v).abs() > 1e-6;
                 st.last_out = Some(sv);
@@ -520,6 +558,7 @@ mod tests {
             slew_w_per_s: sl.slew_w_per_s,
             sanity_band_w: sl.sanity_band_w,
             sanity_secs: sl.sanity_secs,
+            ema_adaptive: false,
         }
     }
 
@@ -647,6 +686,7 @@ mod tests {
             slew_w_per_s: sl.slew_w_per_s,
             sanity_band_w: sl.sanity_band_w,
             sanity_secs: sl.sanity_secs,
+            ema_adaptive: false,
         };
         let mut st = state(Kind::Stock);
         st.owner_us = true; // had owned for hours before the dispatch
@@ -716,19 +756,23 @@ mod tests {
                     assert_eq!(d.hub4mode, Some(3));
                 }
                 19534 => {
-                    // Meter-lag tick: raw law = 1252 + 5 − 5310.4 = −4053.4. The slew guard
-                    // must cap the step from the last actuated value.
+                    // Meter-lag tick: raw law = 1252 + 5 − 5310.4 = −4053.4. The stock
+                    // write EMA absorbs it: prev = −287 (the direct first write on
+                    // re-take at t=19532), so the write is −287 + 0.5·(−3766.4) ≈ −2170 —
+                    // exactly how stock rides out one-tick meter glitches. The W/s slew
+                    // guard stays as a backstop and must NOT need to fire here.
                     let prev = last_setpoint.expect("was writing before the transient");
+                    assert!((prev - (-287.0)).abs() < 1.0, "t={t}: re-take wrote {prev}");
                     match d.write {
                         Write::Setpoint(v) => {
-                            let max_step = c.slew_w_per_s * 1.0;
-                            assert!((v - prev).abs() <= max_step + 1e-6,
-                                "t={t}: slew must cap {prev} -> {v} (raw law −4053.4)");
+                            assert!((v - (-2170.0)).abs() < 2.0,
+                                "t={t}: EMA must halve the step {prev} -> {v} (raw −4053.4)");
                             assert!(v > -4053.0, "t={t}: raw transient must not pass through");
                         }
                         w => panic!("t={t}: expected a setpoint write, got {w:?}"),
                     }
-                    assert!(d.safety.slew_clamped, "t={t}: the clamp must be a visible safety event");
+                    assert!(!d.safety.slew_clamped,
+                        "t={t}: the EMA damping must keep the transient under the slew guard");
                 }
                 _ => {}
             }
@@ -928,6 +972,7 @@ mod tests {
             slew_w_per_s: sl.slew_w_per_s,
             sanity_band_w: sl.sanity_band_w,
             sanity_secs: sl.sanity_secs,
+            ema_adaptive: false,
         };
         let mut st = state(Kind::Stock);
         st.owner_us = true;
@@ -1150,6 +1195,78 @@ mod tests {
         assert!(d.safety.slew_clamped);
         assert_eq!(d.safety.alarm_level(), 1);
         assert_eq!(d.safety.reason(), "slew-clamped");
+    }
+
+    #[test]
+    fn stock_write_ema_gain_schedule() {
+        // First write: passthrough (rounded).
+        assert_eq!(stock_write_ema(None, -286.9, false), -287.0);
+        // Flat mode: 0.5 regardless of step size.
+        assert_eq!(stock_write_ema(Some(0.0), 5000.0, false), 2500.0);
+        // Small step (< 10 W): 0.5 even in adaptive mode.
+        assert_eq!(stock_write_ema(Some(0.0), 8.0, true), 4.0);
+        // Adaptive: Δ=100 → gain 0.25·ln(10) = 0.5756…
+        let v = stock_write_ema(Some(0.0), 100.0, true);
+        assert_eq!(v, (0.25f64 * 10.0f64.ln() * 100.0).round());
+        // Adaptive: Δ=50 → 0.25·ln(5) = 0.402 → clamped UP to 0.5.
+        assert_eq!(stock_write_ema(Some(0.0), 50.0, true), 25.0);
+        // Adaptive: Δ=1000 → 0.25·ln(100) = 1.151 → clamped to 1.1 (overshoot!).
+        assert_eq!(stock_write_ema(Some(0.0), 1000.0, true), 1100.0);
+        // Fixed point: integer target reached and held exactly.
+        assert_eq!(stock_write_ema(Some(30.0), 30.0, false), 30.0);
+    }
+
+    /// The live hold-entry convergence (2026-08-17, stock wrote −160 → −80 → −38 → +30 at
+    /// its 2.5 s cadence): flat-0.5 EMA from the same start toward the same target must
+    /// converge monotonically with no overshoot and settle ON the integer target.
+    #[test]
+    fn stock_write_ema_converges_monotone_flat() {
+        let mut v = -160.0;
+        let mut prev = v;
+        for _ in 0..12 {
+            v = stock_write_ema(Some(v), 30.0, false);
+            assert!(v >= prev && v <= 30.0, "monotone, no overshoot: {prev} -> {v}");
+            prev = v;
+        }
+        assert_eq!(v, 30.0, "must settle exactly on the target");
+    }
+
+    /// EMA through decide(): first write after take-over is direct; subsequent writes
+    /// halve toward the command and are integer watts.
+    #[test]
+    fn takeover_write_is_ema_smoothed_and_integer() {
+        let mut st = state(Kind::Stock);
+        st.owner_us = true;
+        let c = cfg(Stage::Takeover);
+        let mut sp = snap(true);
+        sp.s.grid = 100.0; // law: 0 + 20 − 100 = −80
+        let d1 = decide(&sp, &mut st, &c, 0.0);
+        let Write::Setpoint(v1) = d1.write else { panic!("expected setpoint") };
+        assert_eq!(v1, -80.0, "first write is direct (stock passthrough)");
+        sp.s.grid = 900.0; // law: −880
+        let d2 = decide(&sp, &mut st, &c, 1.0);
+        let Write::Setpoint(v2) = d2.write else { panic!("expected setpoint") };
+        assert_eq!(v2, -480.0, "second write halves toward the command");
+        assert_eq!(v2.fract(), 0.0, "writes are integer watts");
+    }
+
+    /// Shadow simulates the identical write path (for stock-comparable telemetry) but
+    /// still never writes.
+    #[test]
+    fn shadow_simulates_write_path_without_writing() {
+        let mut st = state(Kind::Stock);
+        st.owner_us = true;
+        let c = cfg(Stage::Shadow);
+        let mut sp = snap(true);
+        sp.s.grid = 100.0;
+        let d1 = decide(&sp, &mut st, &c, 0.0);
+        assert_eq!(d1.write, Write::Nothing);
+        assert_eq!(d1.display_cmd, -80.0);
+        sp.s.grid = 900.0;
+        let d2 = decide(&sp, &mut st, &c, 1.0);
+        assert_eq!(d2.write, Write::Nothing, "shadow must never write");
+        assert_eq!(d2.hub4mode, None);
+        assert_eq!(d2.display_cmd, -480.0, "displayed value follows the real write law");
     }
 
     #[test]

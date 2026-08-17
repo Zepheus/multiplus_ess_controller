@@ -675,6 +675,10 @@ fn main() {
         slew_w_per_s: safety.slew_w_per_s,
         sanity_band_w: safety.sanity_band_w,
         sanity_secs: safety.sanity_secs,
+        // Flat 0.5 write-EMA gain: the stock adaptive variant needs a fast grid meter
+        // (< 250 ms updates) + recent Multi firmware, and this install's live traces
+        // show the flat branch. See loop_core::stock_write_ema.
+        ema_adaptive: false,
     };
     // Edge-triggered safety logging state (only log a trip when it newly fires).
     let mut last_safety = loop_core::Safety::default();
