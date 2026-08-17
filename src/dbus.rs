@@ -14,6 +14,7 @@ pub const VEBUS: &str = "com.victronenergy.vebus.ttyS3";
 
 pub const P_GRID: &str = "/Ac/Grid/L1/Power";
 pub const P_ACTIVEIN: &str = "/Ac/ActiveIn/L1/P";
+pub const P_ACOUT: &str = "/Ac/Out/L1/P";
 pub const P_STATE: &str = "/SystemState/State";
 pub const P_SOC: &str = "/Dc/Battery/Soc";
 pub const P_SETPOINT_SETTING: &str = "/Settings/CGwacs/AcPowerSetPoint";

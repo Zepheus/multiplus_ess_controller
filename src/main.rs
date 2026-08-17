@@ -69,7 +69,7 @@ impl Telemetry {
             .map_err(|e| format!("cannot open telemetry '{path}': {e}"))?;
         let mut t = Telemetry { path: path.to_string(), cap: cap_bytes, written: 0, file };
         let _ = t.write_line(
-            "t,grid,reported,target,soc,state,command,owner,actual,fc,maxdis,reason",
+            "t,grid,reported,target,soc,state,command,owner,actual,fc,maxdis,acout,reason",
         );
         Ok(t)
     }
@@ -513,6 +513,7 @@ fn sample(
         gm_should_write: sub.gm_cached.should_write_setpoint,
         shore_out,
         hub4_actual: bus.get_f64(VEBUS, P_HUB4_SETPOINT),
+        ac_out_w: bus.get_f64(VEBUS, P_ACOUT).unwrap_or(f64::NAN),
     })
 }
 
@@ -827,13 +828,19 @@ fn main() {
             // maxdis: effective discharge cap (state inhibit ∧ /Overrides/MaxDischargePower);
             // empty = unlimited. fc: the force-charge regime. Both exist so a charge-window
             // capture is replayable as a golden fixture without a separate capture tool.
+            // acout: measured Multi AC-out (the clamp feedforward); empty = unread.
+            let acout = if snap.ac_out_w.is_finite() {
+                format!("{:.0}", snap.ac_out_w)
+            } else {
+                String::new()
+            };
             let maxdis = if snap.sg.max_discharge_w.is_finite() {
                 format!("{:.0}", snap.sg.max_discharge_w)
             } else {
                 String::new()
             };
             let _ = tel.write_line(&format!(
-                "{t:.0},{:.1},{:.1},{:.1},{:.0},{},{:.1},{},{actual},{},{maxdis},{reason}",
+                "{t:.0},{:.1},{:.1},{:.1},{:.0},{},{:.1},{},{actual},{},{maxdis},{acout},{reason}",
                 snap.s.grid,
                 snap.s.reported,
                 snap.s.target,

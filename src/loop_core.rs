@@ -163,6 +163,9 @@ pub struct Snapshot {
     pub shore_out: ShoreOut,
     /// The stock ESS loop's current setpoint, for the shadow-fidelity delta (read-only).
     pub hub4_actual: Option<f64>,
+    /// Measured Multi AC-out power (W, vebus `/Ac/Out/L1/P`; NaN = unread, treated as 0).
+    /// Feedforward term for battery-frame clamps — see `composed_command`.
+    pub ac_out_w: f64,
 }
 
 /// State carried across ticks; `decide()` mutates it (integrator, ownership, trim state).
@@ -249,8 +252,18 @@ pub fn composed_command(snap: &Snapshot, ctrl: &mut Controller, actuating: bool)
         snap.hi,
         actuating,
     );
-    // SocGuard: discharge inhibit (INF => no-op; 0 => no discharge).
-    cmd = cmd.max(-snap.sg.max_discharge_w);
+    // SocGuard discharge inhibit / external cap, MIMICKING THE STOCK DAEMON EXACTLY
+    // (live-verified 2026-08-17): the stock loop builds its command in the acIn−acOut
+    // frame — total = clamp(target + acIn − grid − acOut, −maxdis, maxchg) — and the
+    // per-phase write adds measured `Ac/Out/L{n}/P` back on top. In normal operation
+    // acOut cancels exactly (the write IS the raw law); when a clamp binds, the written
+    // setpoint floats at clamp + acOut so the BATTERY, not the setpoint, respects the cap
+    // (live: hold writes of +30 W / +48 W = acOut on those mornings, cap 1 W). A bare
+    // `max(-maxdis)` would instead trickle-discharge the battery by the Multis' output
+    // load + losses for the whole hold. NaN acOut (unread) degrades to the bare clamp.
+    // (−INF + acOut is still −INF, so this is a no-op without a cap.)
+    let ac_out = if snap.ac_out_w.is_finite() { snap.ac_out_w } else { 0.0 };
+    cmd = cmd.max(-snap.sg.max_discharge_w + ac_out);
     if let Some(fc) = snap.sg.cmd_override {
         // Force charge. TPIMF (mode 0): keep writing the normal-law value capped at
         // Σ max-charge — the firmware charges maximally on its own and reinterprets the
@@ -261,7 +274,9 @@ pub fn composed_command(snap: &Snapshot, ctrl: &mut Controller, actuating: bool)
     }
     if snap.sg.charge_floor_w > 0.0 {
         // minimum-charge floor ONLY when set (BL state 6); 0 must not zero discharge.
-        cmd = cmd.max(snap.sg.charge_floor_w);
+        // Same frame as the discharge cap: the stock dcV·5 floor sits in the acIn−acOut
+        // total, so the write floor is dcV·5 + acOut (charge 5 A AND serve the output).
+        cmd = cmd.max(snap.sg.charge_floor_w + ac_out);
     }
     if snap.feed_block_charge {
         cmd = cmd.min(0.0);
@@ -475,6 +490,7 @@ mod tests {
             gm_should_write: stage_gm,
             shore_out: ShoreOut::default(),
             hub4_actual: None,
+                ac_out_w: f64::NAN,
         }
     }
 
@@ -663,6 +679,7 @@ mod tests {
                 gm_should_write: true,
                 shore_out: ShoreOut::default(),
                 hub4_actual: None,
+                ac_out_w: f64::NAN,
             };
             let d = decide(&snap, &mut st, &c, t);
 
@@ -821,17 +838,46 @@ mod tests {
         sp.effective_target = 5.0;
         sp.sg = sg_free();
         sp.sg.max_discharge_w = 1.0; // enact() of /Overrides/MaxDischargePower = 1
+        sp.ac_out_w = 49.0; // measured Multi AC-out that morning
         let mut ctrl = Controller::new(Kind::Stock);
         let cmd = composed_command(&sp, &mut ctrl, false);
-        assert!(cmd >= -1.0 - 1e-9, "window tail must hold charge, got {cmd}");
-        assert!((cmd - 48.0).abs() < 100.0, "must track the stock daemon's live hold (~+48 W), got {cmd}");
+        // The stock hold write = clamp(−1 W) + acOut = +48 W — the EXACT value the stock
+        // daemon wrote on this live row (see composed_command for the frame).
+        assert!((cmd - 48.0).abs() < 1e-9, "hold must float at −cap + acOut, got {cmd}");
+
+        // acOut unread (NaN): degrade to the bare cap — still no discharge.
+        sp.ac_out_w = f64::NAN;
+        let mut ctrl = Controller::new(Kind::Stock);
+        let cmd = composed_command(&sp, &mut ctrl, false);
+        assert!((cmd - (-1.0)).abs() < 1e-9, "NaN acOut degrades to the bare cap, got {cmd}");
 
         // Same row with the override cleared (window exit, or an AllowDischarge schedule
-        // >1 % over target): normal discharge resumes.
+        // >1 % over target): normal discharge resumes; acOut must NOT leak into the law.
         sp.sg = sg_free();
+        sp.ac_out_w = 49.0;
         let mut ctrl = Controller::new(Kind::Stock);
         let cmd = composed_command(&sp, &mut ctrl, false);
         assert!(cmd < -1500.0, "cleared override must discharge normally, got {cmd}");
+    }
+
+    /// The AC-out feedforward composes with every battery-frame floor, exactly as the
+    /// stock single clamp does: BL-state discharge inhibit (floor 0 → write = acOut) and
+    /// the state-6 minimum-charge floor (write = dcV·5 + acOut).
+    #[test]
+    fn ac_out_feedforward_lifts_state_floors() {
+        let mut sp = snap(true);
+        sp.s.grid = 1500.0; // big load: raw law is strongly negative
+        sp.sg = sg_free();
+        sp.sg.max_discharge_w = 0.0; // BL no-discharge state
+        sp.ac_out_w = 15.0;
+        let mut ctrl = Controller::new(Kind::Stock);
+        let cmd = composed_command(&sp, &mut ctrl, false);
+        assert!((cmd - 15.0).abs() < 1e-9, "inhibit floor lifts to acOut, got {cmd}");
+
+        sp.sg.charge_floor_w = 260.0; // state 6: dcV·5A
+        let mut ctrl = Controller::new(Kind::Stock);
+        let cmd = composed_command(&sp, &mut ctrl, false);
+        assert!((cmd - 275.0).abs() < 1e-9, "charge floor lifts to dcV·5 + acOut, got {cmd}");
     }
 
     /// Live capture 2026-08-17 — the full scheduled-charge window edge sequence (SystemState
@@ -913,6 +959,7 @@ mod tests {
                 gm_should_write: true,
                 shore_out: ShoreOut::default(),
                 hub4_actual: None,
+                ac_out_w: f64::NAN,
             };
             let d = decide(&snap, &mut st, &c, t);
 
@@ -961,8 +1008,10 @@ mod tests {
                 }
                 54395..=54398 => {
                     assert_eq!(sg.max_discharge_w, 1.0, "t={t}: hold active");
+                    // acOut was not captured in this telemetry (NaN → bare cap). With it,
+                    // the hold floats at −1 + acOut ≈ +30 — the value stock wrote here.
                     assert!((d.command - (-1.0)).abs() < 1e-9,
-                        "t={t}: hold pins the command at −1 W, got {}", d.command);
+                        "t={t}: hold pins the command at −1 W (bare cap), got {}", d.command);
                 }
                 _ => {}
             }
@@ -1263,6 +1312,7 @@ mod tests {
                 gm_should_write: true,
                 shore_out: ShoreOut::default(),
                 hub4_actual: None,
+                ac_out_w: f64::NAN,
             };
             let d = decide(&snap, &mut st, &c, n as f64 * 20.0);
 
