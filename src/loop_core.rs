@@ -834,6 +834,143 @@ mod tests {
         assert!(cmd < -1500.0, "cleared override must discharge normally, got {cmd}");
     }
 
+    /// Live capture 2026-08-17 — the full scheduled-charge window edge sequence (SystemState
+    /// 259), replayed row-for-row through the REAL socguard::enact + decide(). Two boundary
+    /// behaviors of the systemcalc scheduler that pure steady-state tests can't see:
+    ///
+    ///   ENTRY (t=35577): the delegate briefly writes BOTH `/Overrides/ForceCharge`=1 AND
+    ///   `/Overrides/MaxDischargePower`=1 for ~5 s before clearing the cap. The merge must
+    ///   be most-restrictive on discharge (law −462 W → −1 W) while positive/charge values
+    ///   pass untouched (+367 W two ticks later).
+    ///
+    ///   TARGET-SOC HOLD TRANSITION (t=54389..54394): ForceCharge drops to 0 the tick the
+    ///   target SOC is reached, but MaxDischargePower=1 lands only ~6 s LATER — an
+    ///   unguarded gap in which the raw law transiently commands −1.6/−2.1 kW (the grid
+    ///   meter still shows the collapsing 2.3 kW charge). The stock daemon coasts through
+    ///   it on its own write smoothing (−192 W held). We pass the raw law through — a
+    ///   KNOWN, bounded divergence (≈2 ticks, ≲1 Wh, well inside the slew envelope) that
+    ///   this test pins so any future "fix" is a deliberate decision, not drift.
+    #[test]
+    fn golden_schedule_window_edges_dual_override_and_hold_gap() {
+        use crate::socguard;
+        // (t, grid, reported, soc, sysstate, ovr_forcecharge, ovr_maxdischarge) — live rows.
+        #[rustfmt::skip]
+        let rows: &[(f64, f64, f64, f64, i64, bool, f64)] = &[
+            (35575.0,   83.0,  -372.0, 58.0, 256, false, f64::NAN), // pre-window, normal ESS
+            (35577.0,   80.0,  -387.0, 58.0, 256, true,  1.0),      // BOTH overrides land
+            (35578.0,   75.0,  -400.0, 58.0, 259, true,  1.0),
+            (35580.0,   57.0,   419.0, 58.0, 259, true,  1.0),      // law swings positive
+            (35582.0, 1240.0,  2712.0, 58.0, 259, true,  f64::NAN), // cap cleared; charging
+            (54388.0, 2352.0,  2129.0, 90.0, 259, true,  f64::NAN), // last force-charge tick
+            (54389.0, 2340.0,  2131.0, 90.0, 259, false, f64::NAN), // fc drops — gap begins
+            (54390.0, 2329.0,  2133.0, 90.0, 259, false, f64::NAN),
+            (54391.0, 2346.0,   770.0, 90.0, 259, false, f64::NAN), // law −1571 W (transient)
+            (54393.0, 2352.0,   240.0, 90.0, 259, false, f64::NAN), // law −2107 W (transient)
+            (54394.0,  263.0,    70.0, 90.0, 259, false, f64::NAN), // meter settled: law −188
+            (54395.0,  212.0,   -25.0, 90.0, 259, false, 1.0),      // hold lands — gap over
+            (54396.0,  198.0,   -37.0, 90.0, 259, false, 1.0),
+            (54398.0,  185.0,   -45.0, 90.0, 259, false, 1.0),
+        ];
+        let sl = SafetyLimits::derive(7030.0, 1.0, None, None);
+        let c = DecideCfg {
+            stage: Stage::Takeover,
+            soc_hyst: 3.0,
+            min_dwell_s: 30.0,
+            trim_ki: 0.02,
+            orig_mode: 1,
+            state_recharge: 258,
+            slew_w_per_s: sl.slew_w_per_s,
+            sanity_band_w: sl.sanity_band_w,
+            sanity_secs: sl.sanity_secs,
+        };
+        let mut st = state(Kind::Stock);
+        st.owner_us = true;
+        st.last_flip_t = 35000.0;
+
+        for &(t, grid, reported, soc, sysstate, ovr_fc, ovr_maxdis) in rows {
+            let sg = socguard::enact(&socguard::Inputs {
+                bl_state: 10, // BatteryLife stays in its normal regime; this path is pure overrides
+                min_soc: 10.0,
+                charge_request: false,
+                dc_voltage: 52.0,
+                eff_max_charge_w: f64::NAN,
+                multi_supports_tpimf: true,
+                override_force_charge: ovr_fc,
+                ovr_max_discharge_w: ovr_maxdis,
+            });
+            let snap = Snapshot {
+                s: Sensors { grid, reported, target: 5.0, soc, state: sysstate },
+                dt: 1.0,
+                dt_clamped: false,
+                min_soc: 10.0,
+                lo: -7030.0,
+                hi: 7030.0,
+                effective_target: 5.0,
+                sg,
+                feed_block_charge: false,
+                feed_force_flat: false,
+                gen_disable_export: false,
+                gm_should_write: true,
+                shore_out: ShoreOut::default(),
+                hub4_actual: None,
+            };
+            let d = decide(&snap, &mut st, &c, t);
+
+            assert!(d.owner_us && !d.flipped, "t={t}: the window must not disturb ownership");
+            assert_eq!(d.hub4mode, None, "t={t}: no mode writes mid-window");
+            assert!(matches!(d.write, Write::Setpoint(_)), "t={t}: takeover keeps writing");
+
+            match t as i64 {
+                35575 => {
+                    assert!(!sg.force_charge, "t={t}: pre-window");
+                    assert!((d.command - (-450.0)).abs() < 3.0, "t={t}: normal law, got {}", d.command);
+                }
+                35577 | 35578 => {
+                    // Dual override: charge forced AND discharge capped at 1 W, same ticks.
+                    assert!(sg.force_charge && sg.tpimf, "t={t}: force-charge regime");
+                    assert_eq!(sg.max_discharge_w, 1.0, "t={t}: entry cap present");
+                    assert!((d.command - (-1.0)).abs() < 1e-9,
+                        "t={t}: law −462 must clamp to the 1 W cap, got {}", d.command);
+                }
+                35580 => {
+                    assert!((d.command - 367.0).abs() < 3.0,
+                        "t={t}: positive law passes the discharge cap, got {}", d.command);
+                }
+                35582 => {
+                    assert!(sg.max_discharge_w.is_infinite(), "t={t}: entry cap cleared");
+                    assert!((d.command - 1477.0).abs() < 3.0,
+                        "t={t}: TPIMF raw-law passthrough, got {}", d.command);
+                }
+                54388 => {
+                    assert!(sg.force_charge, "t={t}: still force-charging at target SOC");
+                    assert!((d.command - (-218.0)).abs() < 3.0, "t={t}: got {}", d.command);
+                }
+                54391 => {
+                    // The gap: no force-charge, no cap yet, meter mid-collapse.
+                    assert!(!sg.force_charge && sg.max_discharge_w.is_infinite(), "t={t}");
+                    assert!((d.command - (-1571.0)).abs() < 3.0,
+                        "t={t}: pinned known transient, got {}", d.command);
+                }
+                54393 => {
+                    assert!((d.command - (-2107.0)).abs() < 3.0,
+                        "t={t}: pinned known transient, got {}", d.command);
+                    // Bounded by the slew guard's envelope even at its worst.
+                    if let Write::Setpoint(v) = d.write {
+                        assert!(v >= -7030.0, "t={t}: inside envelope");
+                    }
+                }
+                54395..=54398 => {
+                    assert_eq!(sg.max_discharge_w, 1.0, "t={t}: hold active");
+                    assert!((d.command - (-1.0)).abs() < 1e-9,
+                        "t={t}: hold pins the command at −1 W, got {}", d.command);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(st.sanity_trips, 0, "window edges must not trip sanity");
+        assert!(st.owner_us, "still owning after the window");
+    }
+
     /// End-to-end learn-gate test THROUGH decide(): identical steady discharge inputs must
     /// leave the adaptive model untouched in shadow and trim (our command isn't actuated
     /// there — learning would train on a phantom regime)...
