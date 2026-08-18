@@ -1065,6 +1065,104 @@ mod tests {
         assert!(st.owner_us, "still owning after the window");
     }
 
+    /// Live capture 2026-08-18 — the window-tail transition replayed TICK-EXACTLY through
+    /// the full write path (feedforward + EMA + guards): force-charge end, the ~4 s
+    /// override gap, the hold landing, and convergence onto the −1 + acOut floor. Since
+    /// the shadow telemetry `command` column IS the simulated write, every row must
+    /// reproduce to the watt — this pins the whole composed pipeline (raw law → acOut
+    /// floor lift → flat-0.5 EMA → half-away-from-zero integer rounding) in one shot.
+    /// Includes the subtle edges seen live: rounding at exactly .5 (−75.5 → −76,
+    /// 2.5 → 3, 31.5 → 32) and NEGATIVE measured acOut (−16/−20 W) pushing the floor
+    /// slightly below −1.
+    #[test]
+    fn golden_window_tail_ema_replay_is_tick_exact() {
+        use crate::socguard;
+        // (t, grid, reported, soc, ovr_fc, ovr_maxdis, acout, expected_write) — live rows;
+        // stock's own writes tracked the same path within its 2.5 s cadence.
+        #[rustfmt::skip]
+        let rows: &[(f64, f64, f64, f64, bool, f64, f64, f64)] = &[
+            (71647.0, 1569.7,  925.0, 89.0, true,  f64::NAN, 79.0, -624.0),
+            (71648.0, 1566.4,  926.0, 89.0, true,  f64::NAN, 72.0, -630.0),
+            (71649.0, 1569.9,  927.0, 89.0, true,  f64::NAN, 61.0, -634.0),
+            (71650.0, 1572.3,  929.0, 90.0, false, f64::NAN, 63.0, -636.0), // fc drops
+            (71651.0, 1574.3,  929.0, 90.0, false, f64::NAN, 66.0, -638.0),
+            (71652.0, 1573.4,  406.0, 90.0, false, f64::NAN, 22.0, -900.0), // gap: law −1162, EMA halves
+            (71653.0,  257.5, -349.0, 90.0, false, f64::NAN, 31.0, -751.0),
+            (71654.0, -976.8, -996.0, 90.0, false, 1.0,      13.0, -370.0), // hold lands
+            (71655.0, -657.2, -864.0, 90.0, false, 1.0,       1.0, -185.0),
+            (71657.0, -616.7, -657.0, 90.0, false, 1.0,      35.0,  -76.0), // −75.5 rounds away
+            (71658.0, -348.0, -500.0, 90.0, false, 1.0,      35.0,  -21.0),
+            (71659.0, -285.4, -422.0, 90.0, false, 1.0,      27.0,    3.0), // 2.5 rounds away
+            (71660.0, -261.2, -335.0, 90.0, false, 1.0,      37.0,   20.0),
+            (71661.0,  -70.9, -298.0, 90.0, false, 1.0,      11.0,   15.0),
+            (71662.0,  -88.2, -196.0, 90.0, false, 1.0,       9.0,   12.0),
+            (71663.0,   19.8, -188.0, 90.0, false, 1.0,       8.0,   10.0),
+            (71664.0,  513.1, -179.0, 90.0, false, 1.0,     -16.0,   -4.0), // negative acOut floor
+            (71665.0,  546.0, -134.0, 90.0, false, 1.0,     -20.0,  -13.0),
+            (71666.0,  583.9,  -89.0, 90.0, false, 1.0,       6.0,   -4.0),
+            (71667.0,  592.4,  -60.0, 90.0, false, 1.0,      27.0,   11.0),
+            (71669.0,  593.9,  -49.0, 90.0, false, 1.0,      32.0,   21.0),
+            (71670.0,  606.2,  -23.0, 90.0, false, 1.0,      43.0,   32.0),
+            (71671.0,  613.4,  -50.0, 90.0, false, 1.0,      32.0,   32.0), // 31.5 rounds away
+            (71672.0,  610.5,  -22.0, 90.0, false, 1.0,      43.0,   37.0),
+        ];
+        let sl = SafetyLimits::derive(7030.0, 1.0, None, None);
+        let c = DecideCfg {
+            stage: Stage::Shadow, // exactly as captured; shadow runs the real write path
+            soc_hyst: 3.0,
+            min_dwell_s: 30.0,
+            trim_ki: 0.02,
+            orig_mode: 1,
+            state_recharge: 258,
+            slew_w_per_s: sl.slew_w_per_s,
+            sanity_band_w: sl.sanity_band_w,
+            sanity_secs: sl.sanity_secs,
+            ema_adaptive: false,
+        };
+        let mut st = state(Kind::Stock);
+        st.owner_us = true;
+        st.last_flip_t = 71000.0;
+        st.last_out = Some(-608.0); // the write at t=71646, where the replay seeds
+
+        for &(t, grid, reported, soc, ovr_fc, ovr_maxdis, acout, expect) in rows {
+            let sg = socguard::enact(&socguard::Inputs {
+                bl_state: 10,
+                min_soc: 10.0,
+                charge_request: false,
+                dc_voltage: 52.0,
+                eff_max_charge_w: f64::NAN,
+                multi_supports_tpimf: true,
+                override_force_charge: ovr_fc,
+                ovr_max_discharge_w: ovr_maxdis,
+            });
+            let snap = Snapshot {
+                s: Sensors { grid, reported, target: 5.0, soc, state: 259 },
+                dt: 1.0,
+                dt_clamped: false,
+                min_soc: 10.0,
+                lo: -7030.0,
+                hi: 7030.0,
+                effective_target: 5.0,
+                sg,
+                feed_block_charge: false,
+                feed_force_flat: false,
+                gen_disable_export: false,
+                gm_should_write: true,
+                shore_out: ShoreOut::default(),
+                hub4_actual: None,
+                ac_out_w: acout,
+            };
+            let d = decide(&snap, &mut st, &c, t);
+            assert_eq!(d.write, Write::Nothing, "t={t}: shadow never writes");
+            assert!(
+                (d.display_cmd - expect).abs() < 0.6,
+                "t={t}: replay must be tick-exact, expected {expect}, got {}",
+                d.display_cmd
+            );
+        }
+        assert_eq!(st.sanity_trips, 0);
+    }
+
     /// End-to-end learn-gate test THROUGH decide(): identical steady discharge inputs must
     /// leave the adaptive model untouched in shadow and trim (our command isn't actuated
     /// there — learning would train on a phantom regime)...

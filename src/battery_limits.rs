@@ -424,6 +424,22 @@ mod tests {
     }
 
     #[test]
+    fn bms_alarm_dcl_zero_blocks_discharge_while_present() {
+        // A BMS asserting a protection alarm typically keeps publishing but drops
+        // DCL to 0 — that must hard-block discharge (distinct from disappearing).
+        let mut bus = regular(280.0, 52.44, 100.0);
+        let mut br = BatteryBroker::new(&bus);
+        let _ = br.tick(&bus); // normal first
+        bus.set(TEST_BMS, P_BMS_DCL, 0.0);
+        let tr = br.tick(&bus);
+        assert_eq!(tr.published.max_discharge_power, 0.0);
+        assert_eq!(tr.enforced.max_discharge_power, 0.0);
+        let (lo, hi) = clamp_bounds(tr.enforced, -7030.0, 7030.0);
+        assert_eq!(lo, 0.0, "no discharge may be commanded during the alarm");
+        assert!(hi > 0.0, "charge direction stays available");
+    }
+
+    #[test]
     fn bms_disappearing_hard_blocks_discharge_after_latch() {
         let mut bus = regular(280.0, 52.44, 100.0);
         let mut br = BatteryBroker::new(&bus);
