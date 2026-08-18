@@ -94,6 +94,11 @@ pub enum FeedInMode {
 /// invalidate-overrides watchdog.
 #[derive(Clone, Copy)]
 pub struct Overrides {
+    /// Live merged discharge bound from the battery broker ∧ SocGuard (W; NaN = unknown/
+    /// unlimited). Feeds canDischarge (§4.2) so a BMS alarm (DCL → 0), an ephemeral
+    /// override, or a BL no-discharge state disables feed-in exactly as stock does —
+    /// without this, feed-in excess could drain the battery around the setpoint clamp.
+    pub discharge_bound_w: f64,
     /// `/Overrides/FeedInExcess`: 0 = no override, 1 = force NO feed-in, 2 = force feed-in.
     pub feed_in_excess: i32,
     /// `/Overrides/ForceCharge`.
@@ -102,7 +107,7 @@ pub struct Overrides {
 
 impl Default for Overrides {
     fn default() -> Self {
-        Overrides { feed_in_excess: 0, force_charge: false }
+        Overrides { feed_in_excess: 0, force_charge: false, discharge_bound_w: f64::NAN }
     }
 }
 
@@ -259,11 +264,16 @@ impl FeedIn {
     }
 
     /// canDischarge (§4.2): the merged discharge budget is `> 0`, OR unknown (NaN =>
-    /// allowed, matching the reference implementation — see §6.8). The budget is forced to 0 while Sustain
-    /// is active or BL state == 7 (the sustain enactment). We approximate the merged
-    /// budget with the settings `MaxDischargePower` (ephemeral overrides not wired yet).
+    /// allowed, matching the binary — see §6.8). The budget is the settings
+    /// `MaxDischargePower` merged with the live broker/SocGuard bound handed in via
+    /// `Overrides.discharge_bound_w` (BMS DCL, ephemeral override, BL no-discharge
+    /// states), and forced to 0 while Sustain is active or BL state == 7.
     fn can_discharge(&self, i: &Inputs) -> bool {
-        let mut max_dis = i.max_discharge;
+        let mut max_dis = i.max_discharge; // NaN-ignoring merge: f64::min skips NaN
+        let ovr = self.overrides.discharge_bound_w;
+        if ovr.is_finite() {
+            max_dis = if max_dis.is_finite() { max_dis.min(ovr) } else { ovr };
+        }
         if i.sustain || i.bl_state == BL_SUSTAIN_STATE {
             max_dis = 0.0;
         }
@@ -599,6 +609,28 @@ mod tests {
         // OvervoltageFeedIn off & no override => DC excess blocked, and mode!=TPIMFI:
         assert_eq!(o.do_not_feed_in_overvoltage, 1);
         assert_eq!(o.fix_solar_offset, 1); // DVCC on
+    }
+
+    #[test]
+    fn bms_alarm_discharge_bound_zero_disables_feedin() {
+        // A BMS protection alarm (DCL -> 0) reaches feed-in via the live broker bound,
+        // NOT the settings item: feed-in must close so DC excess cannot drain the
+        // battery around the setpoint clamp. Settings MaxDischargePower stays "unknown".
+        let bus = base();
+        let mut f = FeedIn::new(&bus);
+        f.set_overrides(Overrides { discharge_bound_w: 0.0, ..Overrides::default() });
+        let o = f.tick(&bus);
+        assert_eq!(o.disable_feedin, 1, "alarm bound must close feed-in");
+
+        // Bound recovers (alarm clears): feed-in reopens.
+        f.set_overrides(Overrides { discharge_bound_w: f64::NAN, ..Overrides::default() });
+        let o = f.tick(&bus);
+        assert_eq!(o.disable_feedin, 0);
+
+        // A finite POSITIVE bound (normal BMS limit) keeps feed-in open.
+        f.set_overrides(Overrides { discharge_bound_w: 13214.9, ..Overrides::default() });
+        let o = f.tick(&bus);
+        assert_eq!(o.disable_feedin, 0);
     }
 
     #[test]

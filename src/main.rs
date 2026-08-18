@@ -470,9 +470,17 @@ fn sample(
 
     // SocGuard first (its force_charge feeds the feed-in override).
     let sg = sub.socguard.tick(bus);
+    // Merged live discharge bound for feed-in's canDischarge: broker (BMS DCL, sustain,
+    // BL discharged states) ∧ SocGuard (state inhibit ∧ /Overrides/MaxDischargePower).
+    let mut dis_bound = tr.enforced.max_discharge_power;
+    if sg.max_discharge_w.is_finite() {
+        dis_bound =
+            if dis_bound.is_finite() { dis_bound.min(sg.max_discharge_w) } else { sg.max_discharge_w };
+    }
     sub.feedin.set_overrides(feedin::Overrides {
         feed_in_excess: dess_out.feed_in_excess,
         force_charge: sg.force_charge,
+        discharge_bound_w: dis_bound,
     });
     let feed = sub.feedin.tick(bus);
     let feed_block_charge = feed.block_charge();
