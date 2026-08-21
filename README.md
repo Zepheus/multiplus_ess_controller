@@ -76,6 +76,46 @@ VENUS_ESS_LIVE=I_UNDERSTAND ./multiplus_ess_controller --stage takeover --confir
 Controllers: `stock` (reference, no fix), `true-integral`, `pi`, and `adaptive`
 (`pi` + a self-learning feed-forward — see *Tuning it to your system* below).
 
+## Install as a service (Venus OS, daemontools)
+
+Venus OS supervises everything with daemontools (`svscan` on `/service`), and runs
+`/data/rc.local` at every boot. Only `/data` survives reboots **and** firmware
+updates, so the service lives there and re-installs itself into the tmpfs service
+tree each boot — supervise state and logs never touch the eMMC flash. Ready-made
+files are in [`deploy/`](deploy/).
+
+```bash
+# from the repo root, with the cross-compiled binary built:
+scp target/armv7-unknown-linux-musleabihf/release/multiplus_ess_controller \
+    root@<gx-ip>:/data/venus-ess/venus-ess-controller
+scp -r deploy/service root@<gx-ip>:/data/venus-ess/
+scp deploy/rc.local  root@<gx-ip>:/data/rc.local
+ssh root@<gx-ip> 'chmod +x /data/rc.local /data/venus-ess/service/run \
+    /data/venus-ess/service/log/run /data/venus-ess/venus-ess-controller \
+    && /data/rc.local'
+```
+
+`svscan` picks the new service up within ~5 s — no reboot needed. Check and drive
+it with the daemontools tools:
+
+```bash
+svstat /service/venus-ess           # up (pid ...) N seconds
+svc -t /service/venus-ess           # restart (e.g. after deploying a new binary)
+svc -d /service/venus-ess           # stop (supervise keeps it down)
+svc -u /service/venus-ess           # start again
+tail -f /run/venus-ess-svclog/current   # timestamped stderr/stdout (tmpfs, bounded)
+```
+
+The shipped `deploy/service/run` starts the **shadow stage (read-only)**. To
+promote a validated install, edit the `exec` line's flags (`--stage`, the
+double-gate env var, controller choice) — the service supervises whatever stage
+you configure. Crash recovery: supervise restarts the process within seconds;
+on restart the daemon sanitizes a stale external `Hub4Mode` left by an unclean
+death, so the stock loop is always recoverable.
+
+To uninstall: `svc -d /service/venus-ess`, remove the `/service/venus-ess`
+symlink, delete `/data/venus-ess`, and remove (or edit) `/data/rc.local`.
+
 ## Tuning it to your system
 
 Every ESS install leaks by a different amount — it depends on your inverter model, how
