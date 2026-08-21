@@ -552,6 +552,111 @@ mod tests {
         assert_eq!(ctrl.i, 0.0, "reset must clear the integral");
     }
 
+    /// COUNTERFACTUAL REPLAY (ignored; run explicitly) — drives the REAL production
+    /// law (this module + the stock write EMA) closed-loop against a plant fitted
+    /// from live telemetry, over a real captured load profile. Answers "would the
+    /// adaptive controller have balanced the grid, and does it ever run away?"
+    /// without touching the live system.
+    ///
+    ///   REPLAY_LOAD=/path/load.csv (t,load_w rows) \
+    ///   [REPLAY_SCEN=baseline|plantshift|noiseburst|meterfreeze] \
+    ///   [REPLAY_A0=.. REPLAY_B0=..]  (hostile model seed) \
+    ///   cargo test --target <host> replay_counterfactual -- --ignored --nocapture
+    ///
+    /// Plant: rep(t) = A + B·write(t−1) with A=4.7, B=0.9562 (fitted 2026-08-21,
+    /// 32,389 steady rows, resid σ 35 W) + N(0,35) measurement noise.
+    #[test]
+    #[ignore]
+    fn replay_counterfactual() {
+        let path = match std::env::var("REPLAY_LOAD") {
+            Ok(p) => p,
+            Err(_) => return, // not configured: skip silently
+        };
+        let scen = std::env::var("REPLAY_SCEN").unwrap_or_else(|_| "baseline".into());
+        let a0: f64 = std::env::var("REPLAY_A0").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        let b0: f64 = std::env::var("REPLAY_B0").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        let data = std::fs::read_to_string(&path).expect("load csv");
+        let rows: Vec<(i64, f64)> = data
+            .lines()
+            .filter_map(|l| {
+                let mut it = l.split(',');
+                Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+            })
+            .collect();
+        // split into contiguous segments (gaps > 3 s)
+        let mut segs: Vec<Vec<(i64, f64)>> = vec![];
+        let mut cur: Vec<(i64, f64)> = vec![rows[0]];
+        for w in rows.windows(2) {
+            if w[1].0 - w[0].0 <= 3 { cur.push(w[1]); } else { segs.push(std::mem::take(&mut cur)); cur.push(w[1]); }
+        }
+        segs.push(cur);
+        segs.retain(|s| s.len() > 600);
+
+        // deterministic xorshift noise (no external rng crates)
+        let mut rng: u64 = 0x9E3779B97F4A7C15;
+        let mut gauss = move |sd: f64| {
+            let mut n = 0.0;
+            for _ in 0..12 {
+                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                n += (rng >> 11) as f64 / (1u64 << 53) as f64;
+            }
+            (n - 6.0) * sd
+        };
+
+        let (lo, hi) = (-7030.0, 7030.0);
+        let target = 5.0;
+        let mut errs: Vec<f64> = vec![];
+        let (mut worst, mut clamps) = (0.0f64, 0u64);
+        for seg in &segs {
+            let kind = match std::env::var("REPLAY_CTRL").as_deref() {
+                Ok("stock") => Kind::Stock,
+                Ok("pi") => Kind::Pi { ki: 0.05, i_max: 300.0 },
+                _ => {
+                    let mut cfg = AdaptiveCfg::tuned();
+                    cfg.a0 = a0;
+                    cfg.b0 = b0;
+                    cfg.seeded = a0 != 0.0 || b0 != 0.0;
+                    Kind::Adaptive(cfg)
+                }
+            };
+            let mut ctrl = Controller::new(kind);
+            let (mut rep, mut prev_w): (f64, Option<f64>) = (0.0, None);
+            let mut frozen = 0.0f64;
+            let half = seg.len() / 2;
+            for (k, &(_t, load)) in seg.iter().enumerate() {
+                let (pa, pb) = if scen == "plantshift" && k > half { (40.0, 0.91) } else { (4.7, 0.9562) };
+                let grid_true = load + rep;
+                let mut grid = grid_true + gauss(35.0);
+                if scen == "noiseburst" && (k / 600) % 6 == 0 { grid += gauss(200.0); }
+                if scen == "meterfreeze" && k % 600 < 5 && k > 0 { grid = frozen; }
+                frozen = grid;
+                let cmd = ctrl.update(grid, rep, target, 1.0, lo, hi, true);
+                if cmd <= lo + 1e-9 || cmd >= hi - 1e-9 { clamps += 1; }
+                let w = crate::loop_core::stock_write_ema(prev_w, cmd, false);
+                prev_w = Some(w);
+                rep = pa + pb * w;
+                if k > 120 {
+                    let e = grid_true - target;
+                    errs.push(e);
+                    if e.abs() > worst { worst = e.abs(); }
+                }
+            }
+            if let Some(ff) = ctrl.ff_snapshot(500.0) {
+                eprintln!("  segment end: a={:.1} b={:.4} pred@500W={:.1} i-not-shown", ff.a, ff.b, ff.a + ff.b * 500.0);
+            }
+        }
+        errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = errs.len();
+        let med = errs[n / 2];
+        let mean: f64 = errs.iter().sum::<f64>() / n as f64;
+        let mut abs: Vec<f64> = errs.iter().map(|e| e.abs()).collect();
+        abs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "REPLAY scen={scen} n={n}: median {med:+.1}W mean {mean:+.1}W |e|p99 {:.1}W worst {worst:.0}W env-clamps {clamps}",
+            abs[n * 99 / 100]
+        );
+    }
+
     #[test]
     fn adaptive_does_not_learn_when_not_actuating() {
         // learn=false (shadow/trim: our command isn't applied) must freeze learning even
