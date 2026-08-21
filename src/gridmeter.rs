@@ -47,7 +47,7 @@ pub const ACTIVEIN_DISCONNECTED: i32 = 240;
 /// `com.victronenergy.system /Ac/ActiveIn/Source == 2` ⇒ generator. [RE][H]
 pub const SOURCE_GENERATOR: i32 = 2;
 /// `Hub4Mode == 3` ⇒ external control, `the stock ESS loop` inert. [RE][H]
-pub const HUB4MODE_EXTERNAL: i32 = 3;
+pub use crate::states::hub4mode::EXTERNAL as HUB4MODE_EXTERNAL;
 
 // ---- staleness guard (our improvement, non-stock) -------------------------
 
@@ -245,8 +245,15 @@ impl GridMeterGuard {
     /// Run one presence tick: read the bus, apply the staleness guard, step the
     /// setpoint gate and the presence/alarm FSM, and return the decision.
     ///
+    /// `mode3_is_ours`: true when THIS process is the mode-3 (external-control)
+    /// controller — i.e. running the takeover stage. Stock goes inert on
+    /// Hub4Mode==EXTERNAL because in that mode *someone else* owns the loop; for
+    /// the takeover stage that someone is us, so the mode must NOT gate our own
+    /// writes (the same divergence feedin.rs already carries). In shadow/trim the
+    /// flag is false and the gate matches stock exactly.
+    ///
     /// Call once per `PRESENCE_TICK` (2.5 s).
-    pub fn tick(&mut self, bus: &dyn Bus) -> GridMeterGuardOut {
+    pub fn tick(&mut self, bus: &dyn Bus, mode3_is_ours: bool) -> GridMeterGuardOut {
         let i = Self::read_inputs(bus);
         let raw = self.read_meter(bus);
         let (valid, fresh) = self.update_freshness(raw);
@@ -254,11 +261,12 @@ impl GridMeterGuard {
         let stale = valid && !fresh; // present-but-frozen detected this tick
 
         let genset = i.source == SOURCE_GENERATOR;
-        let inert = i.hub4mode == HUB4MODE_EXTERNAL || !i.multi_valid;
+        let external = i.hub4mode == HUB4MODE_EXTERNAL && !mode3_is_ours;
+        let inert = external || !i.multi_valid;
 
         // ---- setpoint gate (mirrors  early-returns) ----
         let regulate = if inert {
-            // External mode or Multi/AC-in unreadable ⇒ write nothing (fail safe).
+            // Foreign external mode or Multi/AC-in unreadable ⇒ write nothing (fail safe).
             Regulation::Skip
         } else if i.run_without_meter || genset {
             // RWGM or genset: meter term degenerates to 0 ⇒ regulate on Multi AC-in.
@@ -341,7 +349,7 @@ mod tests {
     fn meter_present_regulates_on_grid_meter() {
         let bus = grid_present(230.0);
         let mut g = GridMeterGuard::new();
-        let out = g.tick(&bus);
+        let out = g.tick(&bus, false);
         assert!(out.usable);
         assert!(out.should_write_setpoint);
         assert_eq!(out.regulate, Regulation::OnGridMeter);
@@ -354,9 +362,9 @@ mod tests {
     fn meter_present_then_absent_stops_writing() {
         let mut bus = grid_present(230.0);
         let mut g = GridMeterGuard::new();
-        assert!(g.tick(&bus).should_write_setpoint);
+        assert!(g.tick(&bus, false).should_write_setpoint);
         make_absent(&mut bus);
-        let out = g.tick(&bus);
+        let out = g.tick(&bus, false);
         assert!(!out.usable);
         assert!(!out.should_write_setpoint); // required + absent ⇒ Skip ⇒ passthru
         assert_eq!(out.regulate, Regulation::Skip);
@@ -370,34 +378,34 @@ mod tests {
     fn alarm_fires_after_exactly_48_ticks() {
         let mut bus = grid_present(230.0);
         let mut g = GridMeterGuard::new();
-        g.tick(&bus); // meter present: grace = 48
+        g.tick(&bus, false); // meter present: grace = 48
         make_absent(&mut bus);
         // 47 absent ticks stay in grace (no alarm)…
         for k in 1..=47 {
-            let out = g.tick(&bus);
+            let out = g.tick(&bus, false);
             assert_eq!(out.presence, Presence::Grace, "tick {k}");
             assert!(!out.alarm_no_grid_meter, "tick {k}");
         }
         // …the 48th raises the alarm and holds it.
-        let out = g.tick(&bus);
+        let out = g.tick(&bus, false);
         assert_eq!(out.presence, Presence::Missing);
         assert!(out.alarm_no_grid_meter);
-        assert!(g.tick(&bus).alarm_no_grid_meter, "alarm stays latched while absent");
+        assert!(g.tick(&bus, false).alarm_no_grid_meter, "alarm stays latched while absent");
     }
 
     #[test]
     fn returning_meter_clears_the_alarm_next_tick() {
         let mut bus = grid_present(230.0);
         let mut g = GridMeterGuard::new();
-        g.tick(&bus);
+        g.tick(&bus, false);
         make_absent(&mut bus);
         for _ in 0..48 {
-            g.tick(&bus);
+            g.tick(&bus, false);
         }
-        assert!(g.tick(&bus).alarm_no_grid_meter); // firmly in alarm
+        assert!(g.tick(&bus, false).alarm_no_grid_meter); // firmly in alarm
         // Meter comes back (fresh value) ⇒ alarm clears immediately, grace reloads.
         let bus = grid_present(180.0);
-        let out = g.tick(&bus);
+        let out = g.tick(&bus, false);
         assert!(!out.alarm_no_grid_meter);
         assert_eq!(out.presence, Presence::Ok);
         assert!(out.should_write_setpoint);
@@ -410,7 +418,7 @@ mod tests {
         bus.set(VEBUS, P_ACTIVE_INPUT, ACTIVEIN_DISCONNECTED as f64);
         let mut g = GridMeterGuard::new();
         for _ in 0..60 {
-            let out = g.tick(&bus);
+            let out = g.tick(&bus, false);
             assert_eq!(out.presence, Presence::NotApplicable);
             assert!(!out.alarm_no_grid_meter);
         }
@@ -425,12 +433,12 @@ mod tests {
         let mut g = GridMeterGuard::new();
         // First STALE_TICKS reads still look usable (value could be steady briefly).
         for _ in 0..STALE_TICKS {
-            let out = g.tick(&bus);
+            let out = g.tick(&bus, false);
             assert!(out.usable, "not yet declared stale");
             assert!(!out.stale);
         }
         // Once unchanged for STALE_TICKS consecutive ticks it is declared frozen.
-        let out = g.tick(&bus);
+        let out = g.tick(&bus, false);
         assert!(out.stale, "frozen meter must be flagged");
         assert!(!out.usable);
         assert!(!out.should_write_setpoint); // required + frozen ⇒ Skip ⇒ passthru
@@ -442,7 +450,7 @@ mod tests {
         let mut g = GridMeterGuard::new();
         for k in 0..30 {
             let bus = grid_present(200.0 + k as f64); // value advances each tick
-            let out = g.tick(&bus);
+            let out = g.tick(&bus, false);
             assert!(out.usable && !out.stale, "tick {k}");
             assert_eq!(out.regulate, Regulation::OnGridMeter);
         }
@@ -454,7 +462,7 @@ mod tests {
         let bus = grid_present(500.0);
         let mut g = GridMeterGuard::new().with_frozen_guard(false);
         for _ in 0..(STALE_TICKS + 20) {
-            let out = g.tick(&bus);
+            let out = g.tick(&bus, false);
             assert!(out.usable && !out.stale);
             assert_eq!(out.regulate, Regulation::OnGridMeter);
         }
@@ -469,7 +477,7 @@ mod tests {
         bus.set(SETTINGS, P_RUN_WITHOUT_METER, 1.0);
         let mut g = GridMeterGuard::new();
         for _ in 0..60 {
-            let out = g.tick(&bus);
+            let out = g.tick(&bus, false);
             assert_eq!(out.regulate, Regulation::OnMultiInput);
             assert!(out.should_write_setpoint);
             assert_eq!(out.presence, Presence::NotApplicable);
@@ -487,11 +495,11 @@ mod tests {
         bus.set(SETTINGS, P_GRID_METER_REQUIRED, 0.0);
         let mut g = GridMeterGuard::new();
         for _ in 0..48 {
-            let out = g.tick(&bus);
+            let out = g.tick(&bus, false);
             assert_eq!(out.regulate, Regulation::OnMultiInput);
             assert!(out.should_write_setpoint);
         }
-        let out = g.tick(&bus);
+        let out = g.tick(&bus, false);
         assert!(out.alarm_no_grid_meter, "alarm fires even when meter optional");
         assert_eq!(out.regulate, Regulation::OnMultiInput); // still writing
     }
@@ -502,9 +510,9 @@ mod tests {
         make_absent(&mut bus);
         let mut g = GridMeterGuard::new(); // GMR=1, RWGM=0 (default fixture)
         for _ in 0..48 {
-            assert_eq!(g.tick(&bus).regulate, Regulation::Skip);
+            assert_eq!(g.tick(&bus, false).regulate, Regulation::Skip);
         }
-        assert!(g.tick(&bus).alarm_no_grid_meter);
+        assert!(g.tick(&bus, false).alarm_no_grid_meter);
     }
 
     #[test]
@@ -514,7 +522,7 @@ mod tests {
         bus.set(SYS, P_SOURCE, SOURCE_GENERATOR as f64);
         let mut g = GridMeterGuard::new();
         for _ in 0..60 {
-            let out = g.tick(&bus);
+            let out = g.tick(&bus, false);
             assert_eq!(out.regulate, Regulation::OnMultiInput);
             assert!(out.should_write_setpoint);
             assert!(!out.alarm_no_grid_meter);
@@ -528,10 +536,26 @@ mod tests {
         let mut bus = grid_present(230.0);
         bus.set(SETTINGS, P_HUB4MODE, HUB4MODE_EXTERNAL as f64);
         let mut g = GridMeterGuard::new();
-        let out = g.tick(&bus);
+        let out = g.tick(&bus, false);
         assert_eq!(out.regulate, Regulation::Skip);
         assert_eq!(out.presence, Presence::NotApplicable);
         assert!(!out.alarm_no_grid_meter);
+    }
+
+    #[test]
+    fn hub4mode_external_is_not_inert_when_we_own_mode3() {
+        // PROMOTION-BLOCKER regression (found in pre-live review): in the takeover
+        // stage WE set Hub4Mode=EXTERNAL, and the guard treating that as "inert"
+        // stopped every setpoint write within one presence tick of taking over.
+        let mut bus = grid_present(230.0);
+        bus.set(SETTINGS, P_HUB4MODE, HUB4MODE_EXTERNAL as f64);
+        let mut g = GridMeterGuard::new();
+        let out = g.tick(&bus, true); // mode3_is_ours: takeover stage
+        assert!(out.should_write_setpoint, "our own mode-3 must not gate our writes");
+        assert_eq!(out.regulate, Regulation::OnGridMeter);
+        // And a FOREIGN mode 3 (not ours) still goes inert, matching stock.
+        let mut g2 = GridMeterGuard::new();
+        assert_eq!(g2.tick(&bus, false).regulate, Regulation::Skip);
     }
 
     #[test]
@@ -539,7 +563,7 @@ mod tests {
         let mut bus = grid_present(230.0);
         bus.clear(VEBUS, P_ACTIVEIN); // Multi AC-in unreadable ⇒ never write
         let mut g = GridMeterGuard::new();
-        let out = g.tick(&bus);
+        let out = g.tick(&bus, false);
         assert!(!out.should_write_setpoint);
         assert_eq!(out.regulate, Regulation::Skip);
     }
@@ -551,7 +575,7 @@ mod tests {
         let mut bus = MockBus::new();
         bus.set(VEBUS, P_ACTIVEIN, -50.0);
         let mut g = GridMeterGuard::new();
-        let out = g.tick(&bus);
+        let out = g.tick(&bus, false);
         assert!(!out.should_write_setpoint);
         assert!(!out.usable);
     }
@@ -564,7 +588,7 @@ mod tests {
         bus.clear(GRID_SVC, P_METER_POWER);
         bus.set(SYS, P_GRID, 210.0);
         let mut g = GridMeterGuard::new();
-        let out = g.tick(&bus);
+        let out = g.tick(&bus, false);
         assert!(out.usable);
         assert_eq!(out.regulate, Regulation::OnGridMeter);
         assert_eq!(g.meter_service(), None); // adopted via system fallback

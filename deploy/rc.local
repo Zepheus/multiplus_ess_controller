@@ -1,0 +1,8 @@
+#!/bin/sh
+# Run at every boot by /etc/init.d/custom-rc-late.sh (Venus OS hook).
+# /data persists across reboots AND firmware updates, so this re-installs the
+# venus-ess service into the tmpfs service tree each boot, exactly like the
+# stock services in /run/service (supervise state + logs stay off eMMC).
+mkdir -p /run/service
+cp -a /data/venus-ess/service /run/service/venus-ess
+ln -sf /run/service/venus-ess /service/venus-ess

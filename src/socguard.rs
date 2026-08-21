@@ -32,9 +32,9 @@
 use crate::dbus::*;
 
 /// KeepCharged BatteryLife state (min SOC held at 100 %).
-pub const KEEP_CHARGED: i32 = 9;
+pub const KEEP_CHARGED: i32 = crate::states::bl::SOCG_KEEP_CHARGED;
 /// BLForceCharge — the 24 h "slow charge": raise the lower clamp to +5 A × Vdc.
-pub const BL_FORCE_CHARGE: i32 = 6;
+pub const BL_FORCE_CHARGE: i32 = crate::states::bl::FORCE_CHARGE;
 /// "Charge as hard as allowed" sentinel emitted when no finite charge limit is
 /// configured; the Multi/DVCC then decides. Kept bit-compatible for the firmware.
 pub const FORCE_CHARGE_SENTINEL_W: f64 = 414_000.0;
@@ -69,6 +69,8 @@ pub const P_OVR_MAXDISCHARGE: &str = "/Overrides/MaxDischargePower"; // hub4, f6
 /// Discharge-inhibit set {5,6,8,11,12} = {BLDischarged, BLForceCharge, BLLowSocCharge,
 /// SocGuardDischarged, SocGuardLowSocCharge}. the stock ESS loop tests it with the literal
 /// mask `(state-5 < 8) && ((0xCB >> (state-5)) & 1)`; reproduced here for fidelity.
+/// The set it encodes: {DISCHARGED, FORCE_CHARGE, LOW_SOC_CHARGE, SOCG_DISCHARGED,
+/// SOCG_LOW_SOC_CHARGE} (see `crate::states::bl`).
 fn is_discharged_set(s: i32) -> bool {
     let d = s.wrapping_sub(5);
     (0..8).contains(&d) && (0xCB >> d) & 1 != 0
@@ -145,7 +147,10 @@ pub fn enact(inp: &Inputs) -> SocGuardOut {
     let force_charge = inp.override_force_charge
         || inp.charge_request
         || keep_charged
-        || matches!(inp.bl_state, 8 | 12);
+        || matches!(
+            inp.bl_state,
+            crate::states::bl::LOW_SOC_CHARGE | crate::states::bl::SOCG_LOW_SOC_CHARGE
+        );
 
     // (§4a-2) Discharge inhibit: effective MaxDischargePower forced to 0 in the set,
     // AND capped by the external /Overrides/MaxDischargePower (ephemeral override —
@@ -261,6 +266,7 @@ impl SocGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::states::bl;
     use crate::testbus::MockBus;
 
     const TEST_BMS: &str = "com.victronenergy.battery.test";
@@ -487,7 +493,7 @@ mod tests {
     fn nan_min_soc_does_not_force_charge() {
         // A NaN min-SOC must not satisfy `> 99.0` (NaN comparisons are false).
         let inp = Inputs {
-            bl_state: 0,
+            bl_state: bl::DISABLED,
             min_soc: f64::NAN,
             charge_request: false,
             dc_voltage: 52.0,
@@ -562,13 +568,13 @@ mod tests {
 
         // MinSOC=100 edge (HA sets 100%): our own >99 KeepCharged path also charges,
         // independent of systemcalc — matches the stock loop's only internal SOC-ish rule.
-        let kc = enact(&Inputs { min_soc: 100.0, bl_state: 10, ..dispatch_inp() });
+        let kc = enact(&Inputs { min_soc: 100.0, bl_state: bl::SOCG_DEFAULT, ..dispatch_inp() });
         assert!(kc.force_charge, "MinSOC>99 is KeepCharged even at state 10");
     }
 
     fn dispatch_inp() -> Inputs {
         Inputs {
-            bl_state: 10,
+            bl_state: bl::SOCG_DEFAULT,
             min_soc: 80.0,
             charge_request: false,
             dc_voltage: 52.0,

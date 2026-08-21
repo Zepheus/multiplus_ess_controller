@@ -253,7 +253,7 @@ impl BatteryBroker {
         if !keep_charged(i) {
             dp = dp.min(i.s_max_discharge_power); // f64::min ignores NaN
         }
-        if i.sustain || i.bl_state == 7 {
+        if i.sustain || i.bl_state == crate::states::bl::SUSTAIN as i64 {
             dp = 0.0;
         }
 

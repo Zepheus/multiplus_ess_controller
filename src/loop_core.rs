@@ -12,6 +12,7 @@
 //! caller run actuate()", and any composition regression is caught by a host unit test.
 
 use crate::control::Controller;
+use crate::gridmeter::HUB4MODE_EXTERNAL;
 use crate::shore::ShoreOut;
 use crate::socguard::SocGuardOut;
 use crate::Stage;
@@ -192,6 +193,11 @@ pub struct Snapshot {
     /// Measured Multi AC-out power (W, vebus `/Ac/Out/L1/P`; NaN = unread, treated as 0).
     /// Feedforward term for battery-frame clamps — see `composed_command`.
     pub ac_out_w: f64,
+    /// Live `/Settings/CGwacs/Hub4Mode` read this tick (None = unreadable). Takeover uses
+    /// it to (a) cede immediately when someone external flips the mode away from
+    /// EXTERNAL while we own, and (b) keep re-asserting the stock mode after a
+    /// hand-back until the restore actually sticks.
+    pub hub4mode_live: Option<i32>,
 }
 
 /// State carried across ticks; `decide()` mutates it (integrator, ownership, trim state).
@@ -211,6 +217,10 @@ pub struct LoopState {
     /// BL discharged state). The sanity check is suppressed while it was set; using last
     /// tick avoids an ordering dependency.
     pub prev_force_charge: bool,
+    /// Latched when an EXTERNAL actor flipped Hub4Mode away while we owned (user, VRM,
+    /// another tool): we cede and never re-take until the process is restarted — a
+    /// deliberate operator action must not be fought by an auto re-take.
+    pub ceded_external: bool,
     /// Sanity-trip latch: how many times the sanity supervisor has forced a hand-back this
     /// run. Each trip DOUBLES the dwell required before re-takeover (capped), so a
     /// persistently-wrong controller escalates to hour-scale retries instead of flip-flopping
@@ -345,15 +355,46 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
     //    A sanity trip forces exit (hand back / neutralise) regardless of dwell, and each trip
     //    doubles the re-entry dwell (latch/backoff): a persistently-wrong controller escalates
     //    to hour-scale retries instead of oscillating mode 3<->1 forever.
-    let enter_ok = s.soc >= snap.min_soc + cfg.soc_hyst && s.state != cfg.state_recharge;
+    // 1b. External-mode verification (takeover only; read done in sample()). Runs
+    // BEFORE the want/dwell computation so a cede takes effect this tick.
+    let mut ext_note = "";
+    let mut ext_mode_write: Option<i32> = None;
+    if matches!(cfg.stage, Stage::Takeover) {
+        match snap.hub4mode_live {
+            // Someone else (user / VRM / another tool) flipped the mode away while we
+            // owned: the stock loop is running again. Cede IMMEDIATELY, do not fight
+            // the change, and never auto re-take — a deliberate operator action stays
+            // ceded until this process is restarted. (The sanity supervisor cannot
+            // catch this: both laws track the same target, so grid stays in-band.)
+            Some(m) if st.owner_us && m != HUB4MODE_EXTERNAL => {
+                st.owner_us = false;
+                st.last_flip_t = t;
+                st.ceded_external = true;
+                ext_note = "mode changed externally: ceded (sticky)";
+            }
+            // Handed back but the mode still reads EXTERNAL: our restore write never
+            // landed (transient dbus error) or a previous run died mid-takeover. Stock
+            // gates its whole loop on this setting, so keep re-asserting until it
+            // sticks — otherwise nobody runs ESS (Multi sits in watchdog passthru).
+            Some(m) if !st.owner_us && m == HUB4MODE_EXTERNAL => {
+                ext_mode_write = Some(cfg.orig_mode);
+                ext_note = "re-asserting stock mode";
+            }
+            _ => {}
+        }
+    }
+
+    let enter_ok = s.soc >= snap.min_soc + cfg.soc_hyst
+        && s.state != cfg.state_recharge
+        && !st.ceded_external;
     let exit_now = s.soc <= snap.min_soc || s.state == cfg.state_recharge || sanity_tripped;
     let want_us = if st.owner_us { !exit_now } else { enter_ok };
     let backoff_s = cfg.min_dwell_s * f64::from(1u32 << st.sanity_trips.min(7)); // 30s .. ~64min
     let dwell_ok = t - st.last_flip_t >= backoff_s;
 
-    let mut note = "";
-    let mut hub4mode = None;
-    let mut flipped = false;
+    let mut note = ext_note;
+    let mut hub4mode = ext_mode_write;
+    let mut flipped = !ext_note.is_empty() && ext_mode_write.is_none();
     let mut transition_write = Write::Nothing;
     if want_us != st.owner_us && (dwell_ok || !want_us) {
         st.owner_us = want_us;
@@ -364,10 +405,18 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
             st.sanity_trips = st.sanity_trips.saturating_add(1);
         }
         match cfg.stage {
-            // Takeover flips Hub4Mode 1<->3 so stock relinquishes / resumes the whole loop.
+            // Takeover flips Hub4Mode stock<->EXTERNAL so stock relinquishes / resumes
+            // the whole loop.
             Stage::Takeover => {
-                hub4mode = Some(if st.owner_us { 3 } else { cfg.orig_mode });
+                hub4mode = Some(if st.owner_us { HUB4MODE_EXTERNAL } else { cfg.orig_mode });
                 note = if st.owner_us { "TOOK OVER (mode3)" } else { "handed back (mode1)" };
+                if st.owner_us {
+                    // Seed the write-EMA/slew from stock's LAST written setpoint so the
+                    // first write converges from where the Multi already is, instead of
+                    // jumping to the raw law (which can be a multi-kW transient if the
+                    // take-over lands on a meter-lag tick).
+                    st.last_out = snap.hub4_actual.filter(|v| v.is_finite());
+                }
             }
             // Trim never touches Hub4Mode: seed the integral on activation; on deactivation
             // emit one neutralising override write (configured setpoint) so stock resumes.
@@ -463,7 +512,10 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
                 Write::Override(sv)
             }
             Write::Nothing => {
-                st.last_out = None;
+                // Keep the EMA/slew memory across a skipped write (meter-guard gap):
+                // resetting here made every post-gap write a raw, unsmoothed step at
+                // exactly the moment the law input is least trustworthy. Ownership
+                // loss (the else branch below) still clears it.
                 Write::Nothing
             }
         }
@@ -501,6 +553,7 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
 mod tests {
     use super::*;
     use crate::control::Kind;
+    use crate::states::{bl, sysstate};
 
     fn sg_free() -> SocGuardOut {
         SocGuardOut {
@@ -514,7 +567,7 @@ mod tests {
 
     fn snap(stage_gm: bool) -> Snapshot {
         Snapshot {
-            s: Sensors { grid: 100.0, reported: 0.0, target: 20.0, soc: 60.0, state: 256 },
+            s: Sensors { grid: 100.0, reported: 0.0, target: 20.0, soc: 60.0, state: sysstate::DISCHARGING },
             dt: 1.0,
             dt_clamped: false,
             min_soc: 15.0,
@@ -529,6 +582,7 @@ mod tests {
             shore_out: ShoreOut::default(),
             hub4_actual: None,
                 ac_out_w: f64::NAN,
+                hub4mode_live: None,
         }
     }
 
@@ -541,6 +595,7 @@ mod tests {
             last_out: None,
             oob_since: None,
             prev_force_charge: false,
+            ceded_external: false,
             sanity_trips: 0,
         }
     }
@@ -554,7 +609,7 @@ mod tests {
             min_dwell_s: 30.0,
             trim_ki: 0.02,
             orig_mode: 1,
-            state_recharge: 258,
+            state_recharge: sysstate::RECHARGE,
             slew_w_per_s: sl.slew_w_per_s,
             sanity_band_w: sl.sanity_band_w,
             sanity_secs: sl.sanity_secs,
@@ -567,7 +622,7 @@ mod tests {
         let mut st = state(Kind::Stock);
         let d = decide(&snap(true), &mut st, &cfg(Stage::Takeover), 0.0);
         assert!(d.owner_us && d.flipped);
-        assert_eq!(d.hub4mode, Some(3));
+        assert_eq!(d.hub4mode, Some(HUB4MODE_EXTERNAL));
         assert!(matches!(d.write, Write::Setpoint(_)));
     }
 
@@ -682,7 +737,7 @@ mod tests {
             min_dwell_s: 30.0,
             trim_ki: 0.02,
             orig_mode: 1,
-            state_recharge: 258,
+            state_recharge: sysstate::RECHARGE,
             slew_w_per_s: sl.slew_w_per_s,
             sanity_band_w: sl.sanity_band_w,
             sanity_secs: sl.sanity_secs,
@@ -720,6 +775,7 @@ mod tests {
                 shore_out: ShoreOut::default(),
                 hub4_actual: None,
                 ac_out_w: f64::NAN,
+                hub4mode_live: None,
             };
             let d = decide(&snap, &mut st, &c, t);
 
@@ -753,7 +809,7 @@ mod tests {
                 }
                 19532 => {
                     assert!(d.flipped && d.owner_us, "t={t}: re-take once 258 clears");
-                    assert_eq!(d.hub4mode, Some(3));
+                    assert_eq!(d.hub4mode, Some(HUB4MODE_EXTERNAL));
                 }
                 19534 => {
                     // Meter-lag tick: raw law = 1252 + 5 − 5310.4 = −4053.4. The stock
@@ -852,7 +908,7 @@ mod tests {
     #[test]
     fn golden_tpimf_force_charge_passes_normal_law_through() {
         let mut sp = snap(true);
-        sp.s = Sensors { grid: 2771.7, reported: 2513.0, target: 5.0, soc: 73.0, state: 259 };
+        sp.s = Sensors { grid: 2771.7, reported: 2513.0, target: 5.0, soc: 73.0, state: sysstate::SCHEDULED_CHARGE };
         sp.effective_target = 5.0;
         sp.sg = SocGuardOut {
             force_charge: true,
@@ -878,7 +934,7 @@ mod tests {
     #[test]
     fn golden_window_tail_discharge_hold_is_honored() {
         let mut sp = snap(true);
-        sp.s = Sensors { grid: 1908.9, reported: 35.0, target: 5.0, soc: 90.0, state: 259 };
+        sp.s = Sensors { grid: 1908.9, reported: 35.0, target: 5.0, soc: 90.0, state: sysstate::SCHEDULED_CHARGE };
         sp.effective_target = 5.0;
         sp.sg = sg_free();
         sp.sg.max_discharge_w = 1.0; // enact() of /Overrides/MaxDischargePower = 1
@@ -968,7 +1024,7 @@ mod tests {
             min_dwell_s: 30.0,
             trim_ki: 0.02,
             orig_mode: 1,
-            state_recharge: 258,
+            state_recharge: sysstate::RECHARGE,
             slew_w_per_s: sl.slew_w_per_s,
             sanity_band_w: sl.sanity_band_w,
             sanity_secs: sl.sanity_secs,
@@ -980,7 +1036,7 @@ mod tests {
 
         for &(t, grid, reported, soc, sysstate, ovr_fc, ovr_maxdis) in rows {
             let sg = socguard::enact(&socguard::Inputs {
-                bl_state: 10, // BatteryLife stays in its normal regime; this path is pure overrides
+                bl_state: bl::SOCG_DEFAULT, // BatteryLife stays in its normal regime; this path is pure overrides
                 min_soc: 10.0,
                 charge_request: false,
                 dc_voltage: 52.0,
@@ -1005,6 +1061,7 @@ mod tests {
                 shore_out: ShoreOut::default(),
                 hub4_actual: None,
                 ac_out_w: f64::NAN,
+                hub4mode_live: None,
             };
             let d = decide(&snap, &mut st, &c, t);
 
@@ -1113,7 +1170,7 @@ mod tests {
             min_dwell_s: 30.0,
             trim_ki: 0.02,
             orig_mode: 1,
-            state_recharge: 258,
+            state_recharge: sysstate::RECHARGE,
             slew_w_per_s: sl.slew_w_per_s,
             sanity_band_w: sl.sanity_band_w,
             sanity_secs: sl.sanity_secs,
@@ -1126,7 +1183,7 @@ mod tests {
 
         for &(t, grid, reported, soc, ovr_fc, ovr_maxdis, acout, expect) in rows {
             let sg = socguard::enact(&socguard::Inputs {
-                bl_state: 10,
+                bl_state: bl::SOCG_DEFAULT,
                 min_soc: 10.0,
                 charge_request: false,
                 dc_voltage: 52.0,
@@ -1136,7 +1193,7 @@ mod tests {
                 ovr_max_discharge_w: ovr_maxdis,
             });
             let snap = Snapshot {
-                s: Sensors { grid, reported, target: 5.0, soc, state: 259 },
+                s: Sensors { grid, reported, target: 5.0, soc, state: sysstate::SCHEDULED_CHARGE },
                 dt: 1.0,
                 dt_clamped: false,
                 min_soc: 10.0,
@@ -1151,6 +1208,7 @@ mod tests {
                 shore_out: ShoreOut::default(),
                 hub4_actual: None,
                 ac_out_w: acout,
+                hub4mode_live: None,
             };
             let d = decide(&snap, &mut st, &c, t);
             assert_eq!(d.write, Write::Nothing, "t={t}: shadow never writes");
@@ -1368,6 +1426,76 @@ mod tests {
     }
 
     #[test]
+    fn external_mode_flip_cedes_ownership_immediately() {
+        // User/VRM/another tool flips Hub4Mode away while we own: stock is running
+        // again — cede this tick, write no mode (never fight the external change).
+        let mut st = state(Kind::Stock);
+        st.owner_us = true;
+        st.last_flip_t = -1000.0;
+        let mut sp = snap(true);
+        sp.hub4mode_live = Some(1);
+        let d = decide(&sp, &mut st, &cfg(Stage::Takeover), 100.0);
+        assert!(!d.owner_us && d.flipped, "must cede when the mode is taken from us");
+        assert_eq!(d.hub4mode, None, "must not write the mode back");
+        assert_eq!(d.write, Write::Nothing);
+        // Sticky: hours later, with take-over conditions perfect, we still defer to
+        // the operator's choice — only a process restart re-arms the stage.
+        sp.hub4mode_live = Some(1);
+        let d2 = decide(&sp, &mut st, &cfg(Stage::Takeover), 50_000.0);
+        assert!(!d2.owner_us && d2.hub4mode.is_none(), "cede must be sticky");
+    }
+
+    #[test]
+    fn failed_handback_mode_is_reasserted_until_it_sticks() {
+        // Handed back (e.g. after a crash-restart) but the persistent setting still
+        // reads EXTERNAL: stock gates its whole loop on it, so keep restoring.
+        let mut st = state(Kind::Stock);
+        st.owner_us = false;
+        let mut sp = snap(true);
+        sp.s.soc = 10.0; // below floor: no take-over wanted
+        sp.hub4mode_live = Some(HUB4MODE_EXTERNAL);
+        let d = decide(&sp, &mut st, &cfg(Stage::Takeover), 100.0);
+        assert_eq!(d.hub4mode, Some(1), "must re-assert the stock mode");
+        assert!(!d.owner_us);
+    }
+
+    #[test]
+    fn takeover_first_write_is_seeded_from_stock_setpoint() {
+        // Take-over landing on a meter-lag tick must not write the raw transient:
+        // the EMA seeds from stock's last written setpoint.
+        let mut st = state(Kind::Stock);
+        let mut sp = snap(true);
+        sp.s.grid = 100.0; // law: 0 + 20 − 100 = −80
+        sp.hub4_actual = Some(-500.0); // stock's last write
+        let d = decide(&sp, &mut st, &cfg(Stage::Takeover), 0.0);
+        assert!(d.owner_us && d.flipped);
+        let Write::Setpoint(v) = d.write else { panic!("expected setpoint") };
+        assert_eq!(v, -290.0, "EMA from stock's −500 toward law −80, got {v}");
+    }
+
+    #[test]
+    fn write_gap_preserves_ema_memory() {
+        // A meter-guard write gap must not reset the EMA: the post-gap write
+        // continues from the last actuated value instead of stepping raw.
+        let mut st = state(Kind::Stock);
+        st.owner_us = true;
+        let c = cfg(Stage::Takeover);
+        let mut sp = snap(true);
+        sp.s.grid = 100.0; // law −80
+        let d1 = decide(&sp, &mut st, &c, 0.0);
+        let Write::Setpoint(v1) = d1.write else { panic!() };
+        assert_eq!(v1, -80.0);
+        sp.gm_should_write = false; // guard gap
+        let d2 = decide(&sp, &mut st, &c, 1.0);
+        assert_eq!(d2.write, Write::Nothing);
+        sp.gm_should_write = true;
+        sp.s.grid = 900.0; // law −880
+        let d3 = decide(&sp, &mut st, &c, 2.0);
+        let Write::Setpoint(v3) = d3.write else { panic!() };
+        assert_eq!(v3, -480.0, "post-gap write must be EMA'd from −80, got {v3}");
+    }
+
+    #[test]
     fn sanity_supervisor_hands_back_after_sustained_divergence() {
         let mut st = state(Kind::Stock);
         st.owner_us = true;
@@ -1528,6 +1656,7 @@ mod tests {
                 shore_out: ShoreOut::default(),
                 hub4_actual: None,
                 ac_out_w: f64::NAN,
+                hub4mode_live: None,
             };
             let d = decide(&snap, &mut st, &c, n as f64 * 20.0);
 

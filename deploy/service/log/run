@@ -1,0 +1,3 @@
+#!/bin/sh
+# Bounded stderr/stdout log on tmpfs (4 x 256 KB), never on flash.
+exec multilog t s262144 n4 /run/venus-ess-svclog

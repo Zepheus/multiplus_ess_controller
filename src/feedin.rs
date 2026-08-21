@@ -45,7 +45,7 @@ const OV_TRIP: f64 = 1.0; // ov_accum > 1.0 => block positive (charging) setpoin
 const KEEPCHARGED_SOC: f64 = 99.0; // MinimumSocLimit > 99 => keepCharged
 
 const AC_SOURCE_GENERATOR: i32 = 2; // /Ac/ActiveIn/Source == 2 => genset (never back-feed)
-const BL_SUSTAIN_STATE: i32 = 7; // BatteryLife/State == 7 => firmware Sustain
+const BL_SUSTAIN_STATE: i32 = crate::states::bl::SUSTAIN; // firmware Sustain
 const MAX_PHASES: usize = 4; // single vebus service: totals + L1..L3
 
 /// BatteryLife states at/below the SOC floor: {5,6,8,11,12} (the `(0xCB>>(s-5))&1`
@@ -74,6 +74,59 @@ const P_TPIMFI: &str = "/Hub4/TargetPowerIsMaxFeedIn"; // int 0/1 (fw-gated)
 const P_FIX_SOLAR: &str = "/Hub4/FixSolarOffsetTo100mV"; // int 0/1
 fn p_maxfeedin(n: usize) -> String {
     format!("/Hub4/L{n}/MaxFeedInPower") // f64, per phase (fw-gated)
+}
+
+/// Snapshot of every feed-in flag this module can write, captured at take-over so a
+/// hand-back can put back exactly what the stock daemon had written. Stock's write
+/// side is write-if-changed against its own in-process cache: if we leave a flag
+/// different from that cache while its DESIRED value equals the cache, it is never
+/// rewritten — the divergence would persist indefinitely. Restoring the captured
+/// values makes actual == stock's cache again.
+#[derive(Clone, Debug, Default)]
+pub struct FlagSnapshot {
+    disable_feedin: Option<i32>,
+    dnfio: Option<i32>,
+    tpimfi: Option<i32>,
+    fix_solar: Option<i32>,
+    maxfeedin: [Option<f64>; 3],
+}
+
+pub fn snapshot_flags(bus: &dyn Bus) -> FlagSnapshot {
+    FlagSnapshot {
+        disable_feedin: bus.get_i32(VEBUS, P_DISABLE_FEEDIN),
+        dnfio: bus.get_i32(VEBUS, P_DNFIO),
+        tpimfi: bus.get_i32(VEBUS, P_TPIMFI),
+        fix_solar: bus.get_i32(VEBUS, P_FIX_SOLAR),
+        maxfeedin: [
+            bus.get_f64(VEBUS, &p_maxfeedin(1)),
+            bus.get_f64(VEBUS, &p_maxfeedin(2)),
+            bus.get_f64(VEBUS, &p_maxfeedin(3)),
+        ],
+    }
+}
+
+/// Best-effort restore (unreadable-at-capture items are skipped; write errors are
+/// reported but do not abort the remaining restores).
+pub fn restore_flags(bus: &dyn Bus, snap: &FlagSnapshot) {
+    let mut put_i32 = |path: &str, v: Option<i32>| {
+        if let Some(v) = v {
+            if let Err(e) = bus.set_i32(VEBUS, path, v) {
+                eprintln!("flag restore {path}={v} failed: {e}");
+            }
+        }
+    };
+    put_i32(P_DISABLE_FEEDIN, snap.disable_feedin);
+    put_i32(P_DNFIO, snap.dnfio);
+    put_i32(P_TPIMFI, snap.tpimfi);
+    put_i32(P_FIX_SOLAR, snap.fix_solar);
+    for (n, v) in snap.maxfeedin.iter().enumerate() {
+        if let Some(v) = *v {
+            let path = p_maxfeedin(n + 1);
+            if let Err(e) = bus.set_f64(VEBUS, &path, v) {
+                eprintln!("flag restore {path}={v} failed: {e}");
+            }
+        }
+    }
 }
 
 /// The feed-in tri-state (spec §4.1). The exact numeric values are not written to the
@@ -609,6 +662,26 @@ mod tests {
         // OvervoltageFeedIn off & no override => DC excess blocked, and mode!=TPIMFI:
         assert_eq!(o.do_not_feed_in_overvoltage, 1);
         assert_eq!(o.fix_solar_offset, 1); // DVCC on
+    }
+
+    #[test]
+    fn flag_snapshot_roundtrip_restores_stock_values() {
+        let mut bus = base();
+        bus.set(VEBUS, P_DISABLE_FEEDIN, 1.0);
+        bus.set(VEBUS, P_TPIMFI, 0.0);
+        bus.set(VEBUS, "/Hub4/L1/MaxFeedInPower", 200000.0);
+        // L2/L3 unreadable on this single-phase rig: must be skipped by restore.
+        let snap = snapshot_flags(&bus);
+        restore_flags(&bus, &snap);
+        assert_eq!(bus.writes_to(VEBUS, P_DISABLE_FEEDIN), vec![1.0]);
+        assert_eq!(bus.writes_to(VEBUS, P_TPIMFI), vec![0.0]);
+        assert_eq!(bus.writes_to(VEBUS, "/Hub4/L1/MaxFeedInPower"), vec![200000.0]);
+        assert!(bus.writes_to(VEBUS, "/Hub4/L2/MaxFeedInPower").is_empty());
+        assert!(bus.writes_to(VEBUS, "/Hub4/L3/MaxFeedInPower").is_empty());
+        // DNFIO present (fw probe in base()) => captured and restored; FixSolar
+        // unreadable => skipped.
+        assert_eq!(bus.writes_to(VEBUS, P_DNFIO), vec![0.0]);
+        assert!(bus.writes_to(VEBUS, P_FIX_SOLAR).is_empty());
     }
 
     #[test]

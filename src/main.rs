@@ -30,6 +30,7 @@ mod loop_core;
 mod pv;
 mod shore;
 mod socguard;
+mod states;
 #[cfg(test)]
 mod testbus;
 
@@ -118,9 +119,6 @@ extern "C" {
 extern "C" fn on_signal(_sig: i32) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
-
-// Victron SystemState code we must react to: SocGuard force-charge -> hand back.
-const STATE_RECHARGE: i64 = 258;
 
 // The design-capacity clamp + all derived safety params live in loop_core, anchored on the
 // one hardware number (`loop_core::HARD_CLAMP_W` = inverter pair continuous x margin).
@@ -436,6 +434,9 @@ fn sample(
     dt: f64,
     dt_clamped: bool,
 ) -> Option<loop_core::Snapshot> {
+    // The takeover stage IS the legitimate mode-3 (external-control) owner: the
+    // grid-meter guard must not treat our own mode write as "someone else owns it".
+    let mode3_is_ours = matches!(stage, Stage::Takeover);
     let s = read_sensors(bus)?;
 
     // LIVE ownership floor: the UI/VRM/API-controlled MinimumSocLimit (raised by the user's
@@ -490,7 +491,7 @@ fn sample(
 
     // Grid-meter guard at its native 2.5 s cadence; reuse the cached decision between.
     if now >= sub.gm_next {
-        sub.gm_cached = sub.gridmeter.tick(bus);
+        sub.gm_cached = sub.gridmeter.tick(bus, mode3_is_ours);
         sub.gm_next = now + gridmeter::PRESENCE_TICK;
     }
 
@@ -522,6 +523,7 @@ fn sample(
         shore_out,
         hub4_actual: bus.get_f64(VEBUS, P_HUB4_SETPOINT),
         ac_out_w: bus.get_f64(VEBUS, P_ACOUT).unwrap_or(f64::NAN),
+        hub4mode_live: bus.get_i32(SETTINGS, P_HUB4MODE),
     })
 }
 
@@ -534,22 +536,32 @@ fn actuate(
     dec: &loop_core::Decision,
     st: &mut loop_core::LoopState,
 ) {
+    let mut mode_ok = true;
     if let Some(m) = dec.hub4mode {
         if let Err(e) = bus.set_i32(SETTINGS, P_HUB4MODE, m) {
             eprintln!("Hub4Mode set failed: {e}");
             st.owner_us = false; // fail safe
+            mode_ok = false;
         }
     }
     match dec.write {
-        loop_core::Write::Setpoint(v) => {
+        // Skip the setpoint when this tick's mode flip failed: stock is still in its
+        // own mode and writing — never race it with a second writer, even for one tick.
+        loop_core::Write::Setpoint(v) if mode_ok && v.is_finite() => {
             if let Err(e) = bus.set_f64(VEBUS, P_HUB4_SETPOINT, v) {
                 eprintln!("setpoint write failed: {e} (Multi will passthru if persistent)");
             }
         }
-        loop_core::Write::Override(v) => {
+        loop_core::Write::Setpoint(v) => {
+            eprintln!("skipping setpoint write ({v}): mode flip failed or non-finite");
+        }
+        loop_core::Write::Override(v) if v.is_finite() => {
             if let Err(e) = bus.set_f64(socguard::HUB4, socguard::P_OVR_SETPOINT, v) {
                 eprintln!("override write failed: {e} (stock setpoint resumes after 300 s)");
             }
+        }
+        loop_core::Write::Override(v) => {
+            eprintln!("skipping non-finite override write ({v})");
         }
         loop_core::Write::Nothing => {}
     }
@@ -584,6 +596,7 @@ fn main() {
     }
 
     unsafe {
+        signal(1, on_signal as *const () as usize); // SIGHUP (dropped SSH session)
         signal(2, on_signal as *const () as usize); // SIGINT
         signal(15, on_signal as *const () as usize); // SIGTERM
     }
@@ -641,12 +654,26 @@ fn main() {
         safety.max_dt_s,
     );
 
-    // Record original mode so we can always restore it.
-    let orig_mode = bus.get_f64(SETTINGS, P_HUB4MODE).unwrap_or(1.0) as i32;
+    // Record original mode so we can always restore it. If the mode is ALREADY
+    // EXTERNAL at startup, a previous takeover run died uncleanly (the setting is
+    // persistent) — "restoring" it on hand-back would keep stock disengaged forever,
+    // so treat the original as the stock default instead.
+    let orig_mode = {
+        let m = bus.get_f64(SETTINGS, P_HUB4MODE).unwrap_or(1.0) as i32;
+        if m == gridmeter::HUB4MODE_EXTERNAL {
+            eprintln!(
+                "WARNING: Hub4Mode was already EXTERNAL({m}) at startup — previous run \
+                 likely died mid-takeover. Using 1 as the restore target."
+            );
+            1
+        } else {
+            m
+        }
+    };
 
     // Subsystem instances (driven by `sample`; `feedin`/`shore` also written by `actuate`).
     let mut gridmeter = gridmeter::GridMeterGuard::new();
-    let gm0 = gridmeter.tick(&bus); // seed the presence cache
+    let gm0 = gridmeter.tick(&bus, matches!(args.stage, Stage::Takeover)); // seed the presence cache
     let mut sub = Subsystems {
         broker: battery_limits::BatteryBroker::new(&bus),
         dess: dess::Dess::new(&bus),
@@ -670,7 +697,7 @@ fn main() {
         trim_override: None,
         last_out: None,
         oob_since: None,
-        prev_force_charge: false,
+        prev_force_charge: false,        ceded_external: false,
         sanity_trips: 0,
     };
     let cfg = loop_core::DecideCfg {
@@ -679,7 +706,7 @@ fn main() {
         min_dwell_s: 30.0, // anti-thrash on ownership flips
         trim_ki: args.trim_ki,
         orig_mode,
-        state_recharge: STATE_RECHARGE,
+        state_recharge: states::sysstate::RECHARGE,
         slew_w_per_s: safety.slew_w_per_s,
         sanity_band_w: safety.sanity_band_w,
         sanity_secs: safety.sanity_secs,
@@ -722,6 +749,9 @@ fn main() {
     let start = Instant::now();
     let mut prev = Instant::now();
     let mut tick: u64 = 0;
+    // Stock's feed-in flag values captured at take-over, restored at hand-back/exit
+    // (stock's write-if-changed cache can otherwise leave OUR last flag values stuck).
+    let mut flag_snap: Option<feedin::FlagSnapshot> = None;
 
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
@@ -754,7 +784,18 @@ fn main() {
 
         // --- actuate: the single write phase (writing stages only) --------------
         if args.stage.writes() {
+            // Capture stock's feed-in flags BEFORE our first write of them (take-over
+            // tick); put them back the moment we hand back.
+            if matches!(args.stage, Stage::Takeover) && dec.flipped && dec.owner_us {
+                flag_snap = Some(feedin::snapshot_flags(&bus));
+            }
             actuate(&bus, &sub, &snap, &dec, &mut st);
+            if matches!(args.stage, Stage::Takeover) && dec.flipped && !dec.owner_us {
+                if let Some(fs) = flag_snap.take() {
+                    feedin::restore_flags(&bus, &fs);
+                    eprintln!("feed-in flags restored to stock's captured values");
+                }
+            }
         }
 
         // Ownership transitions are rare events -> stderr, so a --quiet service records them.
@@ -872,8 +913,13 @@ fn main() {
 
     // --- clean shutdown: hand the system back to stock -------------------------
     match args.stage {
-        // Takeover: restore the original Hub4Mode (we flipped it to 3).
+        // Takeover: restore the original Hub4Mode (we flipped it to EXTERNAL) and
+        // stock's captured feed-in flags.
         Stage::Takeover => {
+            if let Some(fs) = flag_snap.take() {
+                feedin::restore_flags(&bus, &fs);
+                eprintln!("feed-in flags restored to stock's captured values");
+            }
             eprintln!("restoring Hub4Mode={orig_mode} ...");
             for attempt in 1..=5 {
                 match bus.set_i32(SETTINGS, P_HUB4MODE, orig_mode) {

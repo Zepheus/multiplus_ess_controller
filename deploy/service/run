@@ -1,0 +1,8 @@
+#!/bin/sh
+# venus-ess daemontools service (shadow stage — read-only).
+# Lives in /data/venus-ess/service; /data/rc.local copies it to /run/service
+# (tmpfs) each boot so supervise state and logs never touch eMMC flash.
+exec 2>&1
+echo "*** starting venus-ess (stage: shadow) ***"
+exec /data/venus-ess/venus-ess-controller --stage shadow --controller stock --quiet \
+     --telemetry /run/venus-ess-stock.csv --telemetry-max-mb 4
