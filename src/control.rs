@@ -552,6 +552,125 @@ mod tests {
         assert_eq!(ctrl.i, 0.0, "reset must clear the integral");
     }
 
+    // ---- closed-loop replay machinery (shared by the always-run property tests
+    // below and the ignored real-capture replay) --------------------------------
+    // Plant: rep(t) = A + B·write(t−1) — the live-fitted Multi tracking model
+    // (2026-08-21: A=4.7, B=0.9562, i.e. the 4.4 % under-tracking leak) + N(0,35 W)
+    // measurement noise from a deterministic xorshift (reproducible, no crates).
+
+    struct ReplayStats {
+        median: f64,
+        mean: f64,
+        worst: f64,
+        env_clamps: u64,
+        /// Model prediction at 500 W throughput at the end of the LAST segment
+        /// (NaN for non-adaptive controllers).
+        pred_500: f64,
+    }
+
+    /// The bias the plant actually needs at 500 W discharge for grid == target,
+    /// beyond the stock law: (t−l)(1−B)/B − A/B evaluated per plant constants.
+    fn true_bias_500(a: f64, b: f64) -> f64 {
+        // At steady state with load l s.t. rep = −500: needed = (target−l)(1−b)/b − a/b
+        // and (target−l) = rep = −500 when balanced.
+        (-500.0) * (1.0 - b) / b - a / b
+    }
+
+    struct XorShift(u64);
+    impl XorShift {
+        fn gauss(&mut self, sd: f64) -> f64 {
+            let mut n = 0.0;
+            for _ in 0..12 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                n += (self.0 >> 11) as f64 / (1u64 << 53) as f64;
+            }
+            (n - 6.0) * sd
+        }
+    }
+
+    fn replay(segs: &[Vec<(i64, f64)>], mk: &dyn Fn() -> Kind, scen: &str) -> ReplayStats {
+        let (lo, hi) = (-7030.0, 7030.0);
+        let target = 5.0;
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        let mut errs: Vec<f64> = vec![];
+        let (mut worst, mut clamps) = (0.0f64, 0u64);
+        let mut pred_500 = f64::NAN;
+        for seg in segs {
+            let mut ctrl = Controller::new(mk());
+            let (mut rep, mut prev_w): (f64, Option<f64>) = (0.0, None);
+            let mut frozen = 0.0f64;
+            let half = seg.len() / 2;
+            for (k, &(_t, load)) in seg.iter().enumerate() {
+                let (pa, pb) =
+                    if scen == "plantshift" && k > half { (40.0, 0.91) } else { (4.7, 0.9562) };
+                let grid_true = load + rep;
+                let mut grid = grid_true + rng.gauss(35.0);
+                if scen == "noiseburst" && (k / 600) % 6 == 0 {
+                    grid += rng.gauss(200.0);
+                }
+                if scen == "meterfreeze" && k % 600 < 5 && k > 0 {
+                    grid = frozen;
+                }
+                frozen = grid;
+                let cmd = ctrl.update(grid, rep, target, 1.0, lo, hi, true);
+                if cmd <= lo + 1e-9 || cmd >= hi - 1e-9 {
+                    clamps += 1;
+                }
+                let w = crate::loop_core::stock_write_ema(prev_w, cmd, false);
+                prev_w = Some(w);
+                rep = pa + pb * w;
+                if k > 120 {
+                    let e = grid_true - target;
+                    errs.push(e);
+                    if e.abs() > worst {
+                        worst = e.abs();
+                    }
+                }
+            }
+            if let Some(ff) = ctrl.ff_snapshot(500.0) {
+                pred_500 = ff.a + ff.b * 500.0;
+            }
+        }
+        errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = errs.len();
+        ReplayStats {
+            median: errs[n / 2],
+            mean: errs.iter().sum::<f64>() / n as f64,
+            worst,
+            env_clamps: clamps,
+            pred_500,
+        }
+    }
+
+    /// Deterministic household-like load with PLATEAUS at several discharge
+    /// levels (300/700/1200/500 W) plus a PV-export stretch and kettle bursts —
+    /// the plateaus give the model excitation at multiple throughputs so its
+    /// leak line is identifiable (a single level would leave the slope
+    /// unconstrained, mirroring why `conf` weights by prediction variance).
+    fn synthetic_load_segment(seed: u64, secs: usize) -> Vec<(i64, f64)> {
+        let mut rng = XorShift(seed | 1);
+        let mut out = Vec::with_capacity(secs);
+        for t in 0..secs {
+            let phase = t as f64 / secs as f64;
+            let mut l = match (phase * 10.0) as u32 {
+                0..=1 => 300.0,
+                2..=3 => 700.0,
+                4 => 1200.0,
+                5 => -1300.0, // PV export: charging => model must NOT learn here
+                6..=7 => 1200.0,
+                8 => 500.0,
+                _ => 500.0,
+            } + rng.gauss(30.0);
+            if phase > 0.2 && phase < 0.4 && (t / 180) % 5 == 0 {
+                l += 2000.0; // kettle/oven bursts
+            }
+            out.push((t as i64, l));
+        }
+        out
+    }
+
     /// COUNTERFACTUAL REPLAY (ignored; run explicitly) — drives the REAL production
     /// law (this module + the stock write EMA) closed-loop against a plant fitted
     /// from live telemetry, over a real captured load profile. Answers "would the
@@ -583,79 +702,82 @@ mod tests {
                 Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
             })
             .collect();
-        // split into contiguous segments (gaps > 3 s)
         let mut segs: Vec<Vec<(i64, f64)>> = vec![];
         let mut cur: Vec<(i64, f64)> = vec![rows[0]];
         for w in rows.windows(2) {
-            if w[1].0 - w[0].0 <= 3 { cur.push(w[1]); } else { segs.push(std::mem::take(&mut cur)); cur.push(w[1]); }
+            if w[1].0 - w[0].0 <= 3 {
+                cur.push(w[1]);
+            } else {
+                segs.push(std::mem::take(&mut cur));
+                cur.push(w[1]);
+            }
         }
         segs.push(cur);
         segs.retain(|s| s.len() > 600);
-
-        // deterministic xorshift noise (no external rng crates)
-        let mut rng: u64 = 0x9E3779B97F4A7C15;
-        let mut gauss = move |sd: f64| {
-            let mut n = 0.0;
-            for _ in 0..12 {
-                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
-                n += (rng >> 11) as f64 / (1u64 << 53) as f64;
+        let mk = move || match std::env::var("REPLAY_CTRL").as_deref() {
+            Ok("stock") => Kind::Stock,
+            Ok("pi") => Kind::Pi { ki: 0.05, i_max: 300.0 },
+            _ => {
+                let mut cfg = AdaptiveCfg::tuned();
+                cfg.a0 = a0;
+                cfg.b0 = b0;
+                cfg.seeded = a0 != 0.0 || b0 != 0.0;
+                Kind::Adaptive(cfg)
             }
-            (n - 6.0) * sd
         };
-
-        let (lo, hi) = (-7030.0, 7030.0);
-        let target = 5.0;
-        let mut errs: Vec<f64> = vec![];
-        let (mut worst, mut clamps) = (0.0f64, 0u64);
-        for seg in &segs {
-            let kind = match std::env::var("REPLAY_CTRL").as_deref() {
-                Ok("stock") => Kind::Stock,
-                Ok("pi") => Kind::Pi { ki: 0.05, i_max: 300.0 },
-                _ => {
-                    let mut cfg = AdaptiveCfg::tuned();
-                    cfg.a0 = a0;
-                    cfg.b0 = b0;
-                    cfg.seeded = a0 != 0.0 || b0 != 0.0;
-                    Kind::Adaptive(cfg)
-                }
-            };
-            let mut ctrl = Controller::new(kind);
-            let (mut rep, mut prev_w): (f64, Option<f64>) = (0.0, None);
-            let mut frozen = 0.0f64;
-            let half = seg.len() / 2;
-            for (k, &(_t, load)) in seg.iter().enumerate() {
-                let (pa, pb) = if scen == "plantshift" && k > half { (40.0, 0.91) } else { (4.7, 0.9562) };
-                let grid_true = load + rep;
-                let mut grid = grid_true + gauss(35.0);
-                if scen == "noiseburst" && (k / 600) % 6 == 0 { grid += gauss(200.0); }
-                if scen == "meterfreeze" && k % 600 < 5 && k > 0 { grid = frozen; }
-                frozen = grid;
-                let cmd = ctrl.update(grid, rep, target, 1.0, lo, hi, true);
-                if cmd <= lo + 1e-9 || cmd >= hi - 1e-9 { clamps += 1; }
-                let w = crate::loop_core::stock_write_ema(prev_w, cmd, false);
-                prev_w = Some(w);
-                rep = pa + pb * w;
-                if k > 120 {
-                    let e = grid_true - target;
-                    errs.push(e);
-                    if e.abs() > worst { worst = e.abs(); }
-                }
-            }
-            if let Some(ff) = ctrl.ff_snapshot(500.0) {
-                eprintln!("  segment end: a={:.1} b={:.4} pred@500W={:.1} i-not-shown", ff.a, ff.b, ff.a + ff.b * 500.0);
-            }
-        }
-        errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let n = errs.len();
-        let med = errs[n / 2];
-        let mean: f64 = errs.iter().sum::<f64>() / n as f64;
-        let mut abs: Vec<f64> = errs.iter().map(|e| e.abs()).collect();
-        abs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let r = replay(&segs, &mk, &scen);
         eprintln!(
-            "REPLAY scen={scen} n={n}: median {med:+.1}W mean {mean:+.1}W |e|p99 {:.1}W worst {worst:.0}W env-clamps {clamps}",
-            abs[n * 99 / 100]
+            "REPLAY scen={scen}: median {:+.1}W mean {:+.1}W worst {:.0}W env-clamps {} pred@500 {:.1}",
+            r.median, r.mean, r.worst, r.env_clamps, r.pred_500
         );
     }
+
+    /// ALWAYS-RUN closed-loop property: the leak controllers actually balance the
+    /// grid on a realistic load, and stock reproduces the leak (sim sanity anchor).
+    #[test]
+    fn replay_property_leak_is_balanced() {
+        let segs = vec![synthetic_load_segment(7, 7200)];
+        let stock = replay(&segs, &|| Kind::Stock, "baseline");
+        let pi = replay(&segs, &|| Kind::Pi { ki: 0.05, i_max: 300.0 }, "baseline");
+        let ad = replay(&segs, &|| Kind::Adaptive(AdaptiveCfg::tuned()), "baseline");
+        assert!(stock.median > 8.0, "stock must show the leak, got {:+.1}", stock.median);
+        assert!(pi.median.abs() < 3.0, "pi must balance, got {:+.1}", pi.median);
+        assert!(ad.median.abs() < 5.0, "adaptive must balance, got {:+.1}", ad.median);
+    }
+
+    /// ALWAYS-RUN runaway guard: across every stress scenario and hostile seeds,
+    /// the adaptive law must never hit the design envelope, must stay bounded, and
+    /// (where it learns) must converge NEAR the plant's true leak.
+    #[test]
+    fn replay_property_adaptive_never_runs_away() {
+        let segs = vec![synthetic_load_segment(11, 7200)];
+        let truth = true_bias_500(4.7, 0.9562);
+        for scen in ["baseline", "plantshift", "noiseburst", "meterfreeze"] {
+            let r = replay(&segs, &|| Kind::Adaptive(AdaptiveCfg::tuned()), scen);
+            assert_eq!(r.env_clamps, 0, "{scen}: must never reach the design envelope");
+            assert!(r.worst < 4000.0, "{scen}: worst {:.0}W", r.worst);
+        }
+        let base = replay(&segs, &|| Kind::Adaptive(AdaptiveCfg::tuned()), "baseline");
+        assert!(
+            (base.pred_500 - truth).abs() < 60.0,
+            "model must converge near the true leak ({truth:.1}), got {:.1}",
+            base.pred_500
+        );
+        // Hostile seeds at the parameter rails: bounded, no envelope contact.
+        for (a0, b0) in [(1000.0, 0.5), (-1000.0, -0.5)] {
+            let mk = move || {
+                let mut c = AdaptiveCfg::tuned();
+                c.a0 = a0;
+                c.b0 = b0;
+                c.seeded = true;
+                Kind::Adaptive(c)
+            };
+            let r = replay(&segs, &mk, "baseline");
+            assert_eq!(r.env_clamps, 0, "hostile seed ({a0},{b0}) reached the envelope");
+            assert!(r.worst < 5000.0, "hostile seed worst {:.0}W", r.worst);
+        }
+    }
+
 
     #[test]
     fn adaptive_does_not_learn_when_not_actuating() {
