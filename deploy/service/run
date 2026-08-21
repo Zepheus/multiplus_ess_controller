@@ -1,8 +1,29 @@
 #!/bin/sh
-# venus-ess daemontools service (shadow stage — read-only).
+# venus-ess daemontools service.
 # Lives in /data/venus-ess/service; /data/rc.local copies it to /run/service
 # (tmpfs) each boot so supervise state and logs never touch eMMC flash.
 exec 2>&1
+
+# --- ACTIVE: shadow stage (READ-ONLY validation; replicates stock, leak included)
 echo "*** starting venus-ess (stage: shadow) ***"
 exec /data/venus-ess/venus-ess-controller --stage shadow --controller stock --quiet \
      --telemetry /run/venus-ess-stock.csv --telemetry-max-mb 4
+
+# --- PROMOTION (comment the exec above, uncomment ONE below; svc -t to apply) ---
+# The import-gap fix lives in the CONTROLLER flag, not the stage: "stock" replicates
+# the leak by design; "adaptive" (PI + learned feed-forward) closes it.
+#
+# Step 1 — first supervised take-over: integral fixes the steady leak, the
+# feed-forward model only LEARNS (does not act) so you can sanity-check it:
+# export VENUS_ESS_LIVE=I_UNDERSTAND
+# echo "*** starting venus-ess (stage: TAKEOVER, adaptive learn-only) ***"
+# exec /data/venus-ess/venus-ess-controller --stage takeover --confirm \
+#      --controller adaptive --ff-learn-only --quiet \
+#      --telemetry /run/venus-ess.csv --telemetry-max-mb 4
+#
+# Step 2 — full fix active (feed-forward acts once confident):
+# export VENUS_ESS_LIVE=I_UNDERSTAND
+# echo "*** starting venus-ess (stage: TAKEOVER, adaptive) ***"
+# exec /data/venus-ess/venus-ess-controller --stage takeover --confirm \
+#      --controller adaptive --quiet \
+#      --telemetry /run/venus-ess.csv --telemetry-max-mb 4
