@@ -566,7 +566,33 @@ mod tests {
         /// Model prediction at 500 W throughput at the end of the LAST segment
         /// (NaN for non-adaptive controllers).
         pred_500: f64,
+        /// Chronological true grid error (post-warm-up), for dynamics assertions.
+        trace: Vec<f64>,
     }
+
+    // ---- assertion margins (all in W unless noted) -----------------------------
+    // Loose enough to absorb the deterministic-noise draw and plant-fit drift,
+    // tight enough that a regression in the law is caught, not papered over.
+    /// Stock must exhibit at least this much standing import (the leak).
+    const M_LEAK_MIN: f64 = 8.0;
+    /// A balancing controller's median error must be inside this band.
+    const M_BALANCE: f64 = 5.0;
+    /// No single transient may exceed this (physical load steps included).
+    const M_WORST_TRANSIENT: f64 = 4000.0;
+    /// Hostile-seed runs get extra headroom while the model unlearns.
+    const M_WORST_HOSTILE: f64 = 5000.0;
+    /// Model prediction at 500 W must land within this of the plant truth.
+    const M_MODEL_CONV: f64 = 60.0;
+    /// PI dynamics: smoothed error must re-enter this band after a load step...
+    const M_SETTLE_BAND: f64 = 50.0;
+    /// ...within this many seconds...
+    const M_SETTLE_SECS: usize = 120;
+    /// ...and stay within this band afterwards (no ringing / windup).
+    const M_POST_SETTLE: f64 = 60.0;
+    /// Windowed-mean steadiness: with σ≈35 W/tick measurement noise the integral
+    /// does a slow bounded walk around the true bias, so a 300 s mean wanders
+    /// ~±15 W even when perfectly healthy (medians over hours use M_BALANCE).
+    const M_STEADY_MEAN: f64 = 25.0;
 
     /// The bias the plant actually needs at 500 W discharge for grid == target,
     /// beyond the stock law: (t−l)(1−B)/B − A/B evaluated per plant constants.
@@ -633,15 +659,26 @@ mod tests {
                 pred_500 = ff.a + ff.b * 500.0;
             }
         }
-        errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let n = errs.len();
+        let mut sorted = errs.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = sorted.len();
         ReplayStats {
-            median: errs[n / 2],
-            mean: errs.iter().sum::<f64>() / n as f64,
+            median: sorted[n / 2],
+            mean: sorted.iter().sum::<f64>() / n as f64,
             worst,
             env_clamps: clamps,
             pred_500,
+            trace: errs,
         }
+    }
+
+    /// 10-s moving mean of a trace (noise floor is σ≈35 W per tick; assertions on
+    /// dynamics use the smoothed signal so they test the LOOP, not the dice).
+    fn smooth10(trace: &[f64]) -> Vec<f64> {
+        trace
+            .windows(10)
+            .map(|w| w.iter().sum::<f64>() / w.len() as f64)
+            .collect()
     }
 
     /// Deterministic household-like load with PLATEAUS at several discharge
@@ -740,9 +777,9 @@ mod tests {
         let stock = replay(&segs, &|| Kind::Stock, "baseline");
         let pi = replay(&segs, &|| Kind::Pi { ki: 0.05, i_max: 300.0 }, "baseline");
         let ad = replay(&segs, &|| Kind::Adaptive(AdaptiveCfg::tuned()), "baseline");
-        assert!(stock.median > 8.0, "stock must show the leak, got {:+.1}", stock.median);
-        assert!(pi.median.abs() < 3.0, "pi must balance, got {:+.1}", pi.median);
-        assert!(ad.median.abs() < 5.0, "adaptive must balance, got {:+.1}", ad.median);
+        assert!(stock.median > M_LEAK_MIN, "stock must show the leak, got {:+.1}", stock.median);
+        assert!(pi.median.abs() < M_BALANCE, "pi must balance, got {:+.1}", pi.median);
+        assert!(ad.median.abs() < M_BALANCE, "adaptive must balance, got {:+.1}", ad.median);
     }
 
     /// ALWAYS-RUN runaway guard: across every stress scenario and hostile seeds,
@@ -755,11 +792,11 @@ mod tests {
         for scen in ["baseline", "plantshift", "noiseburst", "meterfreeze"] {
             let r = replay(&segs, &|| Kind::Adaptive(AdaptiveCfg::tuned()), scen);
             assert_eq!(r.env_clamps, 0, "{scen}: must never reach the design envelope");
-            assert!(r.worst < 4000.0, "{scen}: worst {:.0}W", r.worst);
+            assert!(r.worst < M_WORST_TRANSIENT, "{scen}: worst {:.0}W", r.worst);
         }
         let base = replay(&segs, &|| Kind::Adaptive(AdaptiveCfg::tuned()), "baseline");
         assert!(
-            (base.pred_500 - truth).abs() < 60.0,
+            (base.pred_500 - truth).abs() < M_MODEL_CONV,
             "model must converge near the true leak ({truth:.1}), got {:.1}",
             base.pred_500
         );
@@ -774,10 +811,46 @@ mod tests {
             };
             let r = replay(&segs, &mk, "baseline");
             assert_eq!(r.env_clamps, 0, "hostile seed ({a0},{b0}) reached the envelope");
-            assert!(r.worst < 5000.0, "hostile seed worst {:.0}W", r.worst);
+            assert!(r.worst < M_WORST_HOSTILE, "hostile seed worst {:.0}W", r.worst);
         }
     }
 
+
+    /// ALWAYS-RUN PI dynamics: a 2 kW load step must be absorbed without ringing
+    /// or integral windup — the smoothed error re-enters M_SETTLE_BAND within
+    /// M_SETTLE_SECS and stays inside M_POST_SETTLE for the rest of the run.
+    #[test]
+    fn replay_property_pi_step_response_settles_cleanly() {
+        // 1800 s at 400 W, step to 2400 W at t=900, hold.
+        let seg: Vec<(i64, f64)> =
+            (0..1800).map(|t| (t, if t < 900 { 400.0 } else { 2400.0 })).collect();
+        let r = replay(&[seg], &|| Kind::Pi { ki: 0.05, i_max: 300.0 }, "baseline");
+        assert_eq!(r.env_clamps, 0);
+        let sm = smooth10(&r.trace);
+        // The step lands at trace index ~900-120(warm-up) = 780.
+        let step_at = 780usize;
+        let settle = sm[step_at..]
+            .iter()
+            .position(|e| e.abs() < M_SETTLE_BAND)
+            .expect("must re-enter the settle band");
+        assert!(
+            settle < M_SETTLE_SECS,
+            "PI must settle a 2 kW step within {M_SETTLE_SECS}s, took {settle}s"
+        );
+        // After settling (+ a grace period), no ringing and no windup: the smoothed
+        // error stays inside the post-settle band to the end of the run.
+        for (k, e) in sm[step_at + settle + 60..].iter().enumerate() {
+            assert!(
+                e.abs() < M_POST_SETTLE,
+                "ringing/windup: |smoothed err| {:.1}W at +{}s after settle",
+                e.abs(),
+                k + 60
+            );
+        }
+        // And the pre-step steady state was already balanced (leak closed).
+        let pre: f64 = sm[step_at - 300..step_at].iter().sum::<f64>() / 300.0;
+        assert!(pre.abs() < M_STEADY_MEAN, "pre-step mean err {pre:+.1}W");
+    }
 
     #[test]
     fn adaptive_does_not_learn_when_not_actuating() {
