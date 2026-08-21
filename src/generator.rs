@@ -41,14 +41,9 @@ use crate::dbus::*;
 /// AC-input type enum (SYS). 0=n/a, 1=grid, 2=genset, 3=shore, 240=island.
 pub const P_ACIN_SOURCE: &str = "/Ac/ActiveIn/Source";
 /// DC-coupled overvoltage feed-in permission setting (SETTINGS, bool).
-pub const P_OVFEEDIN: &str = "/Settings/CGwacs/OvervoltageFeedIn";
 /// Multi: setpoint-becomes-max-feed-in-cap flag (VEBUS, int 0/1). Its *validity*
 /// (does firmware expose it) is the "Multi supports TPIMFI" gate.
 pub const P_TPIMFI: &str = "/Hub4/TargetPowerIsMaxFeedIn";
-/// Multi: block DC-PV overvoltage feed-in (VEBUS, int 0/1; 0=allowed, 1=blocked).
-pub const P_DONOTFEEDIN: &str = "/Hub4/DoNotFeedInOvervoltage";
-/// Multi: disable AC-in feed-in entirely (VEBUS, int 0/1).
-pub const P_DISABLEFEEDIN: &str = "/Hub4/DisableFeedIn";
 
 /// The AC-input type (`Ac/ActiveIn/Source`). Only `Genset` changes feed-in policy;
 /// every other value is grid-like.
@@ -101,12 +96,6 @@ pub enum FeedMode {
     Normal = 2,
 }
 
-impl FeedMode {
-    pub fn as_i32(self) -> i32 {
-        self as i32
-    }
-}
-
 /// Force-charge context from the (not-yet-built) force-charge / feed-in subsystem
 /// (see the feed-in/sustain design notes). All-false `Default` yields grid `Normal`, which is the
 /// correct grid-only stub for THIS install. The genset branch ignores every field.
@@ -117,28 +106,6 @@ pub struct ForceChargeCtx {
     pub shore_limit_saturated: bool,
 }
 
-/// `/Overrides/FeedInExcess` (server-side state written into our own hub4 service by
-/// DESS/systemcalc). In the grid-only stub it is absent => `UseSetting`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum FeedInExcess {
-    #[default]
-    UseSetting, // 0 — consult /Settings/CGwacs/OvervoltageFeedIn
-    ForceNo,    // 1 — force NO excess feed-in
-    Force,      // 2 — force feed-in
-}
-
-/// Inputs to the flag writers that live in OTHER subsystems (battery-limit / sustain).
-/// Grid-only stub: `Default` is safe (no excess override, no overvoltage feed-in,
-/// discharge blocked). Only used by [`Generator::write_feedin_flags`].
-#[derive(Clone, Copy, Default)]
-pub struct FlagInputs {
-    pub excess: FeedInExcess,
-    /// `/Settings/CGwacs/OvervoltageFeedIn` (DC-PV overvoltage feed-in permission).
-    pub overvoltage_feedin: bool,
-    pub can_discharge: bool,
-    pub battery_at_floor: bool,
-    pub always_peak_shave: bool,
-}
 
 /// The gating decision main.rs folds into the feed-in flags / setpoint interpretation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -191,10 +158,6 @@ pub struct Generator {
     source: AcSource,
     dvcc: bool,
     tpimfi_supported: bool,
-    // write-if-changed caches (never spam the MK3): compare before every write.
-    last_tpimfi: Option<i32>,
-    last_do_not_feedin: Option<i32>,
-    last_disable_feedin: Option<i32>,
 }
 
 impl Generator {
@@ -204,9 +167,6 @@ impl Generator {
             source: AcSource::Unknown,
             dvcc: false,
             tpimfi_supported: false,
-            last_tpimfi: None,
-            last_do_not_feedin: None,
-            last_disable_feedin: None,
         };
         g.refresh(bus);
         eprintln!(
@@ -237,12 +197,6 @@ impl Generator {
     pub fn source(&self) -> AcSource {
         self.source
     }
-    pub fn dvcc(&self) -> bool {
-        self.dvcc
-    }
-    pub fn tpimfi_supported(&self) -> bool {
-        self.tpimfi_supported
-    }
 
     /// Per-tick: refresh inputs, compute the feed mode, and return the gating decision.
     /// Call once per loop iteration BEFORE the setpoint clamp and the flag writers, both
@@ -258,318 +212,8 @@ impl Generator {
         }
     }
 
-    /// Full genset path: write-if-changed the three vebus feed-in flags for `out.mode`.
-    /// (main.rs may instead fold `GenOut` into its own writers; this is the complete
-    /// self-contained writer for callers that want it.) No-op writes are suppressed.
-    pub fn write_feedin_flags(&mut self, bus: &dyn Bus, out: &GenOut, fi: &FlagInputs) {
-        // --- TargetPowerIsMaxFeedIn = (mode == Tpimfi); only if firmware exposes it ---
-        if self.tpimfi_supported {
-            let v = (out.mode == FeedMode::Tpimfi) as i32;
-            if self.last_tpimfi != Some(v) {
-                if bus.set_i32(VEBUS, P_TPIMFI, v).is_ok() {
-                    self.last_tpimfi = Some(v);
-                }
-            }
-        }
-
-        // --- DoNotFeedInOvervoltage: the permissive branch is GATED on !genset (§4.3) ---
-        let excess_allows_ov = match fi.excess {
-            FeedInExcess::Force => true,
-            FeedInExcess::UseSetting => fi.overvoltage_feedin,
-            FeedInExcess::ForceNo => false,
-        };
-        let permissive = !out.is_genset && excess_allows_ov;
-        let dnf = if permissive {
-            0
-        } else {
-            (out.mode != FeedMode::Tpimfi) as i32
-        };
-        if self.last_do_not_feedin != Some(dnf) {
-            if bus.set_i32(VEBUS, P_DONOTFEEDIN, dnf).is_ok() {
-                self.last_do_not_feedin = Some(dnf);
-            }
-        }
-
-        // --- DisableFeedIn: not source-gated directly, but a genset never reaches
-        //     Normal, so mode + these battery gates structurally prevent back-feed. ---
-        let disable = if out.mode == FeedMode::Tpimfi {
-            0 // mode 0 needs the feed path open (TPIMFI caps it instead)
-        } else if !fi.can_discharge {
-            1
-        } else if fi.battery_at_floor {
-            (!fi.always_peak_shave) as i32
-        } else {
-            0
-        };
-        if self.last_disable_feedin != Some(disable) {
-            if bus.set_i32(VEBUS, P_DISABLEFEEDIN, disable).is_ok() {
-                self.last_disable_feedin = Some(disable);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::testbus::MockBus;
-    use std::cell::RefCell;
-    use std::collections::HashMap;
-
-    // ---- enum mapping ----------------------------------------------------------
-
-    #[test]
-    fn source_enum_maps_every_value() {
-        assert_eq!(AcSource::from_dbus(Some(0)), AcSource::Unknown);
-        assert_eq!(AcSource::from_dbus(Some(1)), AcSource::Grid);
-        assert_eq!(AcSource::from_dbus(Some(2)), AcSource::Genset);
-        assert_eq!(AcSource::from_dbus(Some(3)), AcSource::Shore);
-        assert_eq!(AcSource::from_dbus(Some(240)), AcSource::Island);
-        assert_eq!(AcSource::from_dbus(Some(99)), AcSource::Unknown); // unmapped
-        assert_eq!(AcSource::from_dbus(None), AcSource::Unknown); // invalid []
-        // Only genset is special; everything else is grid-like.
-        for s in [AcSource::Unknown, AcSource::Grid, AcSource::Shore, AcSource::Island] {
-            assert!(s.is_grid_like() && !s.is_genset());
-        }
-        assert!(AcSource::Genset.is_genset() && !AcSource::Genset.is_grid_like());
-    }
-
-    // ---- gating per source (the required matrix), via tick() + MockBus ----------
-
-    /// Bus with a source value and DVCC + TPIMFI-firmware present (the "clean" case).
-    fn bus_with(source: Option<i32>, dvcc: bool, tpimfi_fw: bool) -> MockBus {
-        let mut b = MockBus::new();
-        if let Some(v) = source {
-            b.set(SYS, P_ACIN_SOURCE, v as f64);
-        }
-        b.set(SYS, P_DVCC, if dvcc { 1.0 } else { 0.0 });
-        if tpimfi_fw {
-            b.set(VEBUS, P_TPIMFI, 0.0); // present-and-valid => firmware supports it
-        }
-        b
-    }
-
-    #[test]
-    fn each_source_gates_correctly_no_force_charge() {
-        let fc = ForceChargeCtx::default(); // must_force_charge = false
-        // Grid / Shore / Island / Unknown => grid-like Normal: no cap, export allowed.
-        for src in [Some(1), Some(3), Some(240), Some(0), None] {
-            let bus = bus_with(src, true, true);
-            let out = Generator::new(&bus).tick(&bus, fc);
-            assert!(!out.is_genset, "src={src:?}");
-            assert!(!out.force_tpimfi, "src={src:?}");
-            assert!(!out.disable_export, "src={src:?}");
-            assert_eq!(out.mode, FeedMode::Normal, "src={src:?}");
-        }
-        // Genset (DVCC + fw) => clean TPIMFI: force cap on, export disabled.
-        let bus = bus_with(Some(2), true, true);
-        let out = Generator::new(&bus).tick(&bus, fc);
-        assert!(out.is_genset);
-        assert!(out.force_tpimfi);
-        assert!(out.disable_export);
-        assert_eq!(out.mode, FeedMode::Tpimfi);
-    }
-
-    #[test]
-    fn missing_source_read_is_safe_grid_like_default() {
-        // No /Ac/ActiveIn/Source key at all => Unknown => grid-like, never a forced cap.
-        let bus = bus_with(None, true, true);
-        let mut g = Generator::new(&bus);
-        let out = g.tick(&bus, ForceChargeCtx::default());
-        assert_eq!(g.source(), AcSource::Unknown);
-        assert!(!out.is_genset && !out.force_tpimfi && !out.disable_export);
-    }
-
-    #[test]
-    fn genset_forces_tpimfi_and_disables_export() {
-        let bus = bus_with(Some(2), true, true);
-        let out = Generator::new(&bus).tick(&bus, ForceChargeCtx::default());
-        assert!(out.force_tpimfi, "genset with DVCC+fw must force TPIMFI");
-        assert!(out.disable_export, "genset must never allow export tracking");
-    }
-
-    #[test]
-    fn genset_never_enters_normal_even_when_not_force_charging() {
-        // must_force_charge = false would give grid a Normal export mode; a genset must
-        // still refuse Normal. Both DVCC/fw combinations checked.
-        for (dvcc, fw) in [(true, true), (false, true), (true, false), (false, false)] {
-            let bus = bus_with(Some(2), dvcc, fw);
-            let out = Generator::new(&bus).tick(&bus, ForceChargeCtx::default());
-            assert_ne!(out.mode, FeedMode::Normal, "dvcc={dvcc} fw={fw}");
-            assert!(out.disable_export, "dvcc={dvcc} fw={fw}");
-        }
-    }
-
-    #[test]
-    fn genset_without_dvcc_or_fw_degrades_to_charge_hard() {
-        // No DVCC, or no firmware support => ChargeHard: no TPIMFI cap, but export still
-        // structurally disabled (safe: pure hard charge, feed path shut).
-        for (dvcc, fw) in [(false, true), (true, false), (false, false)] {
-            let bus = bus_with(Some(2), dvcc, fw);
-            let out = Generator::new(&bus).tick(&bus, ForceChargeCtx::default());
-            assert_eq!(out.mode, FeedMode::ChargeHard, "dvcc={dvcc} fw={fw}");
-            assert!(!out.force_tpimfi, "dvcc={dvcc} fw={fw}");
-            assert!(out.disable_export, "dvcc={dvcc} fw={fw}");
-        }
-    }
-
-    #[test]
-    fn grid_force_charge_can_reach_tpimfi_but_is_not_genset() {
-        // Grid + force-charge + DVCC/fw + no excess => Tpimfi, yet is_genset stays false.
-        let bus = bus_with(Some(1), true, true);
-        let fc = ForceChargeCtx {
-            must_force_charge: true,
-            feed_in_excess_allowed: false,
-            shore_limit_saturated: false,
-        };
-        let out = Generator::new(&bus).tick(&bus, fc);
-        assert!(!out.is_genset);
-        assert_eq!(out.mode, FeedMode::Tpimfi);
-        assert!(out.force_tpimfi && out.disable_export);
-    }
-
-    #[test]
-    fn grid_force_charge_with_excess_is_charge_hard() {
-        let bus = bus_with(Some(1), true, true);
-        let fc = ForceChargeCtx {
-            must_force_charge: true,
-            feed_in_excess_allowed: true, // sellable excess => ChargeHard, not TPIMFI
-            shore_limit_saturated: false,
-        };
-        let out = Generator::new(&bus).tick(&bus, fc);
-        assert_eq!(out.mode, FeedMode::ChargeHard);
-        assert!(!out.force_tpimfi);
-    }
-
-    #[test]
-    fn sticky_genset_holds_through_a_dropped_read_but_yields_to_explicit_change() {
-        let mut b = bus_with(Some(2), true, true);
-        let mut g = Generator::new(&b);
-        assert_eq!(g.source(), AcSource::Genset);
-        // Dropped read (None): must HOLD Genset, never flip to grid-like for a tick.
-        b.clear(SYS, P_ACIN_SOURCE);
-        let out = g.tick(&b, ForceChargeCtx::default());
-        assert_eq!(g.source(), AcSource::Genset);
-        assert!(out.is_genset && out.disable_export);
-        // Explicit change to grid (1) IS honoured — a real source change takes effect.
-        b.set(SYS, P_ACIN_SOURCE, 1.0);
-        let out = g.tick(&b, ForceChargeCtx::default());
-        assert_eq!(g.source(), AcSource::Grid);
-        assert!(!out.is_genset);
-    }
-
-    // ---- flag writes (write-if-changed), via a local recording bus -------------
-
-    /// Records set_i32 writes; reads back through an inner MockBus.
-    struct RecBus {
-        inner: MockBus,
-        writes: RefCell<HashMap<(String, String), i32>>,
-    }
-    impl RecBus {
-        fn new(inner: MockBus) -> Self {
-            RecBus { inner, writes: RefCell::new(HashMap::new()) }
-        }
-        fn last(&self, svc: &str, path: &str) -> Option<i32> {
-            self.writes.borrow().get(&(svc.into(), path.into())).copied()
-        }
-        fn count(&self) -> usize {
-            self.writes.borrow().len()
-        }
-    }
-    impl Bus for RecBus {
-        fn get_f64(&self, s: &str, p: &str) -> Option<f64> {
-            self.inner.get_f64(s, p)
-        }
-        fn get_str(&self, s: &str, p: &str) -> Option<String> {
-            self.inner.get_str(s, p)
-        }
-        fn list_services(&self, prefix: &str) -> Vec<String> {
-            self.inner.list_services(prefix)
-        }
-        fn set_i32(&self, s: &str, p: &str, v: i32) -> Result<(), String> {
-            self.writes.borrow_mut().insert((s.into(), p.into()), v);
-            Ok(())
-        }
-        fn set_f64(&self, _: &str, _: &str, _: f64) -> Result<(), String> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn genset_flags_written_tpimfi_on_donotfeedin_off() {
-        let bus = RecBus::new(bus_with(Some(2), true, true));
-        let mut g = Generator::new(&bus);
-        let out = g.tick(&bus, ForceChargeCtx::default());
-        g.write_feedin_flags(&bus, &out, &FlagInputs::default());
-        // Clean genset (Tpimfi): cap ON, overvoltage feed-in ALLOWED (it's the bounded
-        // transport for DC-PV excess in mode 0), feed path open.
-        assert_eq!(bus.last(VEBUS, P_TPIMFI), Some(1));
-        assert_eq!(bus.last(VEBUS, P_DONOTFEEDIN), Some(0));
-        assert_eq!(bus.last(VEBUS, P_DISABLEFEEDIN), Some(0));
-    }
-
-    #[test]
-    fn genset_charge_hard_blocks_overvoltage_and_feedin() {
-        // Genset without DVCC => ChargeHard: DC-PV excess must NOT reach the generator.
-        let bus = RecBus::new(bus_with(Some(2), false, true));
-        let mut g = Generator::new(&bus);
-        let out = g.tick(&bus, ForceChargeCtx::default());
-        // can_discharge stays false (default) => DisableFeedIn = 1.
-        g.write_feedin_flags(&bus, &out, &FlagInputs::default());
-        assert_eq!(bus.last(VEBUS, P_TPIMFI), Some(0)); // fw present => written 0
-        assert_eq!(bus.last(VEBUS, P_DONOTFEEDIN), Some(1)); // blocked (mode != Tpimfi)
-        assert_eq!(bus.last(VEBUS, P_DISABLEFEEDIN), Some(1)); // !can_discharge
-    }
-
-    #[test]
-    fn genset_permissive_overvoltage_branch_is_gated_off() {
-        // Even with OvervoltageFeedIn setting on, a genset can NEVER take the permissive
-        // DoNotFeedInOvervoltage=0 branch except via mode 0. Here ChargeHard => blocked.
-        let bus = RecBus::new(bus_with(Some(2), false, true));
-        let mut g = Generator::new(&bus);
-        let out = g.tick(&bus, ForceChargeCtx::default());
-        let fi = FlagInputs { overvoltage_feedin: true, excess: FeedInExcess::Force, ..Default::default() };
-        g.write_feedin_flags(&bus, &out, &fi);
-        assert_eq!(bus.last(VEBUS, P_DONOTFEEDIN), Some(1)); // still blocked on genset
-    }
-
-    #[test]
-    fn grid_normal_overvoltage_follows_setting() {
-        let bus = RecBus::new(bus_with(Some(1), true, true));
-        let mut g = Generator::new(&bus);
-        let out = g.tick(&bus, ForceChargeCtx::default()); // Normal
-        // Grid + OvervoltageFeedIn on + UseSetting => permissive => DoNotFeedIn = 0.
-        let fi = FlagInputs { overvoltage_feedin: true, ..Default::default() };
-        g.write_feedin_flags(&bus, &out, &fi);
-        assert_eq!(bus.last(VEBUS, P_TPIMFI), Some(0));
-        assert_eq!(bus.last(VEBUS, P_DONOTFEEDIN), Some(0));
-    }
-
-    #[test]
-    fn tpimfi_not_written_when_firmware_absent() {
-        // No /Hub4/TargetPowerIsMaxFeedIn on the bus => never write it (genset then
-        // relies on DisableFeedIn/DoNotFeedIn=1 to block back-feed).
-        let bus = RecBus::new(bus_with(Some(2), true, false)); // fw absent
-        let mut g = Generator::new(&bus);
-        assert!(!g.tpimfi_supported());
-        let out = g.tick(&bus, ForceChargeCtx::default());
-        assert_eq!(out.mode, FeedMode::ChargeHard); // no fw => degrades
-        g.write_feedin_flags(&bus, &out, &FlagInputs::default());
-        assert_eq!(bus.last(VEBUS, P_TPIMFI), None); // never written
-        assert_eq!(bus.last(VEBUS, P_DONOTFEEDIN), Some(1));
-    }
-
-    #[test]
-    fn writes_are_suppressed_when_unchanged() {
-        let bus = RecBus::new(bus_with(Some(2), true, true));
-        let mut g = Generator::new(&bus);
-        let out = g.tick(&bus, ForceChargeCtx::default());
-        g.write_feedin_flags(&bus, &out, &FlagInputs::default());
-        let n = bus.count();
-        assert!(n > 0);
-        // Second identical pass must not re-write anything (write-if-changed).
-        let before = bus.writes.borrow().clone();
-        g.write_feedin_flags(&bus, &out, &FlagInputs::default());
-        assert_eq!(*bus.writes.borrow(), before, "no-op writes must be suppressed");
-    }
-}
+#[path = "generator_tests.rs"]
+mod tests;

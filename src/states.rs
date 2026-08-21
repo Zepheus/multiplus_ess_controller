@@ -1,3 +1,4 @@
+#![allow(dead_code)] // deliberately a COMPLETE mirror of the stock enums
 //! Named enum values shared with the Venus stack. Mirrors systemcalc's
 //! `delegates/systemstate.py` (`SystemState`, `BL`, `SOCG` classes) and the
 //! `/Settings/CGwacs/Hub4Mode` setting. The raw numbers live ONLY here — every
