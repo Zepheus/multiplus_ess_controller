@@ -3,11 +3,10 @@
 //! Modes
 //!   shadow (default): READ-ONLY. Reads live dbus, computes what it WOULD command,
 //!                     prints it. Never writes, never changes Hub4Mode.
-//!   live            : Sets Hub4Mode=3 (takes the setpoint loop from the stock ESS loop),
+//!   live            : Sets Hub4Mode=3 (takes the setpoint loop from the stock daemon),
 //!                     writes /Hub4/L1/AcPowerSetpoint each tick, restores Hub4Mode
 //!                     on exit. DOUBLE-GATED: requires `--mode live` AND the env var
 //!                     VENUS_ESS_LIVE=I_UNDERSTAND, or it refuses to run.
-//!
 //!
 //! ## Where the logic lives (module map)
 //!
@@ -41,11 +40,12 @@
 //!   cli.rs         argument parsing + help text
 //!   telemetry.rs   bounded tmpfs CSV writer + eMMC path guard
 //!   dbus.rs        the Bus trait + zbus transport; states.rs: named enum mirror
-//!   *_tests.rs     unit/golden tests, one sibling file per module
+//!   src/tests/     cross-module golden + replay suites (unit tests live
+//!                  inline at the bottom of the module they test)
 //! Safety envelope (live):
 //!   * We only ever discharge/idle within limits. We NEVER force-charge.
 //!   * Below the SOC floor, or on an explicit recharge state, we hand control back
-//!     to the stock ESS loop (Hub4Mode=1) so SocGuard/sustain/scheduling still work.
+//!     to the stock daemon (Hub4Mode=1) so SocGuard/sustain/scheduling still work.
 //!   * Commands are clamped to the configured charge/discharge power limits and a
 //!     hard sanity bound.
 //!   * If the process dies for any reason, it stops writing; the Multi reverts to
@@ -68,6 +68,12 @@ mod telemetry;
 mod cli;
 #[cfg(test)]
 mod testbus;
+#[cfg(test)]
+#[path = "tests/goldens.rs"]
+mod goldens_tests;
+#[cfg(test)]
+#[path = "tests/replay.rs"]
+mod replay_tests;
 
 use control::Controller;
 use cli::parse_args;
@@ -90,7 +96,7 @@ extern "C" fn on_signal(_sig: i32) {
 // one hardware number (`loop_core::HARD_CLAMP_W` = inverter pair continuous x margin).
 use loop_core::HARD_CLAMP_W;
 
-/// The rollout ladder, selected with `--stage` (see the rollout/failsafe design notes). Each rung
+/// The rollout ladder, selected with `--stage` (see re/ROLLOUT-AND-FAILSAFE.md). Each rung
 /// is strictly larger-authority than the previous; `writes()` marks the ones that touch the
 /// live battery system and therefore require the double-gate.
 ///   Shadow (0)   read-only: compute what we WOULD do, compare to stock, never write.
@@ -439,6 +445,9 @@ fn main() {
         last_flip_t: -60.0, // dwell already elapsed at boot
         trim_override: None,
         last_out: None,
+        smith_weff: f64::NAN,
+        smith_weff_lag: f64::NAN,
+        smith_prev_write: f64::NAN,
         oob_since: None,
         prev_force_charge: false,        ceded_external: false,
         sanity_trips: 0,
@@ -453,10 +462,13 @@ fn main() {
         slew_w_per_s: safety.slew_w_per_s,
         sanity_band_w: safety.sanity_band_w,
         sanity_secs: safety.sanity_secs,
-        // Flat 0.5 write-EMA gain: the stock adaptive variant needs a fast grid meter
+        // Flat 0.5 write-EMA gain: stock's adaptive variant needs a fast grid meter
         // (< 250 ms updates) + recent Multi firmware, and this install's live traces
         // show the flat branch. See loop_core::stock_write_ema.
         ema_adaptive: false,
+        ema_gain_up: loop_core::EMA_GAIN_UP,
+        ema_gain_down: loop_core::EMA_GAIN_DOWN,
+        smith: args.smith,
     };
     // Edge-triggered safety logging state (only log a trip when it newly fires).
     let mut last_safety = loop_core::Safety::default();
@@ -583,7 +595,7 @@ fn main() {
         }
         tick += 1;
 
-        // Shadow fidelity: how close is our proposal to the stock ESS loop's actual command?
+        // Shadow fidelity: how close is our proposal to the stock daemon's actual command?
         let note_buf = if matches!(args.stage, Stage::Shadow) {
             snap.hub4_actual
                 .map(|actual| format!("actual={actual:.0} Δ={:.0}", actual - dec.command))

@@ -91,7 +91,7 @@ impl AdaptiveCfg {
 
 #[derive(Clone, Copy, Debug)]
 pub enum Kind {
-    /// Exact reproduction of the stock ESS loop: `command = target - grid + reported`.
+    /// Exact reproduction of the stock daemon: `command = target - grid + reported`.
     /// No integral -> leaks (1-k)*load.  Used to prove shadow fidelity.
     Stock,
     /// One-line fix: integrate on our OWN previous command, not `reported`,
@@ -302,6 +302,17 @@ impl Controller {
     /// command actually drives the plant (takeover + owning + writing). In shadow/trim
     /// our command is not actuated, so learning from the resulting grid would train the
     /// model on a regime it will never drive. Ignored by the non-adaptive kinds.
+    /// Anti-windup by ERROR CLIPPING: the residual integral exists to kill the
+    /// small standing leak (~20 W), so per-tick it may only see this much error.
+    /// A load transient (kettle step: err ~1.5 kW for seconds) then winds the
+    /// integral by at most ki·CLIP·t (~5 W/s) instead of hundreds of watts — which
+    /// was discharging as an export tail after every transient. Clipping (rather
+    /// than freezing) is deliberate: a PERSISTENT bias of any size still integrates
+    /// away at up to 5 W/s, so no state is ever uncorrectable — a freeze + range
+    /// cap variant deadlocked in the replay suite (railed model + frozen integral
+    /// + blocked learn gate = permanent export).
+    pub const I_ERR_CLIP_W: f64 = 100.0;
+
     pub fn update(
         &mut self,
         grid: f64,
@@ -331,7 +342,8 @@ impl Controller {
                 // silently zero it (same policy as the adaptive path below); the command
                 // itself still degrades to the safe idle 0 via the final clamp.
                 if err.is_finite() && dt > 0.0 {
-                    self.i = clamp(self.i + ki * err * dt, -i_max, i_max);
+                    let e = err.clamp(-Self::I_ERR_CLIP_W, Self::I_ERR_CLIP_W);
+                    self.i = clamp(self.i + ki * e * dt, -i_max, i_max);
                 }
                 clamp((target - grid + reported) + self.i, lo, hi)
             }
@@ -358,7 +370,8 @@ impl Controller {
         // Residual integral drives the grid onto target (correctness backstop). Hold it
         // on a non-finite reading rather than letting `clamp` silently zero it.
         if err.is_finite() && dt > 0.0 {
-            self.i = clamp(self.i + c.ki * err * dt, -c.i_max, c.i_max);
+            let e = err.clamp(-Self::I_ERR_CLIP_W, Self::I_ERR_CLIP_W);
+            self.i = clamp(self.i + c.ki * e * dt, -c.i_max, c.i_max);
         }
 
         // Model prediction and its actuation authority for this tick. A non-finite
@@ -416,5 +429,251 @@ impl Controller {
 }
 
 #[cfg(test)]
-#[path = "control_tests.rs"]
-mod tests;
+mod tests {
+    use super::*;
+
+    fn adaptive(cfg: AdaptiveCfg) -> Controller {
+        Controller::new(Kind::Adaptive(cfg))
+    }
+
+    /// A tiny closed-loop plant. At throughput `x` the loop needs a compensating bias
+    /// `comp(x)` beyond the stock feed-forward to sit on target; the grid moves toward
+    /// target as the applied bias approaches `comp(x)`. Sign matches the controller's
+    /// convention (negative feedback), so `grid = target - comp(x) + prev_bias`.
+    /// Returns the applied bias for the next tick.
+    fn plant_tick(
+        ctrl: &mut Controller,
+        x: f64,
+        target: f64,
+        prev_bias: f64,
+        comp: impl Fn(f64) -> f64,
+    ) -> f64 {
+        let reported = -x; // discharge
+        let grid = target - comp(x) + prev_bias;
+        let cmd = ctrl.update(grid, reported, target, 2.5, -9000.0, 9000.0, true);
+        // bias = command - stock feed-forward
+        cmd - (target - grid + reported)
+    }
+
+    #[test]
+    fn adaptive_learns_affine_leak_and_generalizes() {
+        let mut ctrl = adaptive(AdaptiveCfg::tuned());
+        // IMPORT-side leak (the physically real direction on this system: the Multi
+        // under-tracks, so the needed bias is NEGATIVE). The positive side of the
+        // integral is deliberately capped (I_POS_MAX_W) so a positive-leak plant is
+        // no longer representable — nor commandable, per the no-positive clamp.
+        let (a0, b0) = (-25.0, -0.04);
+        let target = 20.0;
+        let leak = |x: f64| a0 + b0 * x;
+        // Alternate two well-separated load clusters -> spread for slope identifiability.
+        let mut bias = 0.0;
+        for i in 0..4000 {
+            // dwell in blocks so the steady-state gate accepts samples (Δx==0 within block)
+            let x = if (i / 50) % 2 == 0 { 300.0 } else { 1500.0 };
+            bias = plant_tick(&mut ctrl, x, target, bias, leak);
+        }
+        let snap = ctrl.ff_snapshot(900.0).unwrap();
+        assert!((snap.a - a0).abs() < 4.0, "a={} want ~{a0}", snap.a);
+        assert!((snap.b - b0).abs() < 0.01, "b={} want ~{b0}", snap.b);
+        assert!(snap.conf > 0.5, "confidence should be high, got {}", snap.conf);
+        // Extrapolation: a load never dwelt at is predicted from the affine fit.
+        let pred_3k = snap.a + snap.b * 3000.0;
+        assert!((pred_3k - leak(3000.0)).abs() < 20.0, "extrapolated {pred_3k}");
+    }
+
+    #[test]
+    fn adaptive_cold_start_behaves_like_pi() {
+        // With no data and a wide prior, first ticks give the model ~no authority, so
+        // the command tracks a plain PI to within a small tolerance.
+        let mut adapt = adaptive(AdaptiveCfg::tuned());
+        let mut pi = Controller::new(Kind::Pi { ki: 0.05, i_max: 300.0 });
+        for _ in 0..3 {
+            let ca = adapt.update(300.0, -1000.0, 20.0, 2.5, -9000.0, 9000.0, true);
+            let cp = pi.update(300.0, -1000.0, 20.0, 2.5, -9000.0, 9000.0, true);
+            assert!((ca - cp).abs() < 5.0, "cold-start adaptive {ca} vs pi {cp}");
+        }
+    }
+
+    #[test]
+    fn adaptive_observe_learns_but_does_not_actuate() {
+        let mut cfg = AdaptiveCfg::tuned();
+        cfg.mode = FfMode::Observe;
+        let mut obs = adaptive(cfg);
+        // Import-side leak (negative bias), matching the real system + integral cap.
+        let comp = |x: f64| -25.0 - 0.04 * x;
+        let mut bias = 0.0;
+        for i in 0..1000 {
+            let x = if (i / 50) % 2 == 0 { 300.0 } else { 1500.0 };
+            bias = plant_tick(&mut obs, x, 20.0, bias, comp);
+        }
+        // Model moved (it learned the slope) ...
+        let snap = obs.ff_snapshot(900.0).unwrap();
+        assert!(snap.b < -0.02, "observe should still learn slope, got {}", snap.b);
+        // ... but observe never applies the feed-forward. With the integral reset (model
+        // preserved), the command must equal a fresh PI's for identical inputs — i.e. the
+        // learned model contributes nothing to the output.
+        obs.reset();
+        let mut p2 = Controller::new(Kind::Pi { ki: cfg.ki, i_max: cfg.i_max });
+        let cmd_o = obs.update(30.0, -800.0, 20.0, 2.5, -9000.0, 9000.0, true);
+        let cmd_p = p2.update(30.0, -800.0, 20.0, 2.5, -9000.0, 9000.0, true);
+        assert!((cmd_o - cmd_p).abs() < 1e-6, "observe actuated FF: {cmd_o} vs {cmd_p}");
+    }
+
+    #[test]
+    fn adaptive_frozen_applies_seed_without_learning() {
+        let mut cfg = AdaptiveCfg::tuned();
+        cfg.mode = FfMode::Frozen;
+        cfg.a0 = 30.0;
+        cfg.b0 = 0.05;
+        cfg.seeded = true;
+        let mut ctrl = adaptive(cfg);
+        // Frozen model must apply a+b*x on top of stock immediately.
+        let cmd = ctrl.update(20.0, -1000.0, 20.0, 2.5, -9000.0, 9000.0, true);
+        let stock = 20.0 - 20.0 + (-1000.0);
+        // grid==target so integral stays 0; applied bias should be the seed model.
+        assert!((cmd - (stock + 30.0 + 0.05 * 1000.0)).abs() < 1e-6, "frozen cmd {cmd}");
+        // And it never learns: params unchanged after many steps.
+        for _ in 0..500 {
+            let _ = plant_tick(&mut ctrl, 800.0, 20.0, 0.0, |x| 25.0 + 0.04 * x);
+        }
+        let snap = ctrl.ff_snapshot(0.0).unwrap();
+        assert_eq!(snap.a, 30.0);
+        assert_eq!(snap.b, 0.05);
+    }
+
+    #[test]
+    fn adaptive_low_confidence_without_spread() {
+        // Train at ONE operating point only: the slope stays unidentified, so authority
+        // at a far, unseen load must remain low even after many samples.
+        let mut ctrl = adaptive(AdaptiveCfg::tuned());
+        for _ in 0..3000 {
+            let _ = plant_tick(&mut ctrl, 500.0, 20.0, 0.0, |x| 25.0 + 0.04 * x);
+        }
+        let near = ctrl.ff_snapshot(500.0).unwrap().conf;
+        let far = ctrl.ff_snapshot(3000.0).unwrap().conf;
+        assert!(far < 0.4, "far-load authority should stay low, got {far}");
+        assert!(far < near, "confidence should fall off away from sampled load");
+    }
+
+    #[test]
+    fn adaptive_reset_preserves_learned_model() {
+        let mut ctrl = adaptive(AdaptiveCfg::tuned());
+        for i in 0..1000 {
+            let x = if (i / 50) % 2 == 0 { 300.0 } else { 1500.0 };
+            let _ = plant_tick(&mut ctrl, x, 20.0, 0.0, |x| 25.0 + 0.04 * x);
+        }
+        let before = ctrl.ff_snapshot(900.0).unwrap();
+        ctrl.reset();
+        let after = ctrl.ff_snapshot(900.0).unwrap();
+        assert_eq!(before.a, after.a, "reset must not wipe learned offset");
+        assert_eq!(before.b, after.b, "reset must not wipe learned slope");
+        assert_eq!(ctrl.i, 0.0, "reset must clear the integral");
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    #[test]
+    fn adaptive_does_not_learn_when_not_actuating() {
+        // learn=false (shadow/trim: our command isn't applied) must freeze learning even
+        // on perfectly steady data, so the live-carried model isn't trained on a phantom
+        // regime.
+        let mut ctrl = adaptive(AdaptiveCfg::tuned());
+        for _ in 0..2000 {
+            // steady discharge at a fixed load, but not actuating
+            let _ = ctrl.update(20.0, -800.0, 20.0, 2.5, -9000.0, 9000.0, false);
+        }
+        let snap = ctrl.ff_snapshot(800.0).unwrap();
+        assert_eq!(snap.a, 0.0, "must not learn offset when not actuating");
+        assert_eq!(snap.b, 0.0, "must not learn slope when not actuating");
+    }
+
+    #[test]
+    fn adaptive_covariance_bounded_under_long_low_excitation() {
+        // A day-plus of near-constant load must not inflate the covariance to overflow
+        // (which would periodically snap the model back to ignorance). Dwell at a single
+        // load far longer than a real day and assert the model stays finite and confident.
+        let mut ctrl = adaptive(AdaptiveCfg::tuned());
+        // Import-side leak (negative bias), matching the real system + integral cap.
+        let comp = |x: f64| -25.0 - 0.04 * x;
+        let mut bias = 0.0;
+        for _ in 0..200_000 {
+            bias = plant_tick(&mut ctrl, 800.0, 20.0, bias, comp);
+        }
+        let snap = ctrl.ff_snapshot(800.0).unwrap();
+        assert!(snap.a.is_finite() && snap.b.is_finite(), "params blew up");
+        assert!(snap.conf > 0.5, "confidence collapsed (covariance overflow?): {}", snap.conf);
+        assert!((bias - comp(800.0)).abs() < 8.0, "lost the correction: {bias}");
+    }
+
+    #[test]
+    fn adaptive_nan_input_is_safe() {
+        let mut ctrl = adaptive(AdaptiveCfg::tuned());
+        // warm the model up first
+        for _ in 0..100 {
+            let _ = plant_tick(&mut ctrl, 800.0, 20.0, 0.0, |x| 25.0 + 0.04 * x);
+        }
+        let good = ctrl.ff_snapshot(800.0).unwrap();
+        let cmd = ctrl.update(f64::NAN, -800.0, 20.0, 2.5, -9000.0, 9000.0, true);
+        assert!(cmd.is_finite(), "NaN grid must yield a finite command");
+        let after = ctrl.ff_snapshot(800.0).unwrap();
+        assert!(after.a.is_finite() && after.b.is_finite());
+        // A NaN error must not have corrupted the model.
+        assert!((after.a - good.a).abs() < 50.0 && (after.b - good.b).abs() < 0.1);
+    }
+
+    #[test]
+    fn adaptive_model_takes_over_from_integral_no_windup() {
+        // The anti-double-count invariant is at STEADY STATE: as the model learns the
+        // needed bias, the integral must RELAX toward zero (the model carries the load),
+        // rather than the two stacking to twice the correction (windup). Dwell at a fixed
+        // load and check the model ends up carrying it while the integral is near zero.
+        let mut ctrl = adaptive(AdaptiveCfg::tuned());
+        // Import-side leak (negative bias), matching the real system + integral cap.
+        let comp = |x: f64| -25.0 - 0.04 * x; // needed bias at load x
+        let x = 800.0;
+        let target = 20.0;
+        let mut bias = 0.0;
+        for _ in 0..4000 {
+            bias = plant_tick(&mut ctrl, x, target, bias, comp);
+        }
+        let want = comp(x); // 57 W
+        // Total applied bias converged to the single correction, not double it.
+        assert!((bias - want).abs() < 6.0, "applied bias {bias} want ~{want}");
+        // The model now carries it (high-confidence prediction ~= the needed bias) ...
+        let snap = ctrl.ff_snapshot(x).unwrap();
+        let model_term = snap.conf * (snap.a + snap.b * x);
+        assert!((model_term - want).abs() < 12.0, "model term {model_term} want ~{want}");
+        // ... and the integral has relaxed toward zero (no windup / no double count).
+        assert!(ctrl.i.abs() < 15.0, "integral should relax, got {}", ctrl.i);
+    }
+}
