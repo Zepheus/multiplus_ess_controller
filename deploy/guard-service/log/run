@@ -1,0 +1,2 @@
+#!/bin/sh
+exec multilog t s65536 n2 /run/venus-ess-guard-log

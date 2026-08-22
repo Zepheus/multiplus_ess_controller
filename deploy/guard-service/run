@@ -1,0 +1,19 @@
+#!/bin/sh
+# venus-ess-guard: independent authoritative-mode watchdog.
+# INVARIANT: if our controller is not running, the stock daemon must be
+# authoritative. Hub4Mode=EXTERNAL(3) with no external controller process alive
+# means a crashed/stopped takeover left the persistent setting behind — restore 1
+# so stock resumes ESS. Runs supervised, independent of the main service.
+exec 2>&1
+echo "*** venus-ess-guard: watching Hub4Mode vs controller liveness ***"
+while true; do
+  sleep 60
+  MODE=$(dbus -y com.victronenergy.settings /Settings/CGwacs/Hub4Mode GetValue 2>/dev/null)
+  if [ "$MODE" = "3" ]; then
+    ALIVE=$(ps | grep "[v]enus-ess/venus-ess-controller" | wc -l)
+    if [ "$ALIVE" = "0" ]; then
+      echo "Hub4Mode=EXTERNAL with controller dead -> restoring stock mode 1"
+      dbus -y com.victronenergy.settings /Settings/CGwacs/Hub4Mode SetValue 1
+    fi
+  fi
+done

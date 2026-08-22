@@ -1,8 +1,17 @@
 #!/bin/sh
 # Run at every boot by /etc/init.d/custom-rc-late.sh (Venus OS hook).
-# /data persists across reboots AND firmware updates, so this re-installs the
-# venus-ess service into the tmpfs service tree each boot, exactly like the
-# stock services in /run/service (supervise state + logs stay off eMMC).
+# /data persists across reboots AND firmware updates. Installs both services
+# into the tmpfs service tree (supervise state + logs stay off eMMC):
+#   venus-ess       — the controller
+#   venus-ess-guard — authoritative-mode watchdog: restores Hub4Mode=1 whenever
+#                     the controller is not running (stock must own the loop
+#                     if we don't actuate).
 mkdir -p /run/service
 cp -a /data/venus-ess/service /run/service/venus-ess
+cp -a /data/venus-ess/guard-service /run/service/venus-ess-guard
 ln -sf /run/service/venus-ess /service/venus-ess
+ln -sf /run/service/venus-ess-guard /service/venus-ess-guard
+# Boot-time belt: if a crash left EXTERNAL mode with no controller yet, restore
+# stock immediately rather than waiting for the guard's first minute.
+MODE=$(dbus -y com.victronenergy.settings /Settings/CGwacs/Hub4Mode GetValue 2>/dev/null)
+[ "$MODE" = "3" ] && dbus -y com.victronenergy.settings /Settings/CGwacs/Hub4Mode SetValue 1

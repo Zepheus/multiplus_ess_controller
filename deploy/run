@@ -1,0 +1,38 @@
+#!/bin/sh
+# venus-ess daemontools service.
+# Lives in /data/venus-ess/service; /data/rc.local copies it to /run/service
+# (tmpfs) each boot so supervise state and logs never touch eMMC flash.
+exec 2>&1
+
+# --- ACTIVE: shadow (READ-ONLY) — stock is authoritative (user revert 2026-08-21)
+echo "*** starting venus-ess (stage: shadow) ***"
+exec /data/venus-ess/venus-ess-controller --stage shadow --controller stock --quiet \
+     --telemetry /run/venus-ess-stock.csv --telemetry-max-mb 4
+
+# --- takeover (frozen FF) — REVERTED 2026-08-21 after slow step-off recovery;
+# --- re-enable only after replay analysis of captures/2026-08-21-live-takeover, FROZEN feed-forward (2026-08-21, user go):
+# the leak curve is pinned by three agreeing estimates (5-day plant fit, live
+# learned model, replay learn-only) — bias(x) = -4.9 - 0.0458*x. Frozen mode
+# applies it deterministically with NO learning loop (no cold-start fragility);
+# the clipped integral covers residual drift. Validated on the 49 h real-load
+# replay: median +0.4 W, mean +3.8 W, export at stock parity.
+# export VENUS_ESS_LIVE=I_UNDERSTAND
+# echo "*** starting venus-ess (stage: TAKEOVER, adaptive-frozen) ***"
+# --ki 0.02: integral retuned for the stock-equivalent write pacing (0.242/s);
+# the old 0.05 was tuned for 0.5/s and left a lightly-damped ±30 W oscillation
+# (minutes-period) on the real meter-lag chain. The frozen FF carries the leak,
+# so the integral only trims small residuals — low gain loses nothing.
+# exec /data/venus-ess/venus-ess-controller --stage takeover --confirm \
+#      --controller adaptive --ff-mode frozen --ff-a -4.9 --ff-b -0.0458 --ki 0.02 --quiet \
+#      --telemetry /run/venus-ess.csv --telemetry-max-mb 4
+
+# --- shadow (previous stage, kept for rollback: swap the exec lines, svc -t) ---
+# echo "*** starting venus-ess (stage: shadow) ***"
+# exec /data/venus-ess/venus-ess-controller --stage shadow --controller stock --quiet \
+#      --telemetry /run/venus-ess-stock.csv --telemetry-max-mb 4
+
+# --- learn-only variant (FF observes but does not act):
+# export VENUS_ESS_LIVE=I_UNDERSTAND
+# exec /data/venus-ess/venus-ess-controller --stage takeover --confirm \
+#      --controller adaptive --ff-learn-only --quiet \
+#      --telemetry /run/venus-ess.csv --telemetry-max-mb 4
