@@ -402,7 +402,10 @@ assert!(pre.abs() < M_STEADY_MEAN, "pre-step mean err {pre:+.1}W");
 fn replay_property_appliance_transients_bounded() {
     let segs = vec![appliance_load_segment(13, 5400)];
     let pi = replay(&segs, &|| Kind::Pi { ki: 0.05, i_max: 300.0 }, "baseline");
-    assert_eq!(pi.env_clamps, 0);
+    // The design envelope MAY be touched momentarily on the aircon inrush stack
+    // (3 kW step + prior flow + noise at full pacing, uncompensated PI here) —
+    // that is the clamp doing its job. Sustained clamping would be a fault.
+    assert!(pi.env_clamps <= 3, "sustained envelope clamping: {}", pi.env_clamps);
     assert!(pi.median.abs() < M_BALANCE_PI, "median {:+.1}", pi.median);
     assert!(pi.worst < M_WORST_TRANSIENT, "worst {:.0}", pi.worst);
 }

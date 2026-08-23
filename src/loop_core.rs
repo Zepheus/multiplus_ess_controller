@@ -156,17 +156,17 @@ pub mod plant {
     pub const METER_LAG_S: usize = 1;
 }
 
-/// Write pacing, SYMMETRIC and stock-equivalent: stock's flat 0.5 gain runs at a
-/// 2.5 s cadence; the same trajectory sampled at our 1 Hz is 1−0.5^(1/2.5) ≈ 0.242
-/// per write. This reproduces stock's transient profile in BOTH directions — equal
-/// dig-in depth (equal export peaks at appliance step-off) and equal recovery.
-/// An asymmetric variant (slow dig-in / fast recovery) was tried and REJECTED: its
-/// noise response holds the adaptive learn-gate's steadiness detector open, so a
-/// cold-start model excursion can never unlearn (replay-suite deadlock, 2026-08-21).
-/// Live-measured motivation: 0.5/s symmetric exported 11.1 Wh/h vs stock's 9.7
-/// with −2.2 kW step-off peaks vs stock's −1.6 kW.
-pub const EMA_GAIN_UP: f64 = 0.242;
-pub const EMA_GAIN_DOWN: f64 = 0.242;
+/// Write pacing, SYMMETRIC at 0.5/s — fast pacing is safe BECAUSE of the Smith
+/// meter-lag compensation (the 2026-08-22 event study, 233 + 331 out-of-sample
+/// events): without compensation, fast pacing chases the ~1 s-stale meter and
+/// over-discharges into step-offs (the 2026-08-21 live exports); with it, the
+/// smith+0.5 combination beats stock on export, import AND export duration.
+/// History: stock-equivalent 0.242 was tried live and exported MORE than stock
+/// (slow recovery, +11% on the event library); an asymmetric variant was
+/// rejected (blocks the adaptive learn-gate's steadiness detector). If Smith is
+/// disabled (--no-smith), consider that pacing trade-off before going live.
+pub const EMA_GAIN_UP: f64 = 0.5;
+pub const EMA_GAIN_DOWN: f64 = 0.5;
 
 pub fn stock_write_ema(
     prev: Option<f64>,
