@@ -1,5 +1,7 @@
 # multiplus_ess_controller
 
+[![CI](https://github.com/Zepheus/multiplus_ess_controller/actions/workflows/rust.yml/badge.svg)](https://github.com/Zepheus/multiplus_ess_controller/actions/workflows/rust.yml)
+
 An experimental replacement for the grid-setpoint control loop of a Victron
 MultiPlus-II ESS on a Venus GX. It runs its own control law (with proper integral
 action) instead of the stock behaviour, to hold the grid meter at the configured
