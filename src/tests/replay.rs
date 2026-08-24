@@ -98,7 +98,7 @@ for seg in segs {
         }
         frozen = grid;
         let cmd = ctrl
-    .update(grid, rep, target, 1.0, lo, hi, true)
+    .update(grid, rep, target, 1.0, lo, hi, true, true)
     // Production parity: outside charge regimes the composed command is clamped
     // to non-positive (stock zeroes non-negative totals; acOut not modeled here).
     .min(0.0);
@@ -433,7 +433,7 @@ fn probe_step_dynamics() {
         for (k, &(_t, load)) in seg.iter().enumerate() {
             let grid_true = load + rep;
             let grid = grid_true + rng.gauss(35.0);
-            let mut cmd = ctrl.update(grid, rep, 5.0, 1.0, -7030.0, 7030.0, true);
+            let mut cmd = ctrl.update(grid, rep, 5.0, 1.0, -7030.0, 7030.0, true, true);
             if clamp0 {
                 cmd = cmd.min(0.0);
             }
@@ -488,7 +488,7 @@ fn probe_adaptive_trajectory() {
         for (k, &(_t, load)) in seg.iter().enumerate() {
             let grid_true = load + rep;
             let grid = grid_true + rng.gauss(35.0);
-            let mut cmd = ctrl.update(grid, rep, 5.0, 1.0, -7030.0, 7030.0, true);
+            let mut cmd = ctrl.update(grid, rep, 5.0, 1.0, -7030.0, 7030.0, true, true);
             if clamp0 { cmd = cmd.min(0.0); }
             let w = crate::loop_core::stock_write_ema(prev_w, cmd, false, gu, gd);
             prev_w = Some(w);

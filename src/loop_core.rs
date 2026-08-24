@@ -125,7 +125,7 @@ fn slew_limit(prev: Option<f64>, desired: f64, max_rate_w_s: f64, dt: f64) -> f6
     }
 }
 
-/// Stock's setpoint write law (matched to the stock daemon's per-phase writer exactly): an EMA toward the
+/// Stock's setpoint write law (stock-behavior analysis-verified, per-phase writer): an EMA toward the
 /// command, `new = prev + gain·(cmd − prev)`, with
 ///   gain = 0.5                                   for |Δ| < 10 W, or with `adaptive` off;
 ///   gain = clamp(0.25·ln(|Δ|/10), 0.5, 1.1)      otherwise — a DELIBERATE overshoot up
@@ -136,7 +136,7 @@ fn slew_limit(prev: Option<f64>, desired: f64, max_rate_w_s: f64, dt: f64) -> f6
 /// passes through. The result is rounded to the integer watt, half away from zero — stock
 /// writes integers (every live-captured setpoint is one). Pure.
 /// Identified plant + meter chain (system identification 2026-08-22 from live
-/// actuation traces; identified 2026-08-22 from live actuation traces).
+/// actuation traces; see captures/2026-08-21-live-takeover/plantfit-v2.json).
 /// The Multi's AC power follows the written setpoint through a 1 s transport
 /// delay and a first-order response (per-second alpha 0.8, tau ~1.25 s); the
 /// ET112 grid reading reaches the loop ~1 s stale (750 ms register + RS485).
@@ -347,6 +347,10 @@ pub fn composed_command(
     meter_corr_w: f64,
 ) -> f64 {
     let s = &snap.s;
+    // Integrate only when OUR law is what the plant follows: not during force-charge
+    // (firmware drives) and not during an external discharge hold (floor drives).
+    let integrate =
+        actuating && !snap.sg.force_charge && !snap.sg.max_discharge_w.is_finite();
     let mut cmd = ctrl.update(
         s.grid + meter_corr_w,
         s.reported,
@@ -355,8 +359,9 @@ pub fn composed_command(
         snap.lo,
         snap.hi,
         actuating,
+        integrate,
     );
-    // SocGuard discharge inhibit / external cap, MIMICKING STOCK EXACTLY (live-verified
+    // SocGuard discharge inhibit / external cap, MIMICKING STOCK EXACTLY (stock-behavior analysis-verified
     // 2026-08-17, actuation tick + distributor + writer): stock builds its total command in
     // the acIn−acOut frame — total = clamp(target + acIn − grid − acOut, −maxdis, maxchg) —
     // and the per-phase write adds measured `Ac/Out/L{n}/P` back on top. In normal operation
@@ -382,7 +387,7 @@ pub fn composed_command(
         // total, so the write floor is dcV·5 + acOut (charge 5 A AND serve the output).
         cmd = cmd.max(snap.sg.charge_floor_w + ac_out);
     }
-    // STOCK PARITY (stock-behavior analysis + 48.8 h of shadow data with ZERO
+    // STOCK PARITY (actuation-tick stock-behavior analysis + 48.8 h of shadow data with ZERO
     // positive stock writes in normal regimes): outside force-charge and the BL
     // minimum-charge floor, stock ZEROES any non-negative battery-frame total
     // before writing — the final AC command never exceeds measured AC-out, so the
@@ -1082,6 +1087,44 @@ mod tests {
         sp.gm_should_write = false; // meter gap: not actuating
         decide(&sp, &mut st, &c, 1.0);
         assert!(st.smith_weff.is_nan(), "must reset across non-actuating ticks");
+    }
+
+    /// Overnight charge-window regression: the integral must FREEZE while
+    /// force-charge (or a discharge hold) drives the plant — grid error during a
+    /// 6 h window is not ours to correct, and integrating it rails the integral,
+    /// which then discharges as a ~300 W export tail for minutes at window exit.
+    #[test]
+    fn integral_freezes_during_force_charge_no_exit_export_tail() {
+        let mut c = cfg(Stage::Takeover);
+        c.smith = false;
+        let mut st = state(Kind::Pi { ki: 0.02, i_max: 300.0 });
+        st.owner_us = true;
+        let mut sp = snap(true);
+        // Settle normally for a while (law ≈ −80, error ≈ 0-ish).
+        sp.s.grid = 100.0;
+        for k in 0..30 {
+            decide(&sp, &mut st, &c, k as f64);
+        }
+        // Scheduled charge: ForceCharge lands; grid legitimately +2.5 kW for "6 h".
+        sp.sg.force_charge = true;
+        sp.sg.cmd_override = Some(crate::socguard::FORCE_CHARGE_SENTINEL_W);
+        sp.sg.tpimf = true;
+        sp.s.grid = 2500.0;
+        for k in 30..1030 {
+            decide(&sp, &mut st, &c, k as f64);
+        }
+        // Window exit: overrides clear, normal law resumes at the same house load.
+        sp.sg = sg_free();
+        sp.s.grid = 100.0;
+        let d = decide(&sp, &mut st, &c, 1030.0);
+        // A railed integral would command ~law − 300 here. Frozen integral: the
+        // command must be within the pre-window ballpark (law −80 ± the small
+        // pre-window integral).
+        assert!(
+            d.command > -200.0,
+            "exit command {} — integral railed during the window",
+            d.command
+        );
     }
 
     #[test]

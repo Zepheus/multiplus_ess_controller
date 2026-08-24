@@ -322,6 +322,7 @@ impl Controller {
         lo: f64,
         hi: f64,
         learn: bool,
+        integrate: bool,
     ) -> f64 {
         match self.kind {
             Kind::Stock => clamp(target - grid + reported, lo, hi),
@@ -341,18 +342,24 @@ impl Controller {
                 // Hold the integral on a non-finite reading rather than letting `clamp`
                 // silently zero it (same policy as the adaptive path below); the command
                 // itself still degrades to the safe idle 0 via the final clamp.
-                if err.is_finite() && dt > 0.0 {
+                // `integrate` gates on "our law is what's actuated": during force-charge
+                // and discharge holds the firmware/hold drives the grid, the error is
+                // not ours to correct, and integrating it rails the integral for the
+                // whole window — which then discharges as an export tail at window exit
+                // (stock has no integral and no such tail).
+                if integrate && err.is_finite() && dt > 0.0 {
                     let e = err.clamp(-Self::I_ERR_CLIP_W, Self::I_ERR_CLIP_W);
                     self.i = clamp(self.i + ki * e * dt, -i_max, i_max);
                 }
                 clamp((target - grid + reported) + self.i, lo, hi)
             }
             Kind::Adaptive(c) => {
-                self.update_adaptive(c, grid, reported, target, dt, lo, hi, learn)
+                self.update_adaptive(c, grid, reported, target, dt, lo, hi, learn, integrate)
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn update_adaptive(
         &mut self,
@@ -364,12 +371,13 @@ impl Controller {
         lo: f64,
         hi: f64,
         learn: bool,
+        integrate: bool,
     ) -> f64 {
         let x = reported.abs(); // throughput regressor
         let err = target - grid;
         // Residual integral drives the grid onto target (correctness backstop). Hold it
         // on a non-finite reading rather than letting `clamp` silently zero it.
-        if err.is_finite() && dt > 0.0 {
+        if integrate && err.is_finite() && dt > 0.0 {
             let e = err.clamp(-Self::I_ERR_CLIP_W, Self::I_ERR_CLIP_W);
             self.i = clamp(self.i + c.ki * e * dt, -c.i_max, c.i_max);
         }
@@ -450,7 +458,7 @@ mod tests {
     ) -> f64 {
         let reported = -x; // discharge
         let grid = target - comp(x) + prev_bias;
-        let cmd = ctrl.update(grid, reported, target, 2.5, -9000.0, 9000.0, true);
+        let cmd = ctrl.update(grid, reported, target, 2.5, -9000.0, 9000.0, true, true);
         // bias = command - stock feed-forward
         cmd - (target - grid + reported)
     }
@@ -488,8 +496,8 @@ mod tests {
         let mut adapt = adaptive(AdaptiveCfg::tuned());
         let mut pi = Controller::new(Kind::Pi { ki: 0.05, i_max: 300.0 });
         for _ in 0..3 {
-            let ca = adapt.update(300.0, -1000.0, 20.0, 2.5, -9000.0, 9000.0, true);
-            let cp = pi.update(300.0, -1000.0, 20.0, 2.5, -9000.0, 9000.0, true);
+            let ca = adapt.update(300.0, -1000.0, 20.0, 2.5, -9000.0, 9000.0, true, true);
+            let cp = pi.update(300.0, -1000.0, 20.0, 2.5, -9000.0, 9000.0, true, true);
             assert!((ca - cp).abs() < 5.0, "cold-start adaptive {ca} vs pi {cp}");
         }
     }
@@ -514,8 +522,8 @@ mod tests {
         // learned model contributes nothing to the output.
         obs.reset();
         let mut p2 = Controller::new(Kind::Pi { ki: cfg.ki, i_max: cfg.i_max });
-        let cmd_o = obs.update(30.0, -800.0, 20.0, 2.5, -9000.0, 9000.0, true);
-        let cmd_p = p2.update(30.0, -800.0, 20.0, 2.5, -9000.0, 9000.0, true);
+        let cmd_o = obs.update(30.0, -800.0, 20.0, 2.5, -9000.0, 9000.0, true, true);
+        let cmd_p = p2.update(30.0, -800.0, 20.0, 2.5, -9000.0, 9000.0, true, true);
         assert!((cmd_o - cmd_p).abs() < 1e-6, "observe actuated FF: {cmd_o} vs {cmd_p}");
     }
 
@@ -528,7 +536,7 @@ mod tests {
         cfg.seeded = true;
         let mut ctrl = adaptive(cfg);
         // Frozen model must apply a+b*x on top of stock immediately.
-        let cmd = ctrl.update(20.0, -1000.0, 20.0, 2.5, -9000.0, 9000.0, true);
+        let cmd = ctrl.update(20.0, -1000.0, 20.0, 2.5, -9000.0, 9000.0, true, true);
         let stock = 20.0 - 20.0 + (-1000.0);
         // grid==target so integral stays 0; applied bias should be the seed model.
         assert!((cmd - (stock + 30.0 + 0.05 * 1000.0)).abs() < 1e-6, "frozen cmd {cmd}");
@@ -610,7 +618,7 @@ mod tests {
         let mut ctrl = adaptive(AdaptiveCfg::tuned());
         for _ in 0..2000 {
             // steady discharge at a fixed load, but not actuating
-            let _ = ctrl.update(20.0, -800.0, 20.0, 2.5, -9000.0, 9000.0, false);
+            let _ = ctrl.update(20.0, -800.0, 20.0, 2.5, -9000.0, 9000.0, false, false);
         }
         let snap = ctrl.ff_snapshot(800.0).unwrap();
         assert_eq!(snap.a, 0.0, "must not learn offset when not actuating");
@@ -643,7 +651,7 @@ mod tests {
             let _ = plant_tick(&mut ctrl, 800.0, 20.0, 0.0, |x| 25.0 + 0.04 * x);
         }
         let good = ctrl.ff_snapshot(800.0).unwrap();
-        let cmd = ctrl.update(f64::NAN, -800.0, 20.0, 2.5, -9000.0, 9000.0, true);
+        let cmd = ctrl.update(f64::NAN, -800.0, 20.0, 2.5, -9000.0, 9000.0, true, true);
         assert!(cmd.is_finite(), "NaN grid must yield a finite command");
         let after = ctrl.ff_snapshot(800.0).unwrap();
         assert!(after.a.is_finite() && after.b.is_finite());
