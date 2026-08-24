@@ -502,7 +502,12 @@ fn main() {
     }
 
     let start = Instant::now();
-    let mut prev = Instant::now();
+    // Seed `prev` one interval back so the FIRST tick's dt is a full interval, not
+    // the ~0 that `Instant::now()` here would give (which collapses the slew budget
+    // to a few watts and false-alarms slew/dt-clamp on the take-over write).
+    let mut prev = start
+        .checked_sub(Duration::from_secs_f64(args.interval))
+        .unwrap_or(start);
     let mut tick: u64 = 0;
     // Stock's feed-in flag values captured at take-over, restored at hand-back/exit
     // (stock's write-if-changed cache can otherwise leave OUR last flag values stuck).

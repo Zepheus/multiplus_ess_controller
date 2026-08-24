@@ -124,7 +124,7 @@ fn slew_limit(prev: Option<f64>, desired: f64, max_rate_w_s: f64, dt: f64) -> f6
     }
 }
 
-/// Stock's setpoint write law (stock-behavior analysis-verified, per-phase writer): an EMA toward the
+/// The stock setpoint write law (matched to the stock per-phase writer): an EMA toward the
 /// command, `new = prev + gain·(cmd − prev)`, with
 ///   gain = 0.5                                   for |Δ| < 10 W, or with `adaptive` off;
 ///   gain = clamp(0.25·ln(|Δ|/10), 0.5, 1.1)      otherwise — a DELIBERATE overshoot up
@@ -361,7 +361,7 @@ pub fn composed_command(
         actuating,
         integrate,
     );
-    // SocGuard discharge inhibit / external cap, MIMICKING STOCK EXACTLY (stock-behavior analysis-verified
+    // SocGuard discharge inhibit / external cap, MIMICKING STOCK EXACTLY (live-verified
     // 2026-08-17, actuation tick + distributor + writer): stock builds its total command in
     // the acIn−acOut frame — total = clamp(target + acIn − grid − acOut, −maxdis, maxchg) —
     // and the per-phase write adds measured `Ac/Out/L{n}/P` back on top. In normal operation
@@ -376,7 +376,7 @@ pub fn composed_command(
     if let Some(fc) = snap.sg.cmd_override {
         // Force charge. TPIMF (mode 0): keep writing the normal-law value capped at
         // Σ max-charge — the firmware charges maximally on its own and reinterprets the
-        // setpoint as a feed-in cap, so the value may legitimately go negative (stock
+        // setpoint as a feed-in cap, so the value may legitimately go negative (stock behavior;
         // live-verified 2026-08-16 across a full 6 h window: stock writes the raw normal
         // law, median |Δ| 2.5 W). Legacy (mode 1): the setpoint IS the charge command.
         cmd = if snap.sg.tpimf { cmd.min(fc) } else { fc };
@@ -387,7 +387,7 @@ pub fn composed_command(
         // total, so the write floor is dcV·5 + acOut (charge 5 A AND serve the output).
         cmd = cmd.max(snap.sg.charge_floor_w + ac_out);
     }
-    // STOCK PARITY (actuation-tick stock-behavior analysis + 48.8 h of shadow data with ZERO
+    // STOCK PARITY (stock actuation-tick behavior + 48.8 h of shadow data with ZERO
     // positive stock writes in normal regimes): outside force-charge and the BL
     // minimum-charge floor, stock ZEROES any non-negative battery-frame total
     // before writing — the final AC command never exceeds measured AC-out, so the
@@ -914,7 +914,7 @@ mod tests {
         sp.ac_out_w = 49.0; // measured Multi AC-out that morning
         let mut ctrl = Controller::new(Kind::Stock);
         let cmd = composed_command(&sp, &mut ctrl, false, 0.0);
-        // Stock's hold write = clamp(−1 W) + acOut = +48 W — stock-behavior analysis-verified frame
+        // Stock's hold write = clamp(−1 W) + acOut = +48 W — live-verified frame
         // (see composed_command) and the EXACT value the stock daemon wrote on this live row.
         assert!((cmd - 48.0).abs() < 1e-9, "hold must float at −cap + acOut, got {cmd}");
 
@@ -1273,6 +1273,35 @@ mod tests {
     }
 
     #[test]
+    fn takeover_first_tick_normal_dt_no_false_slew_alarm() {
+        // Regression: the very first loop tick must carry a sane dt (a full
+        // interval), not the ~0 that a just-initialized `prev` produces — else the
+        // slew budget (rate·dt) collapses to a few watts and the seeded first write
+        // clamps against it, raising a spurious slew/dt alarm every take-over.
+        let mut st = state(Kind::Stock);
+        let mut sp = snap(true);
+        sp.s.grid = 42.6;
+        sp.s.reported = -391.0;
+        sp.hub4_actual = Some(-440.0); // seed from stock's last setpoint
+        // A degenerate first-tick dt (the OLD `prev = Instant::now()` init) collapses
+        // the slew budget and DOES falsely clamp — this is the bug the main-loop
+        // init fix removes:
+        let mut st_bad = state(Kind::Stock);
+        let mut sp_bad = snap(true);
+        sp_bad.s.grid = 42.6;
+        sp_bad.s.reported = -391.0;
+        sp_bad.hub4_actual = Some(-440.0);
+        sp_bad.dt = 0.001;
+        let d_bad = decide(&sp_bad, &mut st_bad, &cfg(Stage::Takeover), 0.0);
+        assert!(d_bad.safety.slew_clamped, "degenerate dt is what caused the false alarm");
+        // A normal interval (what the fixed init guarantees) does NOT:
+        sp.dt = 1.0;
+        let d = decide(&sp, &mut st, &cfg(Stage::Takeover), 0.0);
+        assert!(!d.safety.slew_clamped, "no false slew clamp on the take-over tick");
+        assert!(!d.safety.dt_clamped, "no false dt-clamp on the take-over tick");
+    }
+
+    #[test]
     fn takeover_first_write_is_seeded_from_stock_setpoint() {
         // Take-over landing on a meter-lag tick must not write the raw transient:
         // the EMA seeds from stock's last written setpoint.
@@ -1362,7 +1391,7 @@ mod tests {
         assert!(d.safety.dt_clamped && d.safety.any());
     }
 
-    // Full-loop replay (stock behavior): drive the WHOLE composed decision over the real captured trace
+    // Full-loop replay: drive the WHOLE composed decision over the real captured trace
     // (both discharge 256 + scheduled-charge 259 regimes). Crucially the per-row command bounds
     // and force-charge decision come from the PRODUCTION code (battery_limits::BatteryBroker +
     // socguard::SocGuard fed by the row's own dbus values) — not hand-rolled constants — so this
