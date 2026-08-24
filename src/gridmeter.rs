@@ -1,18 +1,18 @@
 //! Grid-meter presence / failure-mode guard (Tier A safety gate).
 //!
-//! empirically modelled from `the stock ESS loop` (ARM32, closed-source). Decides,
+//! Reverse-engineered from `the stock daemon` 1.3.25 (ARM32, closed-source). Decides,
 //! once per presence tick, whether the ESS setpoint write should proceed and
 //! whether the `/Alarms/NoGridMeter` warning must be raised — exactly the two
-//! independent code paths the reference implementation runs off its `ControlLoop`:
+//! independent code paths the binary runs off its `ControlLoop`:
 //!
-//!   * setpoint gate  — `` early-returns (stop writing → the Multi's
+//!   * setpoint gate  — the stock actuation-tick early-returns (stop writing → the Multi's
 //!     own 60 s watchdog reverts it to Passthru: battery idle, loads on grid).
 //!   * presence / alarm FSM — `onTimer` case 5, a 48-tick grace counter that
 //!     raises `/Alarms/NoGridMeter` after 48 × 2.5 s = 120 s.
 //!
-//! Both paths are faithful to the reference implementation (grace `+0x48` reload `0x30`=48, timers
+//! Both paths are faithful to the binary (grace `+0x48` reload `0x30`=48, timers
 //! `0x9c4`=2500 ms, `ActiveInput==240` disconnect sentinel, `Source==2` genset,
-//! `Hub4Mode==3` inert). See the design notes §1, §3, §6.
+//! `Hub4Mode==3` inert). See ../../re/meter-failure-mode.md §1, §3, §6.
 //!
 //! DELIBERATE DIVERGENCE (safety improvement, §4): stock keys presence on the
 //! meter *pointer* and generic item *validity* only — it has **no staleness /
@@ -34,7 +34,7 @@
 use crate::dbus::*;
 use std::time::Duration;
 
-// ---- faithful constants (verified against the reference implementation) --------------
+// ---- faithful constants (verified against the 1.3.25 binary) --------------
 
 /// Grace counter reload (`ControlLoop +0x48`, `mov …,#0x30`). [RE][H]
 pub const GRACE_TICKS: u32 = 48;
@@ -44,7 +44,7 @@ pub const PRESENCE_TICK: Duration = Duration::from_millis(2500);
 pub const ACTIVEIN_DISCONNECTED: i32 = 240;
 /// `com.victronenergy.system /Ac/ActiveIn/Source == 2` ⇒ generator. [RE][H]
 pub const SOURCE_GENERATOR: i32 = 2;
-/// `Hub4Mode == 3` ⇒ external control, `the stock ESS loop` inert. [RE][H]
+/// `Hub4Mode == 3` ⇒ external control, `the stock daemon` inert. [RE][H]
 pub use crate::states::hub4mode::EXTERNAL as HUB4MODE_EXTERNAL;
 
 // ---- staleness guard (our improvement, non-stock) -------------------------
@@ -55,7 +55,7 @@ pub use crate::states::hub4mode::EXTERNAL as HUB4MODE_EXTERNAL;
 /// moves) yet well under the Multi's 60 s watchdog, so we passthru deliberately
 /// rather than regulate on stale data. See §4 / §6.3.
 pub const STALE_TICKS: u32 = 6;
-/// Documentation form of `STALE_TICKS` at the presence cadence (~15 s).
+// (Documentation form of `STALE_TICKS` at the presence cadence: ~15 s.)
 
 // ---- D-Bus paths this module needs (new; others reused from dbus.rs) ------
 
@@ -76,7 +76,7 @@ const P_ACTIVE_INPUT: &str = "/Ac/ActiveIn/ActiveInput";
 // Reused from dbus.rs: SYS, VEBUS, SETTINGS, P_GRID (system-republished grid
 // power), P_HUB4MODE (/Settings/CGwacs/Hub4Mode), P_ACTIVEIN (vebus AC-in P).
 
-/// Presence state emitted by the FSM (mirrors the reference implementation's `gridMeterPresence`).
+/// Presence state emitted by the FSM (mirrors the binary's `gridMeterPresence`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Presence {
     /// Meter present and usable. (`presence = 0`)
@@ -90,7 +90,7 @@ pub enum Presence {
 }
 
 /// What the setpoint path should regulate against this tick (mirrors the
-/// `` guards). `Skip` = write nothing → Multi watchdog → passthru.
+/// the stock actuation-tick guards). `Skip` = write nothing → Multi watchdog → passthru.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Regulation {
     /// Do NOT write `/Hub4/L1/AcPowerSetpoint` — let the Multi fail safe.
@@ -115,6 +115,7 @@ struct Inputs {
 /// The gate main.rs acts on. `regulate`/`presence` carry the full detail; the
 /// four flat flags are the common decisions the daemon loop needs.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(test), allow(dead_code))] // fields are test/diagnostic surface
 pub struct GridMeterGuardOut {
     /// A grid meter is present AND fresh (passes the staleness guard).
     pub usable: bool,
@@ -168,13 +169,15 @@ impl GridMeterGuard {
 
     /// Builder: toggle the non-stock frozen-meter guard. `false` reproduces
     /// stock behaviour (present-but-frozen meter is treated as usable) so parity
-    /// against the reference implementation stays auditable.
+    /// against the binary stays auditable.
+    #[cfg_attr(not(test), allow(dead_code))] // test-consumed API
     pub fn with_frozen_guard(mut self, on: bool) -> Self {
         self.frozen_guard = on;
         self
     }
 
     /// The grid service currently adopted (if any) — diagnostics only.
+    #[cfg_attr(not(test), allow(dead_code))] // test-consumed API
     pub fn meter_service(&self) -> Option<&str> {
         self.meter_service.as_deref()
     }
@@ -227,9 +230,9 @@ impl GridMeterGuard {
             hub4mode: bus.get_i32(SETTINGS, P_HUB4MODE).unwrap_or(HUB4MODE_EXTERNAL),
             multi_valid: bus
                 .get_f64(VEBUS, P_ACTIVEIN)
-                .map_or(false, |v| v.is_finite()),
+                .is_some_and(|v| v.is_finite()),
             run_without_meter: bus.get_bool(SETTINGS, P_RUN_WITHOUT_METER).unwrap_or(false),
-            // Default TRUE (meter required) — the reference implementation's default and the safe one.
+            // Default TRUE (meter required) — the binary's default and the safe one.
             grid_meter_required: bus.get_bool(SETTINGS, P_GRID_METER_REQUIRED).unwrap_or(true),
             // Default 0 = grid mode (meter matters); never assume genset.
             source: bus.get_i32(SYS, P_SOURCE).unwrap_or(0),
@@ -261,7 +264,7 @@ impl GridMeterGuard {
         let external = i.hub4mode == HUB4MODE_EXTERNAL && !mode3_is_ours;
         let inert = external || !i.multi_valid;
 
-        // ---- setpoint gate (mirrors  early-returns) ----
+        // ---- setpoint gate (mirrors the stock actuation-tick early-returns) ----
         let regulate = if inert {
             // Foreign external mode or Multi/AC-in unreadable ⇒ write nothing (fail safe).
             Regulation::Skip

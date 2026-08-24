@@ -1,4 +1,4 @@
-//! AC-coupled PV power limiter (the stock ESS loop subsystem #8 replacement).
+//! AC-coupled PV power limiter (the stock daemon subsystem #8 replacement).
 //!
 //! Curtails `com.victronenergy.pvinverter.*` inverters when their production can be
 //! neither absorbed by the battery (charge headroom -> 0) nor exported (feed-in
@@ -6,9 +6,9 @@
 //! `/PvPowerLimiterActive` and `/Pv/Disable`, plus the `PvPowerSetpointOffset`
 //! feed-forward the grid-setpoint loop pre-compensates with.
 //!
-//! empirically modelled from `com.victronenergy.hub4` (`PVPowerLimiter` +
-//! `PVInverter`). See the design notes; the constants below are read exact from
-//! the reference implementation `.rodata`.
+//! Reverse-engineered from `com.victronenergy.hub4` 1.3.25 (`PVPowerLimiter` +
+//! `PVInverter`). See ../../re/pv-limiter.md; the constants below are read exact from
+//! the binary `.rodata`.
 //!
 //! THIS INSTALL HAS NO PV and runs ESS External Control (Hub4Mode 3), where the
 //! limiter is doubly dead (no inverters + mode gate). The behaviourally-exact output
@@ -36,7 +36,7 @@ const P_STATUSCODE: &str = "/StatusCode"; // int: run state
 /// Settings export cap read for the proportional "allowed total" (NaN if unset).
 const P_MAXFEEDIN: &str = "/Settings/CGwacs/MaxFeedInPower";
 
-// --- extracted constants (exact, from the stock ESS loop .rodata; see re/pv-limiter.md §4.1) ---
+// --- extracted constants (exact, from the stock daemon .rodata; see re/pv-limiter.md §4.1) ---
 const RELEASE_W: f64 = 200_000.0; // DAT_00051730 "no limit / release" sentinel
 const CURTAIL_W: f64 = 0.0; // DAT_00051738 curtail-to-zero
 const RAMP_FRAC: f64 = 0.01; // DAT_00050350 ramp step = max(1%·MaxPower, 50 W)
@@ -71,13 +71,13 @@ impl PvOut {
 /// path ignores it entirely, so `Default` is safe for the stub caller.
 #[derive(Clone, Copy, Debug)]
 pub struct PvContext {
-    /// Watts the battery can still absorb (). The absorb sink size.
+    /// Watts the battery can still absorb (stock behavior). The absorb sink size.
     pub charge_headroom_w: f64,
     /// Battery cannot absorb meaningfully more (charge state "full").
     pub battery_full: bool,
     /// Feed-in forbidden (DisableFeedIn/preventFeedback) and not force-charging.
     pub export_blocked: bool,
-    /// Global gate (bridge ): false => nothing to limit, release everyone.
+    /// Global gate (stock gate): false => nothing to limit, release everyone.
     pub limiter_enabled: bool,
 }
 
@@ -113,9 +113,9 @@ impl PvInverter {
             service,
         }
     }
-    /// "producing / online" (): running StatusCode {7,11,12} OR Ac/Power > 0.
+    /// "producing / online" (stock behavior): running StatusCode {7,11,12} OR Ac/Power > 0.
     fn producing(&self) -> bool {
-        matches!(self.status, Some(7 | 11 | 12)) || self.ac_power.map_or(false, |p| p > 0.0)
+        matches!(self.status, Some(7 | 11 | 12)) || self.ac_power.is_some_and(|p| p > 0.0)
     }
     /// Finite nameplate ceiling, if the inverter reported one (>0). None => uncontrollable.
     fn nameplate(&self) -> Option<f64> {
@@ -139,6 +139,7 @@ impl PvLimiter {
     }
 
     /// Ac/PowerLimit writes issued on the most recent `tick` (service, watts).
+    #[cfg_attr(not(test), allow(dead_code))] // test-consumed API
     pub fn last_writes(&self) -> &[(String, f64)] {
         &self.writes
     }
@@ -300,7 +301,7 @@ impl PvLimiter {
 
 /// Only inverters that currently report a finite `Ac/PowerLimit` participate in limiting.
 fn controllable(inv: &&PvInverter) -> bool {
-    inv.power_limit.map_or(false, f64::is_finite)
+    inv.power_limit.is_some_and(f64::is_finite)
 }
 
 /// Ramp `cur` toward `target` by at most `step`, snapping when within `deadband`.

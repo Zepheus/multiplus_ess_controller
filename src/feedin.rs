@@ -2,8 +2,8 @@
 //!
 //! This is the subsystem the setpoint loop (`control.rs` + the `main.rs` envelope)
 //! does NOT cover: it owns the VE.Bus feed-in / export *flags* and mirrors the
-//! firmware's Sustain state into our discharge policy. empirically modelled from
-//! the stock ESS loop (Venus OS v3.75); see the design notes §4 and §6.
+//! firmware's Sustain state into our discharge policy. Reverse-engineered from
+//! the stock daemon 1.3.25 (Venus OS v3.75); see ../../re/feedin-sustain.md §4 and §6.
 //!
 //! Everything here is *policy above the VE.Bus firmware*. Five outputs, all written
 //! to the Multi's vebus service (`VEBUS`), never to our own hub4 service:
@@ -12,6 +12,7 @@
 //!   * `/Hub4/TargetPowerIsMaxFeedIn` (§4.4, gated on firmware support)
 //!   * `/Hub4/FixSolarOffsetTo100mV`  (§4.5)
 //!   * `/Hub4/L{n}/MaxFeedInPower`    (§4.6, gated on firmware support)
+//!
 //! plus the DC-overvoltage charge-stop integrator (§4.11), whose `ov_accum` the
 //! setpoint law consumes to zero any *positive* (charging) command.
 //!
@@ -49,7 +50,7 @@ const BL_SUSTAIN_STATE: i32 = crate::states::bl::SUSTAIN; // firmware Sustain
 const MAX_PHASES: usize = 4; // single vebus service: totals + L1..L3
 
 /// BatteryLife states at/below the SOC floor: {5,6,8,11,12} (the `(0xCB>>(s-5))&1`
-/// bitmask from the reference implementation). In these states feed-in is disabled unless peak shaving
+/// bitmask from the binary). In these states feed-in is disabled unless peak shaving
 /// must stay available.
 fn is_floor_state(state: i32) -> bool {
     matches!(state, 5 | 6 | 8 | 11 | 12)
@@ -143,7 +144,7 @@ pub enum FeedInMode {
 }
 
 /// External `/Overrides/*` (served by the hub4 D-Bus server, spec §6.2). Until that
-/// server exists, defaults apply: no override. All fields are volatile per the reference implementation's
+/// server exists, defaults apply: no override. All fields are volatile per the binary's
 /// invalidate-overrides watchdog.
 #[derive(Clone, Copy)]
 pub struct Overrides {
@@ -191,7 +192,7 @@ fn neg1_nan(v: Option<f64>) -> f64 {
     }
 }
 
-/// Write-if-changed cache. We mirror the reference implementation's write-only-on-change setters so the
+/// Write-if-changed cache. We mirror the binary's write-only-on-change setters so the
 /// MK3 link is never spammed. `None` = never written yet (or path absent on this fw).
 #[derive(Clone, Copy, Default)]
 struct LastWritten {
@@ -344,9 +345,9 @@ impl FeedIn {
             // "Unlimited": write the exact sentinel (no slew), per §4.6's dedicated
             // branch and §6.8 ("keep the exact sentinels"). Reset slew memory so a later
             // finite limit steps down immediately rather than from 200 kW.
-            for n in 0..i.phases {
-                out[n] = MAXFEEDIN_UNLIMITED;
-                self.prev_maxfeedin[n] = MAXFEEDIN_UNLIMITED;
+            for (o, prev) in out.iter_mut().zip(&mut self.prev_maxfeedin).take(i.phases) {
+                *o = MAXFEEDIN_UNLIMITED;
+                *prev = MAXFEEDIN_UNLIMITED;
             }
             return out;
         }
@@ -361,13 +362,13 @@ impl FeedIn {
             MAXFEEDIN_UNLIMITED
         };
         let per_phase = total / i.phases as f64;
-        for n in 0..i.phases {
+        for (o, prev) in out.iter_mut().zip(&mut self.prev_maxfeedin).take(i.phases) {
             let mut new = per_phase;
-            if new > self.prev_maxfeedin[n] {
-                new = SLEW_UP_NEW * new + SLEW_UP_PREV * self.prev_maxfeedin[n]; // slew up only
+            if new > *prev {
+                new = SLEW_UP_NEW * new + SLEW_UP_PREV * *prev; // slew up only
             }
-            self.prev_maxfeedin[n] = new;
-            out[n] = new;
+            *prev = new;
+            *o = new;
         }
         out
     }
@@ -481,6 +482,7 @@ impl FeedIn {
 /// Result of one `FeedIn::tick`: the computed flag values (for telemetry / the setpoint
 /// law) plus an internal write-plan. `write` emits only the changed, firmware-present
 /// paths to the vebus service. In shadow mode the caller simply drops this.
+#[cfg_attr(not(test), allow(dead_code))] // fields are test/diagnostic surface
 pub struct Output {
     pub mode: FeedInMode,
     /// DC-overvoltage integrator (§4.11). The setpoint law forces any *positive*
@@ -791,7 +793,7 @@ mod tests {
 
     #[test]
     fn unknown_discharge_budget_allows_feedin() {
-        // §6.8: NaN/unknown budget => can_discharge = true (matches the reference implementation).
+        // §6.8: NaN/unknown budget => can_discharge = true (matches the binary).
         let bus = base(); // MAXDISCHARGE = -1 => NaN
         let mut f = FeedIn::new(&bus);
         assert_eq!(f.tick(&bus).disable_feedin, 0);

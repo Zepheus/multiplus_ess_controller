@@ -670,7 +670,7 @@ fn replay_event(
         let gm = grid_ring[idx];
         let cmd = law(gm, rep, ao, prev_w);
         ph += 1;
-        let do_write = !cadence_2s5 || (ph % 2 == 0 || ph % 5 == 0);
+        let do_write = !cadence_2s5 || (ph.is_multiple_of(2) || ph.is_multiple_of(5));
         if do_write {
             prev_w = (prev_w + pace * (cmd - prev_w)).round();
         }

@@ -1,4 +1,4 @@
-//! SocGuard / BatteryLife enactment (the stock ESS loop §4a, spec §6).
+//! SocGuard / BatteryLife enactment (the stock daemon §4a, spec §6).
 //!
 //! The *decision* half stays in Python (`dbus-systemcalc-py` `batterylife.py`): it
 //! watches SOC and writes a single integer into `Settings/CGwacs/BatteryLife/State`
@@ -53,7 +53,7 @@ pub const P_TPIMF: &str = "/Hub4/TargetPowerIsMaxFeedIn"; // VEBUS, bool/int
 /// uses. In shadow we read stock hub4's published value; in Tier-B, our own served one.
 pub const HUB4: &str = "com.victronenergy.hub4";
 pub const P_OVR_FORCECHARGE: &str = "/Overrides/ForceCharge"; // hub4, int→bool
-/// The DESS/schedule setpoint-override surface. Writing it (mode 1) lets the stock ESS loop
+/// The DESS/schedule setpoint-override surface. Writing it (mode 1) lets stock the stock daemon
 /// keep full authority while we bias only the grid target — the Stage-1 "trim" path, guarded
 /// by the verified 300 s override watchdog. (Read/written by main's Trim stage.)
 pub const P_OVR_SETPOINT: &str = "/Overrides/Setpoint"; // hub4, f64 (invalid = no override)
@@ -67,7 +67,7 @@ pub const P_OVR_SETPOINT: &str = "/Overrides/Setpoint"; // hub4, f64 (invalid = 
 pub const P_OVR_MAXDISCHARGE: &str = "/Overrides/MaxDischargePower"; // hub4, f64
 
 /// Discharge-inhibit set {5,6,8,11,12} = {BLDischarged, BLForceCharge, BLLowSocCharge,
-/// SocGuardDischarged, SocGuardLowSocCharge}. the stock ESS loop tests it with the literal
+/// SocGuardDischarged, SocGuardLowSocCharge}. the stock daemon tests it with the literal
 /// mask `(state-5 < 8) && ((0xCB >> (state-5)) & 1)`; reproduced here for fidelity.
 /// The set it encodes: {DISCHARGED, FORCE_CHARGE, LOW_SOC_CHARGE, SOCG_DISCHARGED,
 /// SOCG_LOW_SOC_CHARGE} (see `crate::states::bl`).
@@ -116,9 +116,9 @@ pub struct Inputs {
 /// Enactment the main loop applies to the ControlLoop command, in this order:
 ///   1. discharge inhibit: `cmd = cmd.max(-max_discharge_w)` (no-op when +∞)
 ///   2. force charge: if `cmd_override` is `Some(fc)` —
-///        tpimf  → `set_i32(VEBUS, P_TPIMF, 1); cmd = cmd.min(fc)` (normal law passes
-///                 through as the firmware's feed-in cap; may be negative)
-///        legacy → `set_i32(VEBUS, P_TPIMF, 0); cmd = fc`
+///      tpimf → `set_i32(VEBUS, P_TPIMF, 1); cmd = cmd.min(fc)` (normal law passes
+///      through as the firmware's feed-in cap; may be negative);
+///      legacy → `set_i32(VEBUS, P_TPIMF, 0); cmd = fc`;
 ///      else `set_i32(VEBUS, P_TPIMF, 0)`
 ///   3. state-6 slow-charge floor: `cmd = cmd.max(charge_floor_w)`
 ///   4. final safety clamp (existing): `cmd = control::clamp(cmd, lo, hi)`
@@ -520,25 +520,25 @@ mod tests {
         assert_eq!(enact(&inp).cmd_override, Some(FORCE_CHARGE_SENTINEL_W));
     }
 
-    /// Dispatch scenario: a Home-Assistant automation RAISES `MinimumSocLimit` when Octopus
-    /// grants a cheap car-charge window, so the ESS charges instead of discharging. Verified
-    /// on-device (2026-08-15): the stock ESS loop subscribes to NO battery-SOC dbus path —
-    /// `updateBatteryLimits()` fires only on state/minSoc/dcVoltage/max{Charge,Discharge}Power/
-    /// sustain — so it CANNOT compare SOC to MinSOC itself. That decision is made entirely by
-    /// `dbus-systemcalc-py` `batterylife.py` (which we do NOT replace) and delivered via
-    /// `BatteryLife/State`:
+    /// Dispatch scenario: a Home-Assistant automation RAISES `MinimumSocLimit` when
+    /// Octopus grants a cheap car-charge window, so the ESS charges instead of
+    /// discharging. Ghidra-confirmed (2026-08-15): stock the stock daemon subscribes to NO
+    /// battery-SOC dbus path — `updateBatteryLimits()` fires only on
+    /// state/minSoc/dcVoltage/max{Charge,Discharge}Power/sustain — so it CANNOT compare
+    /// SOC to MinSOC itself. That decision is made entirely by `dbus-systemcalc-py`
+    /// `batterylife.py` (which we do NOT replace) and delivered via `BatteryLife/State`:
     ///   SocGuardDefault(10) --SOC≤MinSOC--> SocGuardDischarged(11)
     ///                       --SOC≤MinSOC-5--> SocGuardLowSocCharge(12)
     ///                       --SOC≥MinSOC--> back to (11)/(10).
-    /// Our job is faithful ENACTMENT of whatever state systemcalc emits. This replays that exact
-    /// sequence and asserts we inhibit at 11 and force-charge at 12 — i.e. the HA automation
-    /// keeps working byte-for-byte under the rewrite.
+    /// Our job is faithful ENACTMENT of whatever state systemcalc emits. This replays
+    /// that exact sequence and asserts we inhibit at 11 and force-charge at 12 — i.e.
+    /// the HA automation keeps working byte-for-byte under the rewrite.
     #[test]
     fn dispatch_minsoc_raise_charges_via_state_machine() {
         let sg = |state: i32| {
             enact(&Inputs {
                 bl_state: state,
-                min_soc: 80.0, // HA raised it; the stock/our path only cares about >99, inert here
+                min_soc: 80.0, // HA raised it; hub4/our path only cares about >99, so inert here
                 charge_request: false,
                 dc_voltage: 52.0,
                 eff_max_charge_w: 4700.0,
@@ -567,7 +567,7 @@ mod tests {
         assert!(chg.tpimf, "modern firmware path drives TPIMF force-charge");
 
         // MinSOC=100 edge (HA sets 100%): our own >99 KeepCharged path also charges,
-        // independent of systemcalc — matches the stock loop's only internal SOC-ish rule.
+        // independent of systemcalc — matches stock hub4's only internal SOC-ish rule.
         let kc = enact(&Inputs { min_soc: 100.0, bl_state: bl::SOCG_DEFAULT, ..dispatch_inp() });
         assert!(kc.force_charge, "MinSOC>99 is KeepCharged even at state 10");
     }

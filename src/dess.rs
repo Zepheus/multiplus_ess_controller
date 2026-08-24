@@ -1,20 +1,20 @@
 //! Dynamic ESS (DESS) override subsystem.
 //!
 //! Reads the two DESS overrides that systemcalc's `DynamicEss` delegate writes onto
-//! the stock ESS loop's own `com.victronenergy.hub4` service and turns them into the
+//! the stock daemon's own `com.victronenergy.hub4` service and turns them into the
 //! effective-target override the control law consumes. This is the CONSUMER half of
-//! the `/Overrides/*` transport empirically modelled in the design notes (§4, §6):
+//! the `/Overrides/*` transport reverse-engineered in ../../re/dynamic-ess.md (§4, §6):
 //!
 //!   * `/Overrides/Setpoint` (double, invalid = empty array) — grid-exchange target
 //!     in W (+import / 0 hold / −export). The core tick's effective-setpoint getter
-//!     (``) is exactly `isFinite(override) ? override : configured`, so
+//!     (stock behavior) is exactly `isFinite(override) ? override : configured`, so
 //!     DESS "overriding the setpoint" is literally *swapping the target input*; the
 //!     feed-forward control law is untouched.
 //!   * `/Overrides/FeedInExcess` (int32 {0,1,2}) — 0 = follow the user's configured
 //!     feed-in policy, 1 = disable feed-in this slot, 2 = enable feed-in this slot
-//!     (``, pinned on both producer and consumer side).
+//!     (`the stock code`, pinned on both producer and consumer side).
 //!
-//! Safety posture (matches the stock ESS loop's `invalidateOverrides`, `` case 9):
+//! Safety posture (matches the stock daemon's `invalidateOverrides`, `the stock code` case 9):
 //!   * An absent, empty-array, or NaN setpoint override is NOT a value — we fall back
 //!     to the user's configured setpoint. A finite override (including `0.0` and
 //!     negatives) genuinely overrides; `0` and invalid are never conflated (§5).
@@ -31,8 +31,8 @@
 use crate::dbus::Bus;
 use std::time::{Duration, Instant};
 
-// --- DESS override paths on the stock ESS loop's OWN service (systemcalc is the writer) ---
-/// The service the stock ESS loop owns and publishes; systemcalc `SetValue`s the overrides here.
+// --- DESS override paths on the stock daemon's OWN service (systemcalc is the writer) ---
+/// The service the stock daemon owns and publishes; systemcalc `SetValue`s the overrides here.
 pub const HUB4: &str = "com.victronenergy.hub4";
 /// Grid-exchange target (W). Invalid/empty-array ⇒ read as absent ⇒ fall back. Double.
 pub const P_OVR_SETPOINT: &str = "/Overrides/Setpoint";
@@ -41,13 +41,14 @@ pub const P_OVR_FEEDIN: &str = "/Overrides/FeedInExcess";
 
 /// Overrides watchdog period. systemcalc refreshes every 5 s; any value comfortably
 /// above that works. 300 s matches Victron's documented overrides watchdog (§4.4);
-/// the exact literal is not in the analysis, so this is the safe documented value.
+/// the exact literal is not in the decompilation, so this is the safe documented value.
 const WATCHDOG: Duration = Duration::from_secs(300);
 
 /// Feed-in-excess policy — the DESS `/Overrides/FeedInExcess` int, decoded.
 ///
 /// Producer (`dynamicess.py`): `0 if allow_feedin is None else 2 if allow_feedin else 1`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // test-consumed API
 pub enum FeedInExcess {
     /// 0 — follow the user's configured feed-in policy (PreventFeedback / MaxFeedInPower).
     Follow = 0,
@@ -60,6 +61,7 @@ pub enum FeedInExcess {
 impl FeedInExcess {
     /// Decode the raw override int. Anything other than 1/2 is `Follow` (systemcalc's
     /// default-0 "follow system setup"), so a garbage value fails safe to the user policy.
+    #[cfg_attr(not(test), allow(dead_code))] // test-consumed API
     pub fn from_i32(v: i32) -> Self {
         match v {
             1 => FeedInExcess::Disable,
@@ -67,6 +69,7 @@ impl FeedInExcess {
             _ => FeedInExcess::Follow,
         }
     }
+
 }
 
 /// The DESS override, resolved for one control tick.
@@ -89,9 +92,11 @@ impl DessOut {
     }
 
     /// The decoded feed-in-excess policy.
+    #[cfg_attr(not(test), allow(dead_code))] // test-consumed API
     pub fn feedin(&self) -> FeedInExcess {
         FeedInExcess::from_i32(self.feed_in_excess)
     }
+
 }
 
 /// DESS override consumer. Reads `/Overrides/*` off the hub4 service each tick and
@@ -100,7 +105,7 @@ impl DessOut {
 /// Watchdog model (poller edition): we can only observe the applied override values,
 /// not systemcalc's `SetValue` timestamps, so we treat any *change* in the observed
 /// override (setpoint or feed-in) as a refresh that re-arms the watchdog — the reader's
-/// equivalent of the stock ESS loop's per-write QTimer re-arm (§4.4). If nothing changes for
+/// equivalent of the stock daemon's per-write QTimer re-arm (§4.4). If nothing changes for
 /// longer than `WATCHDOG`, the optimiser is presumed dead and we revert to normal ESS.
 /// Reverting is always fail-safe (back to the user's static setpoint and feed-in policy),
 /// so a legitimately constant override that trips the watchdog only costs optimisation,
@@ -154,7 +159,7 @@ impl Dess {
         }
 
         // Watchdog: if an override was armed and has gone stale, fail safe to normal ESS —
-        // exactly the stock ESS loop's invalidateOverrides: setpoint → configured, feed-in → follow.
+        // exactly the stock daemon's invalidateOverrides: setpoint → configured, feed-in → follow.
         let stale = self.armed && now.duration_since(self.last_activity) > WATCHDOG;
         if stale {
             self.armed = false;

@@ -1,31 +1,31 @@
 //! Shore / genset AC-input current limiter (peak-shaving), subsystem #7.
 //!
-//! Ports the stock ESS loop's `` shore/peak-shave tick. the stock ESS loop never
+//! Ports the stock daemon's `the stock code` shore/peak-shave tick. the stock daemon never
 //! shaves in software: it dynamically *overrides* the Multi's VE.Bus firmware
 //! AC-input current limit, per phase, by writing `/Hub4/L{n}/OverruledShoreLimit`
 //! (Amps) on the vebus service. The firmware then PowerAssists from the battery to
 //! keep the current under that limit. We decide the limit; the firmware does the
-//! shaving. See the design notes (its §6 is the drop-in spec).
+//! shaving. See ../../re/shore-peakshave.md (its §6 is the drop-in spec).
 //!
 //! Two behaviours, both implemented here:
 //!   * DORMANT (this install): `Settings/CGwacs/AcInputLimit = -1` -> the getter is
 //!     NaN, the per-phase write loop is skipped, and `OverruledShoreLimit` is NEVER
 //!     touched. A no-op is behaviourally exact (proved in spec §5). `tick` returns
 //!     `active=false` with every phase `None` (leave the path alone), matching
-//!     the stock ESS loop which does not clear it.
-//!   * ACTIVE (a breaker/inlet limit is configured): the first-order IIR
-//!         state[n] = 0.8*old + 0.2*((AcInputLimit - meter_I[n]) + multi_I[n])
+//!     the stock daemon which does not clear it.
+//!   * ACTIVE (a breaker/inlet limit is configured): the reversed first-order IIR
+//!     `state[n] = 0.8*old + 0.2*((AcInputLimit - meter_I[n]) + multi_I[n])`
 //!     converges the written limit toward the configured Amps, gently slewed so the
 //!     firmware limit never steps. We write `max(0, state)` to impose, or the
 //!     `3270.0` "unlimited" sentinel to release (charging / force-charge /
 //!     below-min-SOC / non-physical negative state).
 //!
-//! Constants (0.8/0.2 IIR, 3270 sentinel) are read straight from the reference implementation
+//! Constants (0.8/0.2 IIR, 3270 sentinel) are read straight from the binary
 //! `.rodata` (spec §4.1). `AcInputLimit` is in AMPS (−1 = unlimited).
 //!
 //! SAFETY: when `AcInputLimit` is unset / −1 / NaN we do NOT impose a limit and we
 //! do NOT clamp AC-in to 0 — we leave `OverruledShoreLimit` untouched, exactly as
-//! the stock ESS loop does. The impose value is `max(0, state)` so a written limit is never
+//! the stock daemon does. The impose value is `max(0, state)` so a written limit is never
 //! negative; a state that goes negative triggers a *release* (sentinel), never a
 //! non-physical negative current limit reaching the firmware.
 
@@ -89,6 +89,7 @@ impl ShoreWrite {
 /// source); `false` when dormant (no limit / external meter) — in which case every
 /// `writes` entry is `None` and no path is touched.
 #[derive(Default)]
+#[cfg_attr(not(test), allow(dead_code))] // fields are test/diagnostic surface
 pub struct ShoreOut {
     /// Resolved value for L1 in Amps — the filtered limit when imposing, or the
     /// `3270.0` sentinel when releasing. NaN means "L1 left untouched" (dormant, or no
@@ -98,7 +99,7 @@ pub struct ShoreOut {
     /// True while the subsystem actively manages the limit; false = dormant/untouched.
     pub active: bool,
     /// Full per-phase decision, index 0 = L1. `None` = leave that dbus path untouched
-    /// (matches the stock ESS loop, which never clears `OverruledShoreLimit`).
+    /// (matches the stock daemon, which never clears `OverruledShoreLimit`).
     pub writes: Vec<Option<ShoreWrite>>,
 }
 
@@ -108,7 +109,7 @@ pub struct ShoreOut {
 pub struct ShoreLimiter {
     /// Per-phase IIR state (Amps), L1..L3. `None` = not yet seeded (treated as 0.0,
     /// spec's `DAT_00046970` filter seed). Persistent across ticks and across
-    /// dormant/active transitions, exactly like the stock ESS loop's QVector.
+    /// dormant/active transitions, exactly like the stock daemon's QVector.
     filt: [Option<f64>; MAX_PHASES],
     /// Active phase count (1 for this single-phase install; only L1 exists).
     phases: u8,
@@ -164,6 +165,7 @@ impl ShoreLimiter {
         }
 
         let mut writes = writes;
+        #[allow(clippy::needless_range_loop)] // n indexes three parallel per-phase arrays
         for n in 0..n_phases {
             // Missing/non-finite data this tick -> leave THIS phase untouched, keep its
             // filter memory intact (do not seed it with garbage).
@@ -175,7 +177,7 @@ impl ShoreLimiter {
             };
 
             let old = self.filt[n].filter(|v| v.is_finite()).unwrap_or(0.0);
-            // first-order IIR: meter_I and multi_I are the same physical
+            // Reversed first-order IIR: meter_I and multi_I are the same physical
             // current from two sensors, so error ≈ limit + tracking gap; state slews
             // toward the configured Amps.
             let error = (limit - mi) + vi;
@@ -200,7 +202,7 @@ impl ShoreLimiter {
 
     /// Live-mode write: apply a tick's decision to the vebus service. Only phases with
     /// `Some(..)` are written; `None` phases are left untouched. The setter writes
-    /// unconditionally (no change-suppression), matching the stock ESS loop's ``.
+    /// unconditionally (no change-suppression), matching the stock daemon's `the stock code`.
     pub fn write(&self, bus: &dyn Bus, out: &ShoreOut) -> Result<(), String> {
         for (i, w) in out.writes.iter().enumerate() {
             if let Some(w) = w {
@@ -241,7 +243,7 @@ impl ShoreLimiter {
     }
 }
 
-/// Port of ``'s impose-vs-release predicate (spec §6.5). Exact predicate
+/// Port of the stock loop's impose-vs-release predicate (spec §6.5). Exact predicate
 /// is Medium confidence; this is the safe, behaviour-matching approximation.
 /// `true` -> release (write the sentinel); `false` -> impose the filtered limit.
 pub fn should_release(
@@ -260,7 +262,7 @@ pub fn should_release(
 }
 
 /// Read `CGwacs/AcInputLimit` as Amps, mapping Victron's −1 "unlimited" / any negative
-/// / missing / non-finite value to `None` (dormant). The getter (``)
+/// / missing / non-finite value to `None` (dormant). The stock getter
 /// returns NaN for a negative setting; we return `None` for the same cases so the
 /// caller never imposes a limit when none is configured.
 pub fn read_ac_input_limit(bus: &dyn Bus) -> Option<f64> {
@@ -457,7 +459,7 @@ mod tests {
     #[test]
     fn release_still_advances_the_filter() {
         // Release chooses the sentinel to WRITE, but the IIR state must keep tracking,
-        // so a later impose resumes from the right place (matches the stock ESS loop: the
+        // so a later impose resumes from the right place (matches the stock daemon: the
         // filter update precedes the impose/release choice).
         let mut sh = ShoreLimiter::new(1);
         let _ = sh.tick(Some(16.0), false, &[Some(10.0)], &[Some(10.0)], true);

@@ -326,8 +326,9 @@ assert!(st.owner_us, "still owning after the window");
 fn golden_window_tail_ema_replay_is_tick_exact() {
 // (t, grid, reported, soc, ovr_fc, ovr_maxdis, acout, expected_write) — live rows;
 // stock's own writes tracked the same path within its 2.5 s cadence.
+type TailRow = (f64, f64, f64, f64, bool, f64, f64, f64);
 #[rustfmt::skip]
-let rows: &[(f64, f64, f64, f64, bool, f64, f64, f64)] = &[
+let rows: &[TailRow] = &[
     (71647.0, 1569.7,  925.0, 89.0, true,  f64::NAN, 79.0, -624.0),
     (71648.0, 1566.4,  926.0, 89.0, true,  f64::NAN, 72.0, -630.0),
     (71649.0, 1569.9,  927.0, 89.0, true,  f64::NAN, 61.0, -634.0),

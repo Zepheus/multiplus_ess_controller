@@ -181,7 +181,7 @@ impl RlsModel {
         let pphi0 = self.p00 + self.p01 * x;
         let pphi1 = self.p01 + self.p11 * x;
         let denom = self.lambda + (pphi0 + pphi1 * x);
-        if !(denom > 0.0) || !denom.is_finite() {
+        if denom <= 0.0 || !denom.is_finite() {
             return; // numerically degenerate — skip rather than blow up
         }
         let k0 = pphi0 / denom;
@@ -313,6 +313,7 @@ impl Controller {
     /// + blocked learn gate = permanent export).
     pub const I_ERR_CLIP_W: f64 = 100.0;
 
+    #[allow(clippy::too_many_arguments)] // the tick's full sensor set; a struct would just rename the problem
     pub fn update(
         &mut self,
         grid: f64,

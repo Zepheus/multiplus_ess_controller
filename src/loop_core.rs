@@ -153,6 +153,7 @@ pub mod plant {
     #[allow(dead_code)]
     pub const DELAY_S: usize = 1;
     /// Meter-chain staleness of the grid reading as seen by the loop.
+    #[cfg_attr(not(test), allow(dead_code))] // test-consumed API
     pub const METER_LAG_S: usize = 1;
 }
 

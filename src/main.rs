@@ -582,7 +582,7 @@ fn main() {
         // convergence is observable (essential in --ff-mode observe, where nothing else
         // reveals what the model would do). Cheap: ~once/minute at a 1 s interval.
         if let Some(ff) = st.ctrl.ff_snapshot(snap.s.reported) {
-            if tick == 0 || tick % 60 == 0 {
+            if tick == 0 || tick.is_multiple_of(60) {
                 eprintln!(
                     "[t={t:.0}] MODEL: a={:.1}W b={:.4} ({:.1}% of load) conf={:.2} @load={:.0}W",
                     ff.a,
