@@ -36,19 +36,37 @@ actual import), because the inverters slightly under-achieve their commanded AC-
 power and the stock loop has no integral term to trim that residual out. Over a day this
 is a steady, avoidable import cost.
 
-This controller takes the setpoint loop (`Hub4Mode` 1 → 3) and runs a loop **with
-integral action**, driving the grid meter onto the setpoint regardless of the
-inverter's few-percent deficit. On top of the integral it can **learn your system's
-own leak-vs-load curve** and pre-compensate it, so the gap is corrected *instantly*
-after a load change instead of after the integral catches up (see *Tuning it to your
-system*). It only ever discharges/idles within limits and hands control back to the
-stock firmware for anything outside a safe envelope (see Safety).
+This controller takes the setpoint loop (`Hub4Mode` 1 → 3) and runs the stock law
+**plus three additions the stock loop never had**:
 
-Two parts:
+1. **Integral action** — drives the grid meter onto the setpoint and kills the
+   standing leak (live-validated: median error ~+1 W vs stock's +19 W).
+2. **A leak feed-forward** — your system's leak-vs-load curve, either learned
+   online (`--ff-mode observe` to learn without acting) or measured once and
+   frozen (`--ff-mode frozen --ff-a <a> --ff-b <b>`, the recommended config),
+   so the correction is instant after load changes.
+3. **Smith-predictor meter-lag compensation** (`--no-smith` to disable) — grid
+   meters report ~1 s stale; during the controller's own ramps that staleness
+   causes overshoot and export spikes at appliance step-offs. The compensation
+   corrects the stale reading using the controller's own write history and an
+   identified inverter-response model. On a 500+-event library this beats the
+   stock loop on export, import AND export duration simultaneously.
 
-- **`/` (Rust crate)** — the on-device controller. Static ARM binary, no runtime deps.
-- **`simulator/` (Python)** — an offline sandbox with a validated plant model to
-  experiment with control laws (stock / integral / PI) before running anything live.
+Everything else deliberately mimics the stock loop exactly (write smoothing,
+no-charge rule outside charge regimes, force-charge/window handling — all
+verified against live captures to the watt). It only ever discharges/idles
+within limits and hands control back to the stock firmware for anything outside
+a safe envelope (see Safety).
+
+Layout: the Rust crate is the on-device controller (static ARM binary, no
+runtime deps); `src/tests/` holds the cross-module golden suites including a
+replay harness with the identified plant + meter model and **postdiction
+gates** (the simulator must reproduce captured live events before its
+predictions count); `tools/event_scoreboard.py` scores any live session
+per-event against baselines; `docs/AB-PROTOCOL.md` is the pre-registered
+live-testing protocol. (`simulator/` is the original Python sandbox, kept for
+reference — the maintained simulation is the Rust harness with the identified
+plant model.)
 
 ## Build (cross-compile from macOS/Linux to the GX)
 
@@ -68,13 +86,19 @@ Needs Rust ≥ 1.87 (the `zbus` 5 MSRV); any current stable works.
 ./multiplus_ess_controller --stage shadow --controller stock    --seconds 30
 ./multiplus_ess_controller --stage shadow --controller adaptive --telemetry /run/ess.csv --quiet
 
-# live (double-gated): takes Hub4Mode=3 within the safety envelope, restores on exit
+# live (double-gated): takes Hub4Mode=3 within the safety envelope, restores on exit.
+# Recommended config: frozen feed-forward at your measured leak curve + Smith:
 VENUS_ESS_LIVE=I_UNDERSTAND ./multiplus_ess_controller --stage takeover --confirm \
-    --controller adaptive --seconds 900 --min-soc 20
+    --controller adaptive --ff-mode frozen --ff-a -4.9 --ff-b -0.046 --ki 0.02 \
+    --seconds 1800 --min-soc 20
 ```
 
 Controllers: `stock` (reference, no fix), `true-integral`, `pi`, and `adaptive`
-(`pi` + a self-learning feed-forward — see *Tuning it to your system* below).
+(`pi` + the leak feed-forward). `adaptive` has three `--ff-mode`s: `frozen`
+(apply a measured curve — recommended), `observe`/`learn-only` (act as plain
+PI while the model learns for inspection), and `apply` (closed-loop learning —
+carries a documented cold-start fragility; see the notes in `src/tests/replay.rs`
+before using it unattended). Smith compensation is on by default (`--no-smith`).
 
 ## Install as a service (Venus OS, daemontools)
 
@@ -105,6 +129,11 @@ svc -d /service/venus-ess           # stop (supervise keeps it down)
 svc -u /service/venus-ess           # start again
 tail -f /run/venus-ess-svclog/current   # timestamped stderr/stdout (tmpfs, bounded)
 ```
+
+`deploy/` also ships **`guard-service/`** — an independent watchdog that
+restores the stock loop's authority (`Hub4Mode=1`) within 60 s whenever the
+controller is not running, so a killed process can never leave the system
+ownerless; `rc.local` installs it alongside and adds a boot-time restore.
 
 The shipped `deploy/service/run` starts the **shadow stage (read-only)**. To
 promote a validated install, edit the `exec` line's flags (`--stage`, the
@@ -199,15 +228,21 @@ fine, the offset + integral still hold target.
 
 ### Suggested rollout
 
-1. **Shadow with `stock`** for an evening — no writes; confirm the reimplementation matches
-   your device's real commands and measure your leak (grid minus setpoint):
-   `--stage shadow --controller stock`
-2. **Supervised takeover with `--ff-learn-only`** — drives with the plain integral (already
-   fixes the steady-state leak) while the model learns on the side; watch the `MODEL:` line
-   converge and sanity-check `a`/`b` against the leak measured in step 1.
-3. **Let the feed-forward act** — either re-run with the learned numbers as a seed
-   (`--controller adaptive --ff-a <a> --ff-b <b>`) or simply run plain `--controller
-   adaptive` and let it re-learn; it keeps adapting either way.
+1. **Shadow with `stock`** for a few days — no writes; confirm the
+   reimplementation matches your device's real commands (expect a few watts
+   median) and collect the transient event library.
+2. **Fit your leak curve** from the shadow data: regress the inverter's
+   reported power against the written setpoint on steady rows; the residual
+   line `bias(x) = a + b·x` is your `--ff-a`/`--ff-b`. (Learn-only takeover
+   sessions can do this online instead: `--ff-mode observe`, watch `MODEL:`.)
+3. **Short supervised takeover sessions** with `--ff-mode frozen` + your curve,
+   following `docs/AB-PROTOCOL.md`: pre-registered abort criteria, and judge
+   each session with `tools/event_scoreboard.py` per-event against your own
+   stock baseline — never by eyeball or aggregate medians alone.
+4. Promote to the daily driver once ~10 transient events score at-or-better
+   than your stock baseline. Note: the `MODEL:` log line's `conf` shows the
+   covariance snapshot and reads low in frozen mode — frozen actuates at full
+   authority regardless.
 
 ### Advanced knobs (rarely needed — defaults are sensible)
 
@@ -266,7 +301,12 @@ only configuration it has actually run on. Treat anything else as untested.
 
 ## Status
 
-Experimental. Built and validated in **shadow mode** on real hardware; the stock law
-reproduces the device's actual commands within a few watts, and the leak it corrects is
-confirmed live (~20 W fixed + ~4 % of load on the test system). **Not run live** in this
-initial cut — the mode-1→3 cutover is intended to be done supervised.
+Experimental but **live-validated**. On the reference system: five days of
+shadow at watt-level fidelity to the stock loop (including scheduled-charge
+windows and low-SOC dispatches), followed by supervised live takeover
+sessions. Measured live: standing grid error ~+1 W vs the stock loop's +19 W
+(the leak, fixed), appliance step-off export peaks at-or-shallower than the
+stock loop's own class, zero charging outside charge regimes, clean
+hand-backs. The full-adaptive learning mode remains the one experimental
+corner (cold-start fragility, documented in the test suite) — use `frozen`
+or `observe`. Run live sessions supervised and follow `docs/AB-PROTOCOL.md`.
