@@ -96,7 +96,7 @@ extern "C" fn on_signal(_sig: i32) {
 // one hardware number (`loop_core::HARD_CLAMP_W` = inverter pair continuous x margin).
 use loop_core::HARD_CLAMP_W;
 
-/// The rollout ladder, selected with `--stage` (see re/ROLLOUT-AND-FAILSAFE.md). Each rung
+/// The rollout ladder, selected with `--stage`. Each rung
 /// is strictly larger-authority than the previous; `writes()` marks the ones that touch the
 /// live battery system and therefore require the double-gate.
 ///   Shadow (0)   read-only: compute what we WOULD do, compare to stock, never write.

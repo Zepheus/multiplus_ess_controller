@@ -6,9 +6,8 @@
 //! `/PvPowerLimiterActive` and `/Pv/Disable`, plus the `PvPowerSetpointOffset`
 //! feed-forward the grid-setpoint loop pre-compensates with.
 //!
-//! Reverse-engineered from `com.victronenergy.hub4` 1.3.25 (`PVPowerLimiter` +
-//! `PVInverter`). See ../../re/pv-limiter.md; the constants below are read exact from
-//! the binary `.rodata`.
+//! Matches the stock PV-limiter behavior; the constants below are the stock
+//! values reproduced exactly.
 //!
 //! THIS INSTALL HAS NO PV and runs ESS External Control (Hub4Mode 3), where the
 //! limiter is doubly dead (no inverters + mode gate). The behaviourally-exact output
@@ -36,15 +35,15 @@ const P_STATUSCODE: &str = "/StatusCode"; // int: run state
 /// Settings export cap read for the proportional "allowed total" (NaN if unset).
 const P_MAXFEEDIN: &str = "/Settings/CGwacs/MaxFeedInPower";
 
-// --- extracted constants (exact, from the stock daemon .rodata; see re/pv-limiter.md §4.1) ---
-const RELEASE_W: f64 = 200_000.0; // DAT_00051730 "no limit / release" sentinel
-const CURTAIL_W: f64 = 0.0; // DAT_00051738 curtail-to-zero
-const RAMP_FRAC: f64 = 0.01; // DAT_00050350 ramp step = max(1%·MaxPower, 50 W)
-const RAMP_MIN_W: f64 = 50.0; // DAT_00050358
-const DEADBAND_FRAC: f64 = 0.02; // DAT_00050218 min meaningful step: 2%·MaxPower
-const FAST_THROTTLE: f64 = 0.015; // DAT_00051e60 aggressive cut when battery-full
-const OFF_EMA_NEW: f64 = 0.6; // DAT_00051210 feed-forward EMA new-sample weight
-const OFF_EMA_OLD: f64 = 0.4; // DAT_00051218 feed-forward EMA history weight
+// --- stock constants (reproduced exactly) ---
+const RELEASE_W: f64 = 200_000.0; // a stock constant "no limit / release" sentinel
+const CURTAIL_W: f64 = 0.0; // a stock constant curtail-to-zero
+const RAMP_FRAC: f64 = 0.01; // a stock constant ramp step = max(1%·MaxPower, 50 W)
+const RAMP_MIN_W: f64 = 50.0; // a stock constant
+const DEADBAND_FRAC: f64 = 0.02; // a stock constant min meaningful step: 2%·MaxPower
+const FAST_THROTTLE: f64 = 0.015; // a stock constant aggressive cut when battery-full
+const OFF_EMA_NEW: f64 = 0.6; // a stock constant feed-forward EMA new-sample weight
+const OFF_EMA_OLD: f64 = 0.4; // a stock constant feed-forward EMA history weight
 /// Hub4Mode value that gates the limiter fully off (External Control).
 const HUB4MODE_EXTERNAL: i32 = 3;
 
@@ -67,11 +66,11 @@ impl PvOut {
 
 /// Shared, battery-derived context the limiter needs but does not own. Produced once
 /// per tick by the battery-limit subsystem (#2/#3) and the setpoint loop, and passed
-/// in so both read one consistent snapshot (re/pv-limiter.md §6.3). The no-PV stub
+/// in so both read one consistent snapshot. The no-PV stub
 /// path ignores it entirely, so `Default` is safe for the stub caller.
 #[derive(Clone, Copy, Debug)]
 pub struct PvContext {
-    /// Watts the battery can still absorb (stock behavior). The absorb sink size.
+    /// Watts the battery can still absorb. The absorb sink size.
     pub charge_headroom_w: f64,
     /// Battery cannot absorb meaningfully more (charge state "full").
     pub battery_full: bool,
@@ -113,7 +112,7 @@ impl PvInverter {
             service,
         }
     }
-    /// "producing / online" (stock behavior): running StatusCode {7,11,12} OR Ac/Power > 0.
+    /// "producing / online": running StatusCode {7,11,12} OR Ac/Power > 0.
     fn producing(&self) -> bool {
         matches!(self.status, Some(7 | 11 | 12)) || self.ac_power.is_some_and(|p| p > 0.0)
     }
@@ -124,7 +123,7 @@ impl PvInverter {
 }
 
 pub struct PvLimiter {
-    offset_ema: f64,          // per-phase feed-forward state (+0x38); NaN until first sample
+    offset_ema: f64,          // per-phase feed-forward state; NaN until first sample
     active: bool,             // -> /PvPowerLimiterActive
     disabled: bool,           // -> /Pv/Disable
     writes: Vec<(String, f64)>, // Ac/PowerLimit writes issued this tick (for inspection/tests)
@@ -146,7 +145,7 @@ impl PvLimiter {
 
     /// Read live PV, recompute limits, write `Ac/PowerLimit`, and return the hub4
     /// flags + feed-forward. Call once per main-loop tick, AFTER the battery limits
-    /// (so `ctx.charge_headroom_w` is fresh — re/pv-limiter.md §6.4).
+    /// (so `ctx.charge_headroom_w` is fresh).
     pub fn tick(&mut self, bus: &dyn Bus, ctx: PvContext) -> PvOut {
         self.writes.clear();
 
@@ -185,7 +184,7 @@ impl PvLimiter {
         }
     }
 
-    /// `updateLimits()` port (re/pv-limiter.md §4.2). Decides the global posture, writes
+    /// Global-posture update. Decides the global posture, writes
     /// each inverter's `Ac/PowerLimit`, and sets `active`/`disabled`.
     fn update_limits(&mut self, bus: &dyn Bus, inverters: &[PvInverter], ctx: &PvContext) {
         // 1. Nothing to limit -> release everyone to the sentinel.
@@ -272,7 +271,7 @@ impl PvLimiter {
         self.disabled = false;
     }
 
-    /// `updatePower()` feed-forward port (re/pv-limiter.md §4.3), collapsed to one phase.
+    /// Feed-forward update, collapsed to one phase.
     /// EMA (0.6·new + 0.4·prev) of the PV currently being produced; the caller adds this
     /// into the grid-setpoint bias so the Multi anticipates the PV inverter's slow report.
     fn update_power(&mut self, inverters: &[PvInverter]) -> f64 {

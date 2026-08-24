@@ -18,8 +18,8 @@
 //! source reads 1 (grid); the genset branches are cold code here and kept behind
 //! `is_genset()` guards so a future input reconfiguration can never silently back-feed.
 //!
-//! Reverse-engineered against the stock daemon 1.3.25 (Venus OS v3.75). See
-//! ../../re/generator.md (its §6 is the drop-in spec this module implements).
+//! Matches the stock ESS behavior (Venus OS v3.75) as the drop-in spec this
+//! module implements.
 //!
 //! Safety posture:
 //!   * Unknown / missing / unmapped source read  => grid-like (safe default: never
@@ -28,7 +28,7 @@
 //!   * `/Hub4/TargetPowerIsMaxFeedIn` absent (old firmware) => never written; the
 //!     genset then relies on `DisableFeedIn` / `DoNotFeedInOvervoltage=1` to block
 //!     back-feed.
-//!   * Sticky-genset (safe-direction divergence from the binary): once source==2 has
+//!   * Sticky-genset (safe-direction divergence from stock): once source==2 has
 //!     been observed, a *dropped* read (None) holds Genset rather than flipping to
 //!     grid-like for a tick — a transient read glitch must never re-enable export
 //!     toward a physical generator. An *explicit* non-genset value (incl. 0/240) is
@@ -63,7 +63,7 @@ pub enum AcSource {
 
 impl AcSource {
     /// Map a raw `Ac/ActiveIn/Source` read. `None` (invalid `[]` / read fail) and any
-    /// unmapped integer fall to `Unknown` => grid-like (matches the binary's non-genset
+    /// unmapped integer fall to `Unknown` => grid-like (matches the stock non-genset
     /// defaults of 0 on the flag path / 3 on the tick).
     pub fn from_dbus(v: Option<i32>) -> Self {
         match v {
@@ -85,7 +85,7 @@ impl AcSource {
     }
 }
 
-/// Feed-in mode tri-state (the stock daemon `FUN_000458cc`, stored at ControlLoop+0x28).
+/// Feed-in mode tri-state (the stock loop's feed-in posture).
 /// **2** = normal grid tracking (export allowed); **1** = charge as hard as possible,
 /// no feed-in; **0** = TPIMFI (setpoint reinterpreted as a max-feed-in cap, Multi
 /// self-charges). A genset can only ever be `Tpimfi` or `ChargeHard`.
@@ -97,7 +97,7 @@ pub enum FeedMode {
 }
 
 /// Force-charge context from the (not-yet-built) force-charge / feed-in subsystem
-/// (see re/feedin-sustain.md). All-false `Default` yields grid `Normal`, which is the
+/// All-false `Default` yields grid `Normal`, which is the
 /// correct grid-only stub for THIS install. The genset branch ignores every field.
 #[derive(Clone, Copy, Default)]
 pub struct ForceChargeCtx {
@@ -123,7 +123,7 @@ pub struct GenOut {
     pub mode: FeedMode,
 }
 
-/// Pure port of the stock daemon's feed-in mode tri-state (`FUN_000458cc`, §4.1).
+/// Pure port of the stock loop's feed-in mode tri-state.
 fn feed_mode(
     source: AcSource,
     dvcc: bool,

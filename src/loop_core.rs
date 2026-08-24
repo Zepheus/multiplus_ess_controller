@@ -1,5 +1,4 @@
 //! Pure decision core — the `decide()` phase of the sample/decide/actuate split
-//! (re/ROLLOUT-AND-FAILSAFE.md §3.1).
 //!
 //!   sample()  (main.rs)  — does EVERY bus read, packs a `Snapshot`. The only reader.
 //!   decide()  (here)     — PURE, total: `Snapshot × LoopState → Decision`. No I/O, so the
@@ -377,7 +376,7 @@ pub fn composed_command(
     if let Some(fc) = snap.sg.cmd_override {
         // Force charge. TPIMF (mode 0): keep writing the normal-law value capped at
         // Σ max-charge — the firmware charges maximally on its own and reinterprets the
-        // setpoint as a feed-in cap, so the value may legitimately go negative (§4a-4;
+        // setpoint as a feed-in cap, so the value may legitimately go negative (stock
         // live-verified 2026-08-16 across a full 6 h window: stock writes the raw normal
         // law, median |Δ| 2.5 W). Legacy (mode 1): the setpoint IS the charge command.
         cmd = if snap.sg.tpimf { cmd.min(fc) } else { fc };
@@ -1363,7 +1362,7 @@ mod tests {
         assert!(d.safety.dt_clamped && d.safety.any());
     }
 
-    // Full-loop replay (§3.2): drive the WHOLE composed decision over the real captured trace
+    // Full-loop replay (stock behavior): drive the WHOLE composed decision over the real captured trace
     // (both discharge 256 + scheduled-charge 259 regimes). Crucially the per-row command bounds
     // and force-charge decision come from the PRODUCTION code (battery_limits::BatteryBroker +
     // socguard::SocGuard fed by the row's own dbus values) — not hand-rolled constants — so this

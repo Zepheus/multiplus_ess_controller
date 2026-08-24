@@ -2,32 +2,32 @@
 //!
 //! This is the subsystem the setpoint loop (`control.rs` + the `main.rs` envelope)
 //! does NOT cover: it owns the VE.Bus feed-in / export *flags* and mirrors the
-//! firmware's Sustain state into our discharge policy. Reverse-engineered from
-//! the stock daemon 1.3.25 (Venus OS v3.75); see ../../re/feedin-sustain.md §4 and §6.
+//! firmware's Sustain state into our discharge policy. The behavior is a drop-in
+//! match for the stock daemon shipped with Venus OS v3.75.
 //!
 //! Everything here is *policy above the VE.Bus firmware*. Five outputs, all written
 //! to the Multi's vebus service (`VEBUS`), never to our own hub4 service:
-//!   * `/Hub4/DisableFeedIn`          (§4.2)
-//!   * `/Hub4/DoNotFeedInOvervoltage` (§4.3, gated on firmware support)
-//!   * `/Hub4/TargetPowerIsMaxFeedIn` (§4.4, gated on firmware support)
-//!   * `/Hub4/FixSolarOffsetTo100mV`  (§4.5)
-//!   * `/Hub4/L{n}/MaxFeedInPower`    (§4.6, gated on firmware support)
+//!   * `/Hub4/DisableFeedIn`
+//!   * `/Hub4/DoNotFeedInOvervoltage` (gated on firmware support)
+//!   * `/Hub4/TargetPowerIsMaxFeedIn` (gated on firmware support)
+//!   * `/Hub4/FixSolarOffsetTo100mV`
+//!   * `/Hub4/L{n}/MaxFeedInPower`    (gated on firmware support)
 //!
-//! plus the DC-overvoltage charge-stop integrator (§4.11), whose `ov_accum` the
+//! plus the DC-overvoltage charge-stop integrator, whose `ov_accum` the
 //! setpoint law consumes to zero any *positive* (charging) command.
 //!
-//! TWO correctness invariants that shape the whole module (spec §6 preamble):
+//! TWO correctness invariants that shape the whole module:
 //!   1. **Sustain is FIRMWARE-owned.** We only READ `/Hub4/Sustain` and mirror it
 //!      into our discharge budget (-> DisableFeedIn=1, discharge clamp 0). We NEVER
 //!      write it, and there is no sustain-voltage/hysteresis logic to port — the
 //!      ESS assistant runs that even in mode 3.
 //!   2. **"Overvoltage" here is the DC bus, not AC grid voltage.**
-//!      `DoNotFeedInOvervoltage` gates *DC-coupled PV excess* feed-in; the §4.11
+//!      `DoNotFeedInOvervoltage` gates *DC-coupled PV excess* feed-in; the charge-stop
 //!      integrator watches `Vdc` vs the BMS charge voltage. We deliberately DO NOT
 //!      add an AC grid-code over-voltage trip — that lives in the Multi's grid-code
 //!      firmware, and faking it here would double-act and be unsafe.
 //!
-//! Scope note: this is a DC-coupled, PV-less, single-Multi install. Per §6.9 the
+//! Scope note: this is a DC-coupled, PV-less, single-Multi install. The
 //! AC-PV-inverter curtailment and the `OverruledShoreLimit` peak-shave path are
 //! out of scope (they need grid-meter per-phase current/voltage wiring we do not
 //! do here). Their absence is faithful for this site: with no shore-limit IIR we
@@ -36,8 +36,8 @@
 
 use crate::dbus::*;
 
-// --- wire-contract constants (lifted verbatim; the GUI, modbus registers and Multi
-// firmware all expect these exact values — spec §6.4 / §6.8). ---
+// --- wire-contract constants (the GUI, modbus registers and Multi firmware all
+// expect these exact values). ---
 const MAXFEEDIN_UNLIMITED: f64 = 200_000.0; // sentinel: "no feed-in limit"
 const SLEW_UP_NEW: f64 = 0.6; // upward IIR on MaxFeedInPower: new = 0.6*new + 0.4*prev
 const SLEW_UP_PREV: f64 = 0.4; // downward steps are immediate
@@ -49,14 +49,14 @@ const AC_SOURCE_GENERATOR: i32 = 2; // /Ac/ActiveIn/Source == 2 => genset (never
 const BL_SUSTAIN_STATE: i32 = crate::states::bl::SUSTAIN; // firmware Sustain
 const MAX_PHASES: usize = 4; // single vebus service: totals + L1..L3
 
-/// BatteryLife states at/below the SOC floor: {5,6,8,11,12} (the `(0xCB>>(s-5))&1`
-/// bitmask from the binary). In these states feed-in is disabled unless peak shaving
+/// BatteryLife states at/below the SOC floor: {5,6,8,11,12}, the exact set the
+/// stock daemon uses. In these states feed-in is disabled unless peak shaving
 /// must stay available.
 fn is_floor_state(state: i32) -> bool {
     matches!(state, 5 | 6 | 8 | 11 | 12)
 }
 
-// --- local dbus path consts (spec §2 / §6.6). Reused from `dbus.rs`: SETTINGS, SYS,
+// --- local dbus path consts. Reused from `dbus.rs`: SETTINGS, SYS,
 // VEBUS, P_SUSTAIN, P_DC_VOLTAGE, P_DVCC, P_HUB4MODE, P_MAXDISCHARGE, P_BL_STATE,
 // P_BL_MINSOC. ---
 const P_OVERVOLTAGE_FEEDIN: &str = "/Settings/CGwacs/OvervoltageFeedIn"; // SETTINGS, bool
@@ -130,7 +130,7 @@ pub fn restore_flags(bus: &dyn Bus, snap: &FlagSnapshot) {
     }
 }
 
-/// The feed-in tri-state (spec §4.1). The exact numeric values are not written to the
+/// The feed-in tri-state (stock behavior). The exact numeric values are not written to the
 /// bus (we write the *derived* flags), but the three-way choice drives every flag.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FeedInMode {
@@ -143,13 +143,13 @@ pub enum FeedInMode {
     Normal,
 }
 
-/// External `/Overrides/*` (served by the hub4 D-Bus server, spec §6.2). Until that
-/// server exists, defaults apply: no override. All fields are volatile per the binary's
-/// invalidate-overrides watchdog.
+/// External `/Overrides/*` (served by the hub4 D-Bus server). Until that
+/// server exists, defaults apply: no override. All fields are volatile, matching
+/// the stock daemon's invalidate-overrides watchdog.
 #[derive(Clone, Copy)]
 pub struct Overrides {
     /// Live merged discharge bound from the battery broker ∧ SocGuard (W; NaN = unknown/
-    /// unlimited). Feeds canDischarge (§4.2) so a BMS alarm (DCL → 0), an ephemeral
+    /// unlimited). Feeds canDischarge (stock behavior) so a BMS alarm (DCL → 0), an ephemeral
     /// override, or a BL no-discharge state disables feed-in exactly as stock does —
     /// without this, feed-in excess could drain the battery around the setpoint clamp.
     pub discharge_bound_w: f64,
@@ -165,7 +165,7 @@ impl Default for Overrides {
     }
 }
 
-/// Raw per-tick reads (spec §6.6). `None` / NaN sentinels are handled by the caller.
+/// Raw per-tick reads (stock behavior). `None` / NaN sentinels are handled by the caller.
 struct Inputs {
     multi_state: Option<f64>, // /State — None => invalid => gate the whole tick
     hub4mode: i32,
@@ -192,7 +192,7 @@ fn neg1_nan(v: Option<f64>) -> f64 {
     }
 }
 
-/// Write-if-changed cache. We mirror the binary's write-only-on-change setters so the
+/// Write-if-changed cache. We mirror the stock daemon's write-only-on-change setters so the
 /// MK3 link is never spammed. `None` = never written yet (or path absent on this fw).
 #[derive(Clone, Copy, Default)]
 struct LastWritten {
@@ -205,12 +205,12 @@ struct LastWritten {
 
 pub struct FeedIn {
     mode: FeedInMode,
-    prev_maxfeedin: [f64; MAX_PHASES], // per-phase upward-slew memory (§4.6), init 0
-    ov_accum: f64,                     // DC-overvoltage integrator (§4.11), init 0
+    prev_maxfeedin: [f64; MAX_PHASES], // per-phase upward-slew memory, init 0
+    ov_accum: f64,                     // DC-overvoltage integrator, init 0
     last: LastWritten,                 // write-if-changed cache
-    overrides: Overrides,              // filled by the hub4 server (§6.2); default = none
+    overrides: Overrides,              // filled by the hub4 server; default = none
     // Firmware-support gates, probed once at startup: writes to paths an old Multi does
-    // not publish must be skipped forever (spec §6.6 / §6.8 item 8).
+    // not publish must be skipped forever.
     has_dnfio: bool,
     has_tpimfi: bool,
     has_maxfeedin: bool,
@@ -237,7 +237,7 @@ impl FeedIn {
         }
     }
 
-    /// Update the cached `/Overrides/*` (called by the hub4 server, spec §6.2). Until
+    /// Update the cached `/Overrides/*` (called by the hub4 server). Until
     /// that server exists the defaults from `new` stand.
     pub fn set_overrides(&mut self, ov: Overrides) {
         self.overrides = ov;
@@ -267,12 +267,12 @@ impl FeedIn {
         }
     }
 
-    /// keepCharged (§4.1): BL state 9 or a "keep charged" minimum-SOC setting.
+    /// keepCharged: BL state 9 or a "keep charged" minimum-SOC setting.
     fn keep_charged(&self, i: &Inputs) -> bool {
         i.bl_state == 9 || i.bl_min_soc > KEEPCHARGED_SOC
     }
 
-    /// mustForceCharge (§4.1 / §6.6). `batteryChargeRequested` (BMS `Info/ChargeRequest`)
+    /// mustForceCharge. `batteryChargeRequested` (BMS `Info/ChargeRequest`)
     /// belongs to the battery subsystem and is not read here; defaulting it to false is
     /// safe (it can only *raise* force-charge, never lower it).
     fn must_force_charge(&self, i: &Inputs) -> bool {
@@ -281,7 +281,7 @@ impl FeedIn {
             || matches!(i.bl_state, 8 | 12)
     }
 
-    /// feedInExcessAllowed (§4.1): the override wins if set, else the settings flag.
+    /// feedInExcessAllowed (stock behavior): the override wins if set, else the settings flag.
     fn feed_in_excess_allowed(&self, i: &Inputs) -> bool {
         if self.overrides.feed_in_excess != 0 {
             self.overrides.feed_in_excess == 2
@@ -290,9 +290,9 @@ impl FeedIn {
         }
     }
 
-    /// Feed-in tri-state (§4.1). `fw_tpimfi` = DVCC AND firmware TPIMFI support. The
+    /// Feed-in tri-state (stock behavior). `fw_tpimfi` = DVCC AND firmware TPIMFI support. The
     /// "any shore limit saturated => mode 1" branch is faithfully a no-op here: we do
-    /// not compute the OverruledShoreLimit peak-shave IIR (§6.9), so the input current
+    /// not compute the OverruledShoreLimit peak-shave IIR (stock behavior), so the input current
     /// limit is never reported saturated and the branch is not taken.
     fn compute_mode(&self, i: &Inputs) -> FeedInMode {
         let fw_tpimfi = i.dvcc && self.has_tpimfi;
@@ -309,7 +309,8 @@ impl FeedIn {
             if self.feed_in_excess_allowed(i) {
                 FeedInMode::ForceFlat // force-charge, excess may be sold
             } else {
-                // (else-if any shore saturated => ForceFlat: not reached, see §6.9)
+                // (else-if any shore saturated => ForceFlat: not reached, see the
+                // module scope note — we compute no shore-limit IIR)
                 FeedInMode::Tpimfi // force-charge, feed-in capped by the setpoint
             }
         } else {
@@ -317,8 +318,8 @@ impl FeedIn {
         }
     }
 
-    /// canDischarge (§4.2): the merged discharge budget is `> 0`, OR unknown (NaN =>
-    /// allowed, matching the binary — see §6.8). The budget is the settings
+    /// canDischarge: the merged discharge budget is `> 0`, OR unknown (NaN =>
+    /// allowed, matching the stock daemon). The budget is the settings
     /// `MaxDischargePower` merged with the live broker/SocGuard bound handed in via
     /// `Overrides.discharge_bound_w` (BMS DCL, ephemeral override, BL no-discharge
     /// states), and forced to 0 while Sustain is active or BL state == 7.
@@ -334,16 +335,15 @@ impl FeedIn {
         !max_dis.is_finite() || max_dis > 0.0
     }
 
-    /// Per-phase `/Hub4/L{n}/MaxFeedInPower` targets (§4.6, reduced per §6.9 to
-    /// `total / phases` with upward-only 0.6/0.4 slew — no AC-PV reserve term here).
+    /// Per-phase `/Hub4/L{n}/MaxFeedInPower` targets (stock behavior).
     fn compute_maxfeedin(&mut self, i: &Inputs, excess_ok: bool) -> [f64; MAX_PHASES] {
         let maxfeedin_finite = i.maxfeedin_setting.is_finite();
         let acexport_finite = i.acexport_limit.is_finite();
         let mut out = [f64::NAN; MAX_PHASES];
 
         if excess_ok && !maxfeedin_finite && !acexport_finite {
-            // "Unlimited": write the exact sentinel (no slew), per §4.6's dedicated
-            // branch and §6.8 ("keep the exact sentinels"). Reset slew memory so a later
+            // "Unlimited": write the exact sentinel (no slew) — the stock daemon has a
+            // dedicated branch that keeps the exact sentinel. Reset slew memory so a later
             // finite limit steps down immediately rather than from 200 kW.
             for (o, prev) in out.iter_mut().zip(&mut self.prev_maxfeedin).take(i.phases) {
                 *o = MAXFEEDIN_UNLIMITED;
@@ -354,7 +354,7 @@ impl FeedIn {
 
         // Finite cap. `MaxFeedInPower` unlimited/NaN => 200 kW; AcExportLimit->W
         // conversion needs grid-meter per-phase voltage we do not wire here, so it is
-        // treated as unlimited (documented deviation, §6.6). The min() therefore reduces
+        // treated as unlimited (documented deviation from stock). The min() therefore reduces
         // to the configured MaxFeedInPower when set.
         let total = if maxfeedin_finite {
             i.maxfeedin_setting
@@ -373,7 +373,7 @@ impl FeedIn {
         out
     }
 
-    /// One slow-tick update (spec §6.5). Reads live inputs, computes the flags + the DC-
+    /// One slow-tick update. Reads live inputs, computes the flags + the DC-
     /// overvoltage integrator, updates the write-if-changed cache, and returns the
     /// `Output` (flag snapshot + a `write` method). Pure of side effects on the bus:
     /// the caller decides whether to `Output::write` (live) or discard it (shadow).
@@ -381,9 +381,9 @@ impl FeedIn {
         let i = self.read(bus);
 
         // Gate: Multi /State unreadable => invalid => write nothing, hold last flags,
-        // do not advance the integrator (spec §4.12 / §6.5 step 1). NOTE: unlike the
-        // stock binary we do NOT bail on Hub4Mode==3 — in this full replacement WE are
-        // the mode-3 owner of these vebus flags (spec §6.5/§6.7). `hub4mode` is read only
+        // do not advance the integrator. NOTE: unlike the
+        // stock daemon we do NOT bail on Hub4Mode==3 — in this full replacement WE are
+        // the mode-3 owner of these vebus flags. `hub4mode` is read only
         // to fail safe (unknown => 3) for a future minimal-integration handback.
         if i.multi_state.is_none() {
             return Output::gated(self.mode, self.ov_accum, i.sustain);
@@ -394,7 +394,7 @@ impl FeedIn {
         let excess_ok = self.feed_in_excess_allowed(&i);
         let can_discharge = self.can_discharge(&i);
 
-        // §4.2 /Hub4/DisableFeedIn
+        // /Hub4/DisableFeedIn
         let disable_feedin = if mode == FeedInMode::Tpimfi {
             0 // TPIMFI needs the feed-in path open
         } else if !can_discharge {
@@ -405,7 +405,7 @@ impl FeedIn {
             0
         };
 
-        // §4.3 /Hub4/DoNotFeedInOvervoltage (DC-coupled excess; 0 = allowed)
+        // /Hub4/DoNotFeedInOvervoltage (DC-coupled excess; 0 = allowed)
         let allow_dc_excess = i.ac_source != AC_SOURCE_GENERATOR
             && (self.overrides.feed_in_excess == 2
                 || (self.overrides.feed_in_excess == 0 && i.overvoltage_feedin));
@@ -415,16 +415,16 @@ impl FeedIn {
             i32::from(mode != FeedInMode::Tpimfi) // also 0 in TPIMFI mode
         };
 
-        // §4.4 /Hub4/TargetPowerIsMaxFeedIn
+        // /Hub4/TargetPowerIsMaxFeedIn
         let tpimfi = i32::from(mode == FeedInMode::Tpimfi);
 
-        // §4.5 /Hub4/FixSolarOffsetTo100mV = DVCC
+        // /Hub4/FixSolarOffsetTo100mV = DVCC
         let fix_solar = i32::from(i.dvcc);
 
-        // §4.6 /Hub4/L{n}/MaxFeedInPower
+        // /Hub4/L{n}/MaxFeedInPower
         let maxfeedin = self.compute_maxfeedin(&i, excess_ok);
 
-        // §4.11 DC-overvoltage charge-stop integrator. NaN-safe: a NaN excess makes the
+        // DC-overvoltage charge-stop integrator. NaN-safe: a NaN excess makes the
         // `> 0` test false, resetting the accumulator (never accumulate NaN).
         let excess = i.dc_voltage - OV_CHARGE_FACTOR * i.charge_voltage;
         self.ov_accum = if excess > 0.0 { self.ov_accum + excess * excess } else { 0.0 };
@@ -485,7 +485,7 @@ impl FeedIn {
 #[cfg_attr(not(test), allow(dead_code))] // fields are test/diagnostic surface
 pub struct Output {
     pub mode: FeedInMode,
-    /// DC-overvoltage integrator (§4.11). The setpoint law forces any *positive*
+    /// DC-overvoltage integrator (stock behavior). The setpoint law forces any *positive*
     /// (charging) command to 0 while this exceeds the trip.
     pub ov_accum: f64,
     /// Firmware Sustain (read-only). Mirrors into the discharge budget: while set the
@@ -528,12 +528,12 @@ impl Output {
     }
 
     /// Does the DC-overvoltage integrator currently block charging? The setpoint law
-    /// forces any positive command to 0 when true (§4.11).
+    /// forces any positive command to 0 when true (stock behavior).
     pub fn block_charge(&self) -> bool {
         self.ov_accum > OV_TRIP
     }
 
-    /// mode 1: the setpoint law should command force-charge flat-out (§4.9).
+    /// mode 1: the setpoint law should command force-charge flat-out (stock behavior).
     pub fn force_flat(&self) -> bool {
         self.mode == FeedInMode::ForceFlat
     }
@@ -759,7 +759,7 @@ mod tests {
         assert_eq!(o.do_not_feed_in_overvoltage, 0);
     }
 
-    // ---- DisableFeedIn conditions (§4.2) ----
+    // ---- DisableFeedIn conditions (stock behavior) ----
 
     #[test]
     fn sustain_disables_feedin_and_is_mirrored() {
@@ -793,13 +793,13 @@ mod tests {
 
     #[test]
     fn unknown_discharge_budget_allows_feedin() {
-        // §6.8: NaN/unknown budget => can_discharge = true (matches the binary).
+        // NaN/unknown budget => can_discharge = true (matches stock).
         let bus = base(); // MAXDISCHARGE = -1 => NaN
         let mut f = FeedIn::new(&bus);
         assert_eq!(f.tick(&bus).disable_feedin, 0);
     }
 
-    // ---- MaxFeedInPower: sentinel + slew (§4.6) ----
+    // ---- MaxFeedInPower: sentinel + slew (stock behavior) ----
 
     #[test]
     fn maxfeedin_unlimited_writes_exact_sentinel() {
@@ -846,7 +846,7 @@ mod tests {
         assert!(bus.writes_to(VEBUS, &p_maxfeedin(1)).is_empty());
     }
 
-    // ---- DC-overvoltage integrator (§4.11) ----
+    // ---- DC-overvoltage integrator (stock behavior) ----
 
     #[test]
     fn dc_overvoltage_integrator_accumulates_and_trips() {

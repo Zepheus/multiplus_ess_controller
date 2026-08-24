@@ -1,14 +1,12 @@
-//! SocGuard / BatteryLife enactment (the stock daemon §4a, spec §6).
+//! SocGuard / BatteryLife enactment (matches the stock ESS behavior).
 //!
 //! The *decision* half stays in Python (`dbus-systemcalc-py` `batterylife.py`): it
 //! watches SOC and writes a single integer into `Settings/CGwacs/BatteryLife/State`
 //! plus `MinimumSocLimit`. This module is the *actuator* — it never looks at SOC. It
 //! reads that state integer, the min-SOC limit and the managed BMS `/Info/ChargeRequest`,
 //! and turns them into the force-charge / discharge-inhibit enactment the main loop
-//! applies to the ControlLoop command (per-tick order step 5, after the control law).
+//! applies to the control-loop command (per-tick order step 5, after the control law).
 //!
-//! Recovered constants used faithfully (RE confidence [H] unless noted, see
-//! ../../re/socguard-gridmeter.md §4a/§5):
 //!   - force-charge predicate: state∈{8,12} ∨ ChargeRequest ∨ KeepCharged
 //!     (state 9 ∨ MinSOC > 99.0)
 //!   - discharge-inhibit set {5,6,8,11,12} via the mask (s-5<8) && (0xCB>>(s-5))&1
@@ -17,7 +15,7 @@
 //!   - BL state 6 (24 h slow charge): battery-power lower clamp raised to +5 A × Vdc
 //!   - TargetPowerIsMaxFeedIn "modern" path when the firmware advertises the item
 //!
-//! Scope: enactment only. The grid-meter presence/fallback half (§4b) and the
+//! Scope: enactment only. The grid-meter presence/fallback half and the
 //! `/Hub4/DisableFeedIn` composition live in a separate module; this one only
 //! produces `force_charge`, the discharge-inhibit bound, the `tpimf` flag, the
 //! legacy force-charge command and the state-6 charge floor.
@@ -113,7 +111,7 @@ pub struct Inputs {
     pub ovr_max_discharge_w: f64,
 }
 
-/// Enactment the main loop applies to the ControlLoop command, in this order:
+/// Enactment the main loop applies to the control-loop command, in this order:
 ///   1. discharge inhibit: `cmd = cmd.max(-max_discharge_w)` (no-op when +∞)
 ///   2. force charge: if `cmd_override` is `Some(fc)` —
 ///      tpimf → `set_i32(VEBUS, P_TPIMF, 1); cmd = cmd.min(fc)` (normal law passes
@@ -138,10 +136,10 @@ pub struct SocGuardOut {
     pub charge_floor_w: f64,
 }
 
-/// Pure enactment — no I/O, total over any `Inputs` (incl. NaN). Faithful to §4a and
+/// Pure enactment — no I/O, total over any `Inputs` (incl. NaN). Matches the stock behavior and
 /// unit-testable in isolation; `SocGuard::tick` samples `Inputs` and calls this.
 pub fn enact(inp: &Inputs) -> SocGuardOut {
-    // (§4a-3) Force-charge predicate, INCLUDING the external Overrides/ForceCharge
+    // Force-charge predicate, INCLUDING the external Overrides/ForceCharge
     // trigger (schedule / DESS) so scheduled off-peak charging is actually enacted.
     let keep_charged = inp.bl_state == KEEP_CHARGED || inp.min_soc > MINSOC_KEEPCHARGED;
     let force_charge = inp.override_force_charge
@@ -152,7 +150,7 @@ pub fn enact(inp: &Inputs) -> SocGuardOut {
             crate::states::bl::LOW_SOC_CHARGE | crate::states::bl::SOCG_LOW_SOC_CHARGE
         );
 
-    // (§4a-2) Discharge inhibit: effective MaxDischargePower forced to 0 in the set,
+    // Discharge inhibit: effective MaxDischargePower forced to 0 in the set,
     // AND capped by the external /Overrides/MaxDischargePower (ephemeral override —
     // schedule post-target hold / DESS). Most restrictive wins.
     let state_inhibit = if is_discharged_set(inp.bl_state) {
@@ -167,18 +165,18 @@ pub fn enact(inp: &Inputs) -> SocGuardOut {
     };
     let max_discharge_w = state_inhibit.min(ovr_cap);
 
-    // (§4a-4, state-6 special case) +5 A × Vdc slow-charge floor. NaN Vdc → 0 (safe).
+    // (state-6 special case) +5 A × Vdc slow-charge floor. NaN Vdc → 0 (safe).
     let charge_floor_w = if inp.bl_state == BL_FORCE_CHARGE {
         sanitize_floor(FORCE_CHARGE_FLOOR_A * inp.dc_voltage)
     } else {
         0.0
     };
 
-    // (§4a-4) Modern TPIMF path only when the firmware advertises the item. The
+    // Modern TPIMF path only when the firmware advertises the item. The
     // feed-in-force / generator refinements are [M]; the safe subset is used here.
     let tpimf = force_charge && inp.multi_supports_tpimf;
 
-    // (§4a-4, mode 1/0) Force-charge command target: Σ effective max-charge, or the
+    // (mode 1/0) Force-charge command target: Σ effective max-charge, or the
     // 414 000 W sentinel when unlimited. Only meaningful while force_charge.
     let cmd_override = if force_charge {
         Some(if inp.eff_max_charge_w.is_finite() && inp.eff_max_charge_w > 0.0 {
@@ -235,7 +233,7 @@ impl SocGuard {
             .unwrap_or(false);
 
         // Σ effective max-charge: the settings ceiling if configured (> 0), else NaN
-        // to trip the 414 000 W sentinel — same rule as `pick_limit`/§6.4. The
+        // to trip the 414 000 W sentinel — same rule as `pick_limit`. The
         // caller may instead feed the broker's computed Σ via `enact` directly.
         let eff_max_charge_w = match bus.get_f64(SETTINGS, P_MAXCHARGE) {
             Some(x) if x > 0.0 => x,
@@ -351,7 +349,7 @@ mod tests {
         assert_eq!(SocGuard::new(&bus).tick(&bus).max_discharge_w, 0.0);
     }
 
-    // ---- each force-charge trigger (§4a-3) ----
+    // ---- each force-charge trigger ----
 
     #[test]
     fn no_force_charge_in_baseline() {
@@ -402,7 +400,7 @@ mod tests {
         assert!(!SocGuard::new(&bus).tick(&bus).force_charge);
     }
 
-    // ---- force-charge command target (§4a-4, mode 1/0) ----
+    // ---- force-charge command target (mode 1/0) ----
 
     #[test]
     fn cmd_override_uses_configured_ceiling_when_finite() {
@@ -437,7 +435,7 @@ mod tests {
         assert!(SocGuard::new(&bus).tick(&bus).force_charge); // still forces, just legacy
     }
 
-    // ---- state-6 slow-charge floor (§4a-4) ----
+    // ---- state-6 slow-charge floor ----
 
     #[test]
     fn state_6_raises_charge_floor_to_5a_times_vdc() {
@@ -522,7 +520,7 @@ mod tests {
 
     /// Dispatch scenario: a Home-Assistant automation RAISES `MinimumSocLimit` when
     /// Octopus grants a cheap car-charge window, so the ESS charges instead of
-    /// discharging. Ghidra-confirmed (2026-08-15): stock the stock daemon subscribes to NO
+    /// discharging. The stock loop subscribes to NO
     /// battery-SOC dbus path — `updateBatteryLimits()` fires only on
     /// state/minSoc/dcVoltage/max{Charge,Discharge}Power/sustain — so it CANNOT compare
     /// SOC to MinSOC itself. That decision is made entirely by `dbus-systemcalc-py`

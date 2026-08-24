@@ -1,14 +1,14 @@
 //! Battery charge/discharge limit broker (Tier A).
 //!
 //! Converts the live BMS/DVCC current limits into the AC-side (lo, hi) power clamp
-//! the ControlLoop uses, so we never command past what the battery allows. This is
+//! the control loop uses, so we never command past what the battery allows. This is
 //! the safety-critical piece the earlier build was missing: it clamped discharge to
 //! a *static* startup value and never tracked the live BMS discharge-current limit,
 //! so if the BMS lowers its limit (cold / low SOC / cell imbalance) we would not
 //! follow it down.
 //!
 //! empirically modelled and validated live (280 A × 52.44 V × 0.9 = 13214.9 W matched
-//! the published /MaxDischargePower to the watt). See the design notes.
+//! the published /MaxDischargePower to the watt).
 //!
 //! Tier A scope: the read-only broker + clamp only. No hub4 D-Bus server and no
 //! machine-written ephemeral overrides yet (those are Tier B).
@@ -269,7 +269,7 @@ impl BatteryBroker {
     /// Read live inputs and recompute limits. Returns both the PUBLISHED limits
     /// (what the stock ESS loop puts on `/MaxChargePower` / `/MaxDischargePower`, pre-
     /// tightening — used for golden regression) and the ENFORCED clamp for the
-    /// ControlLoop (discharge additionally zeroed in BatteryLife discharged states
+    /// control loop (discharge additionally zeroed in BatteryLife discharged states
     /// {5,6,8,11,12}). Reads are cheap; call once per tick, not the control hot path.
     pub fn tick(&mut self, bus: &dyn Bus) -> TickResult {
         let i = self.read(bus);

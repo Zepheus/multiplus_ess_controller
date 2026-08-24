@@ -213,7 +213,7 @@ with --slew-w-per-s / --sanity-band-w. Every trip logs a stable `SAFETY:` prefix
 `reason` column; the hand-back itself is visible via Hub4Mode / Overrides (Tier-B also publishes
 /Alarms/EssSafety, the same /Alarms/* surface the HA/VRM Victron integration already reads).
 
-Rollout stages (--stage, see re/ROLLOUT-AND-FAILSAFE.md):
+Rollout stages (--stage):
   shadow (0)   READ-ONLY. Compute what we would command, compare to stock, never write.
   trim   (1)   Mode 1 + /Overrides/Setpoint outer-integral trim. Stock keeps ALL safety;
                we only bias the grid target. Reverts via the 300 s override watchdog.

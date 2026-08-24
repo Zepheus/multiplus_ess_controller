@@ -1,20 +1,20 @@
 //! Grid-meter presence / failure-mode guard (Tier A safety gate).
 //!
-//! Reverse-engineered from `the stock daemon` 1.3.25 (ARM32, closed-source). Decides,
+//! Matches the stock grid-meter guard. Decides,
 //! once per presence tick, whether the ESS setpoint write should proceed and
 //! whether the `/Alarms/NoGridMeter` warning must be raised — exactly the two
-//! independent code paths the binary runs off its `ControlLoop`:
+//! independent code paths the stock loop runs each control tick:
 //!
 //!   * setpoint gate  — the stock actuation-tick early-returns (stop writing → the Multi's
 //!     own 60 s watchdog reverts it to Passthru: battery idle, loads on grid).
-//!   * presence / alarm FSM — `onTimer` case 5, a 48-tick grace counter that
+//!   * presence / alarm FSM — a 48-tick grace counter that
 //!     raises `/Alarms/NoGridMeter` after 48 × 2.5 s = 120 s.
 //!
-//! Both paths are faithful to the binary (grace `+0x48` reload `0x30`=48, timers
-//! `0x9c4`=2500 ms, `ActiveInput==240` disconnect sentinel, `Source==2` genset,
-//! `Hub4Mode==3` inert). See ../../re/meter-failure-mode.md §1, §3, §6.
+//! Both paths reproduce the stock behavior exactly (grace reload 48, presence
+//! tick 2500 ms, `ActiveInput==240` disconnect sentinel, `Source==2` genset,
+//! `Hub4Mode==3` inert).
 //!
-//! DELIBERATE DIVERGENCE (safety improvement, §4): stock keys presence on the
+//! DELIBERATE DIVERGENCE (safety improvement): stock keys presence on the
 //! meter *pointer* and generic item *validity* only — it has **no staleness /
 //! value-age check**, so a frozen-but-present meter (D-Bus service up, values
 //! stuck) is silently regulated on stale data, with NO passthru and NO alarm.
@@ -34,17 +34,17 @@
 use crate::dbus::*;
 use std::time::Duration;
 
-// ---- faithful constants (verified against the 1.3.25 binary) --------------
+// ---- faithful constants (verified against stock behavior) --------------
 
-/// Grace counter reload (`ControlLoop +0x48`, `mov …,#0x30`). [RE][H]
+/// Grace counter reload (stock-verified).
 pub const GRACE_TICKS: u32 = 48;
-/// Presence-tick interval (both `QTimer`s `movw r1,#0x9c4`). [RE][H]
+/// Presence-tick interval (stock-verified).
 pub const PRESENCE_TICK: Duration = Duration::from_millis(2500);
-/// `/Ac/ActiveIn/ActiveInput == 240` (0xf0) ⇒ no AC input connected. [RE][H]
+/// `/Ac/ActiveIn/ActiveInput == 240` (0xf0) ⇒ no AC input connected.
 pub const ACTIVEIN_DISCONNECTED: i32 = 240;
-/// `com.victronenergy.system /Ac/ActiveIn/Source == 2` ⇒ generator. [RE][H]
+/// `com.victronenergy.system /Ac/ActiveIn/Source == 2` ⇒ generator.
 pub const SOURCE_GENERATOR: i32 = 2;
-/// `Hub4Mode == 3` ⇒ external control, `the stock daemon` inert. [RE][H]
+/// `Hub4Mode == 3` ⇒ external control, `the stock daemon` inert.
 pub use crate::states::hub4mode::EXTERNAL as HUB4MODE_EXTERNAL;
 
 // ---- staleness guard (our improvement, non-stock) -------------------------
@@ -53,7 +53,7 @@ pub use crate::states::hub4mode::EXTERNAL as HUB4MODE_EXTERNAL;
 /// frozen/stale and treated as absent. 6 ticks ≈ 15 s at the 2.5 s cadence —
 /// generous versus a healthy ET112 (~2 s refresh, value practically always
 /// moves) yet well under the Multi's 60 s watchdog, so we passthru deliberately
-/// rather than regulate on stale data. See §4 / §6.3.
+/// rather than regulate on stale data.
 pub const STALE_TICKS: u32 = 6;
 // (Documentation form of `STALE_TICKS` at the presence cadence: ~15 s.)
 
@@ -76,7 +76,7 @@ const P_ACTIVE_INPUT: &str = "/Ac/ActiveIn/ActiveInput";
 // Reused from dbus.rs: SYS, VEBUS, SETTINGS, P_GRID (system-republished grid
 // power), P_HUB4MODE (/Settings/CGwacs/Hub4Mode), P_ACTIVEIN (vebus AC-in P).
 
-/// Presence state emitted by the FSM (mirrors the binary's `gridMeterPresence`).
+/// Presence state emitted by the FSM (mirrors the stock presence signal).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Presence {
     /// Meter present and usable. (`presence = 0`)
@@ -169,7 +169,7 @@ impl GridMeterGuard {
 
     /// Builder: toggle the non-stock frozen-meter guard. `false` reproduces
     /// stock behaviour (present-but-frozen meter is treated as usable) so parity
-    /// against the binary stays auditable.
+    /// against stock behavior stays auditable.
     #[cfg_attr(not(test), allow(dead_code))] // test-consumed API
     pub fn with_frozen_guard(mut self, on: bool) -> Self {
         self.frozen_guard = on;
@@ -232,7 +232,7 @@ impl GridMeterGuard {
                 .get_f64(VEBUS, P_ACTIVEIN)
                 .is_some_and(|v| v.is_finite()),
             run_without_meter: bus.get_bool(SETTINGS, P_RUN_WITHOUT_METER).unwrap_or(false),
-            // Default TRUE (meter required) — the binary's default and the safe one.
+            // Default TRUE (meter required) — the stock default and the safe one.
             grid_meter_required: bus.get_bool(SETTINGS, P_GRID_METER_REQUIRED).unwrap_or(true),
             // Default 0 = grid mode (meter matters); never assume genset.
             source: bus.get_i32(SYS, P_SOURCE).unwrap_or(0),
@@ -281,9 +281,9 @@ impl GridMeterGuard {
             Regulation::Skip
         };
 
-        // ---- presence / alarm FSM (mirrors onTimer case 5) ----
+        // ---- presence / alarm FSM ----
         // Independent of the gate: the alarm fires after grace even when the meter
-        // is *optional* (GridMeterRequired only gates the Skip branch). [RE][H]
+        // is *optional* (GridMeterRequired only gates the Skip branch).
         let presence = if inert || i.run_without_meter || genset {
             self.grace = GRACE_TICKS;
             Presence::NotApplicable
@@ -468,7 +468,7 @@ mod tests {
         }
     }
 
-    // ---- RunWithoutGridMeter × GridMeterRequired combinations (§3a) ----
+    // ---- RunWithoutGridMeter × GridMeterRequired combinations ----
 
     #[test]
     fn rwgm1_gmr1_absent_runs_on_multi_and_never_alarms() {

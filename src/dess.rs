@@ -3,7 +3,7 @@
 //! Reads the two DESS overrides that systemcalc's `DynamicEss` delegate writes onto
 //! the stock daemon's own `com.victronenergy.hub4` service and turns them into the
 //! effective-target override the control law consumes. This is the CONSUMER half of
-//! the `/Overrides/*` transport reverse-engineered in ../../re/dynamic-ess.md (§4, §6):
+//! the `/Overrides/*` transport the stock loop consumes:
 //!
 //!   * `/Overrides/Setpoint` (double, invalid = empty array) — grid-exchange target
 //!     in W (+import / 0 hold / −export). The core tick's effective-setpoint getter
@@ -17,7 +17,7 @@
 //! Safety posture (matches the stock daemon's `invalidateOverrides`, `the stock code` case 9):
 //!   * An absent, empty-array, or NaN setpoint override is NOT a value — we fall back
 //!     to the user's configured setpoint. A finite override (including `0.0` and
-//!     negatives) genuinely overrides; `0` and invalid are never conflated (§5).
+//!     negatives) genuinely overrides; `0` and invalid are never conflated (stock behavior).
 //!   * The ~300 s overrides watchdog: if the optimiser stops refreshing the overrides,
 //!     we fail safe back to normal ESS — setpoint → configured, feed-in → follow user.
 //!
@@ -25,7 +25,7 @@
 //! the configured setpoint", which this module produces with `target_override = None`.
 //!
 //! Tier scope: read-only consumer + watchdog. The hub4 D-Bus server that systemcalc
-//! writes into (§6.2) is a sibling concern; here we read the applied override values
+//! writes into (stock behavior) is a sibling concern; here we read the applied override values
 //! through the `Bus` trait, exactly like the battery-limit broker reads its inputs.
 
 use crate::dbus::Bus;
@@ -40,8 +40,8 @@ pub const P_OVR_SETPOINT: &str = "/Overrides/Setpoint";
 pub const P_OVR_FEEDIN: &str = "/Overrides/FeedInExcess";
 
 /// Overrides watchdog period. systemcalc refreshes every 5 s; any value comfortably
-/// above that works. 300 s matches Victron's documented overrides watchdog (§4.4);
-/// the exact literal is not in the decompilation, so this is the safe documented value.
+/// above that works. 300 s matches Victron's documented overrides watchdog (stock behavior);
+/// the exact literal is not externally documented, so this is the safe documented value.
 const WATCHDOG: Duration = Duration::from_secs(300);
 
 /// Feed-in-excess policy — the DESS `/Overrides/FeedInExcess` int, decoded.
@@ -105,7 +105,7 @@ impl DessOut {
 /// Watchdog model (poller edition): we can only observe the applied override values,
 /// not systemcalc's `SetValue` timestamps, so we treat any *change* in the observed
 /// override (setpoint or feed-in) as a refresh that re-arms the watchdog — the reader's
-/// equivalent of the stock daemon's per-write QTimer re-arm (§4.4). If nothing changes for
+/// equivalent of the stock daemon's per-write watchdog re-arm. If nothing changes for
 /// longer than `WATCHDOG`, the optimiser is presumed dead and we revert to normal ESS.
 /// Reverting is always fail-safe (back to the user's static setpoint and feed-in policy),
 /// so a legitimately constant override that trips the watchdog only costs optimisation,
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn zero_override_is_finite_and_overrides_not_fallback() {
-        // §5: `0` is a finite value ⇒ hold exactly 0 W exchange; must NOT be conflated
+        // `0` is a finite value ⇒ hold exactly 0 W exchange; must NOT be conflated
         // with invalid/None (which would fall back to the configured setpoint).
         let mut bus = MockBus::new();
         bus.set(HUB4, P_OVR_SETPOINT, 0.0);

@@ -5,12 +5,12 @@
 //! AC-input current limit, per phase, by writing `/Hub4/L{n}/OverruledShoreLimit`
 //! (Amps) on the vebus service. The firmware then PowerAssists from the battery to
 //! keep the current under that limit. We decide the limit; the firmware does the
-//! shaving. See ../../re/shore-peakshave.md (its §6 is the drop-in spec).
+//! shaving, matching the stock peak-shave behavior as the drop-in spec.
 //!
 //! Two behaviours, both implemented here:
 //!   * DORMANT (this install): `Settings/CGwacs/AcInputLimit = -1` -> the getter is
 //!     NaN, the per-phase write loop is skipped, and `OverruledShoreLimit` is NEVER
-//!     touched. A no-op is behaviourally exact (proved in spec §5). `tick` returns
+//!     touched. A no-op is behaviourally exact (proved in the stock spec). `tick` returns
 //!     `active=false` with every phase `None` (leave the path alone), matching
 //!     the stock daemon which does not clear it.
 //!   * ACTIVE (a breaker/inlet limit is configured): the reversed first-order IIR
@@ -20,8 +20,8 @@
 //!     `3270.0` "unlimited" sentinel to release (charging / force-charge /
 //!     below-min-SOC / non-physical negative state).
 //!
-//! Constants (0.8/0.2 IIR, 3270 sentinel) are read straight from the binary
-//! `.rodata` (spec §4.1). `AcInputLimit` is in AMPS (−1 = unlimited).
+//! Constants (0.8/0.2 IIR, 3270 sentinel) reproduce the stock values
+//! the stock constants (stock behavior). `AcInputLimit` is in AMPS (−1 = unlimited).
 //!
 //! SAFETY: when `AcInputLimit` is unset / −1 / NaN we do NOT impose a limit and we
 //! do NOT clamp AC-in to 0 — we leave `OverruledShoreLimit` untouched, exactly as
@@ -44,10 +44,10 @@ pub const P_AC_EXPORT_LIMIT: &str = "/Settings/CGwacs/AcExportLimit";
 /// policy; here it feeds `should_release`.
 pub const P_ALWAYS_PEAKSHAVE: &str = "/Settings/CGwacs/AlwaysPeakShave";
 
-// --- IIR constants (spec §4.1, read from .rodata) ---
-const IIR_RETAIN: f64 = 0.8; // DAT_00046988 — retain coefficient (old value)
-const IIR_UPDATE: f64 = 0.2; // DAT_00046978 — update coefficient (new error)
-/// DAT_00046980 — the "unlimited" sentinel written on release. Opaque magic constant;
+// --- IIR constants (the stock spec, stock-verified) ---
+const IIR_RETAIN: f64 = 0.8; // a stock constant — retain coefficient (old value)
+const IIR_UPDATE: f64 = 0.2; // a stock constant — update coefficient (new error)
+/// a stock constant — the "unlimited" sentinel written on release. Opaque magic constant;
 /// treated as effectively-infinite, never computed.
 pub const SHORE_UNLIMITED: f64 = 3270.0;
 
@@ -108,7 +108,7 @@ pub struct ShoreOut {
 /// its latches).
 pub struct ShoreLimiter {
     /// Per-phase IIR state (Amps), L1..L3. `None` = not yet seeded (treated as 0.0,
-    /// spec's `DAT_00046970` filter seed). Persistent across ticks and across
+    /// spec's `a stock constant` filter seed). Persistent across ticks and across
     /// dormant/active transitions, exactly like the stock daemon's QVector.
     filt: [Option<f64>; MAX_PHASES],
     /// Active phase count (1 for this single-phase install; only L1 exists).
@@ -122,7 +122,7 @@ impl ShoreLimiter {
     }
 
     /// True if any seeded per-phase state has gone negative — a non-physical current
-    /// limit, which forces a release (spec §4.3).
+    /// limit, which forces a release (stock behavior).
     pub fn any_phase_negative(&self) -> bool {
         self.filt.iter().flatten().any(|v| *v < 0.0)
     }
@@ -132,7 +132,7 @@ impl ShoreLimiter {
     /// * `ac_input_limit_a` — the `CGwacs/AcInputLimit` setting in Amps, or `None` if
     ///   unset / −1 / NaN (see [`read_ac_input_limit`]). `None` -> dormant.
     /// * `meter_present` — is an external grid meter metering AC-in? If so the loop is
-    ///   skipped (spec §4.4, Medium confidence — verify live before trusting it).
+    ///   skipped (the stock spec, Medium confidence — verify live before trusting it).
     /// * `meter_i[n]` — per-phase measured AC-in current (A, signed): the grid meter,
     ///   or the Multi self-meter when there is no external meter. `None` = unavailable.
     /// * `multi_i[n]` — the Multi's `/Ac/ActiveIn/Ln/I` (A). `None` = unavailable.
@@ -187,7 +187,7 @@ impl ShoreLimiter {
             writes[n] = Some(if release {
                 ShoreWrite::Release
             } else {
-                // Impose: never negative (spec §3 "Value semantics").
+                // Impose: never negative (the stock spec "Value semantics").
                 ShoreWrite::Impose(next.max(0.0))
             });
         }
@@ -215,7 +215,7 @@ impl ShoreLimiter {
 
     /// Convenience for `main.rs`: read the meter/Multi currents off the bus, then tick.
     /// For a single Multi with self-metering the meter current *is* `/Ac/ActiveIn/Ln/I`
-    /// (spec §6.8.3), so `meter_present=false` and both current vectors come from vebus.
+    /// (the stock spec.3), so `meter_present=false` and both current vectors come from vebus.
     /// The caller supplies the release decision from the SocGuard/BatteryLife state it
     /// already tracks (subsystem #6).
     pub fn tick_from_bus(
@@ -243,7 +243,7 @@ impl ShoreLimiter {
     }
 }
 
-/// Port of the stock loop's impose-vs-release predicate (spec §6.5). Exact predicate
+/// Port of the stock loop's impose-vs-release predicate (stock behavior). Exact predicate
 /// is Medium confidence; this is the safe, behaviour-matching approximation.
 /// `true` -> release (write the sentinel); `false` -> impose the filtered limit.
 pub fn should_release(
@@ -329,7 +329,7 @@ mod tests {
         }
     }
 
-    // ---- DORMANT: AcInputLimit = -1 -> no-op, path untouched (spec §5) ----
+    // ---- DORMANT: AcInputLimit = -1 -> no-op, path untouched (stock behavior) ----
 
     #[test]
     fn dormant_minus_one_setting_reads_as_none() {
@@ -435,7 +435,7 @@ mod tests {
         assert!((written - 3.2).abs() < 1e-9, "wrote {written}");
     }
 
-    // ---- meter_present gate (spec §4.4) ----
+    // ---- meter_present gate (stock behavior) ----
 
     #[test]
     fn external_meter_present_skips_write_loop() {
