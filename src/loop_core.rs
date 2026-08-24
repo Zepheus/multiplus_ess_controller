@@ -1127,6 +1127,45 @@ mod tests {
         );
     }
 
+    /// Same guarantee across a min-SOC dispatch (e.g. car-charging automation
+    /// bumping MinimumSocLimit): the integral must carry no windup from the
+    /// handed-back charging period into the re-take.
+    #[test]
+    fn integral_safe_across_min_soc_dispatch() {
+        let mut c = cfg(Stage::Takeover);
+        c.smith = false;
+        let mut st = state(Kind::Pi { ki: 0.02, i_max: 300.0 });
+        st.owner_us = true;
+        st.last_flip_t = -1000.0;
+        let mut sp = snap(true);
+        sp.s.soc = 80.0;
+        sp.s.grid = 100.0; // law ≈ −80
+        for k in 0..30 {
+            decide(&sp, &mut st, &c, k as f64);
+        }
+        // Dispatch: automation raises the floor above SOC -> hand back that tick.
+        sp.min_soc = 90.0;
+        let d = decide(&sp, &mut st, &c, 30.0);
+        assert!(!d.owner_us, "must hand back on the raised floor");
+        // Stock charges the battery for "20 min"; huge import the whole time.
+        sp.s.grid = 5000.0;
+        for k in 31..1231 {
+            decide(&sp, &mut st, &c, k as f64);
+        }
+        // Automation restores the floor; dwell has long elapsed -> re-take.
+        sp.min_soc = 10.0;
+        sp.s.soc = 90.0;
+        sp.s.grid = 100.0;
+        let d = decide(&sp, &mut st, &c, 1231.0);
+        assert!(d.owner_us, "re-take after the dispatch");
+        let d2 = decide(&sp, &mut st, &c, 1232.0);
+        assert!(
+            d2.command > -200.0 && d2.command < 0.0,
+            "post-dispatch command {} must carry no windup",
+            d2.command
+        );
+    }
+
     #[test]
     fn stock_write_ema_gain_schedule() {
         // First write: passthrough (rounded).
