@@ -124,7 +124,7 @@ fn slew_limit(prev: Option<f64>, desired: f64, max_rate_w_s: f64, dt: f64) -> f6
     }
 }
 
-/// The stock setpoint write law (matched to the stock per-phase writer): an EMA toward the
+/// Stock's setpoint write law (matched to the stock per-phase writer): an EMA toward the
 /// command, `new = prev + gain·(cmd − prev)`, with
 ///   gain = 0.5                                   for |Δ| < 10 W, or with `adaptive` off;
 ///   gain = clamp(0.25·ln(|Δ|/10), 0.5, 1.1)      otherwise — a DELIBERATE overshoot up
@@ -300,6 +300,12 @@ pub struct DecideCfg {
     /// Directional write-pacing gains (see `EMA_GAIN_UP`/`EMA_GAIN_DOWN`).
     pub ema_gain_up: f64,
     pub ema_gain_down: f64,
+    /// Export-conditional pacing: when the (lag-corrected) meter shows export beyond
+    /// `export_fast_dead_w` AND the pending step raises the setpoint (reduces export),
+    /// the up-gain becomes `ema_gain_export_fast`. `f64::INFINITY` deadband disables.
+    /// Values from the Pareto sweep over the live event library (tools/pace_sweep.py).
+    pub ema_gain_export_fast: f64,
+    pub export_fast_dead_w: f64,
     /// Smith-style meter-lag compensation (see `decide`). Event-library study
     /// (233 events, 2026-08-22): with compensation + 0.5 pacing the loop beats
     /// stock on export (-11%), import (-30%) AND export duration (-15%);
@@ -597,7 +603,14 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
         // pathological steps), then the hard design envelope.
         match raw {
             Write::Setpoint(v) => {
-                let ema = stock_write_ema(st.last_out, v, cfg.ema_adaptive, cfg.ema_gain_up, cfg.ema_gain_down);
+                // Export-conditional pacing: arrest a measured export faster than the
+                // symmetric pace, but ONLY toward reducing it — never toward export,
+                // never on imports (sweep-validated on the live event library:
+                // shorter/shallower export, no oscillation on cycling loads).
+                let exporting = snap.s.grid + meter_corr < -cfg.export_fast_dead_w;
+                let step_up = st.last_out.is_some_and(|p| v > p);
+                let gain_up = if exporting && step_up { cfg.ema_gain_export_fast } else { cfg.ema_gain_up };
+                let ema = stock_write_ema(st.last_out, v, cfg.ema_adaptive, gain_up, cfg.ema_gain_down);
                 let sv = slew_limit(st.last_out, ema, cfg.slew_w_per_s, snap.dt);
                 let sv = crate::control::clamp(sv, snap.lo, snap.hi);
                 safety.slew_clamped = (sv - ema).abs() > 1e-6;
@@ -727,6 +740,8 @@ pub mod testutil {
             // tick-exact replays stay exact. Production defaults are asymmetric.
             ema_gain_up: 0.5,
             ema_gain_down: 0.5,
+            ema_gain_export_fast: 0.5,
+            export_fast_dead_w: f64::INFINITY, // captured pre-feature: conditional pacing off
             // Captures predate the Smith compensation - replay without it.
             smith: false,
         }
@@ -1273,6 +1288,38 @@ mod tests {
     }
 
     #[test]
+    fn export_fast_pacing_arrests_export_faster_only() {
+        // Sweep-chosen export-conditional pacing (0.9 over 100 W deadband): a
+        // measured export with a rising setpoint paces at the fast gain; the same
+        // rise WITHOUT export (and any fall) keeps the symmetric 0.5.
+        let run = |grid: f64, seed: f64, dead: f64| {
+            let mut st = state(Kind::Stock);
+            st.owner_us = true;
+            st.last_flip_t = 0.0;
+            st.last_out = Some(seed);
+            let mut sp = snap(true);
+            sp.s.grid = grid;
+            sp.s.reported = -900.0;
+            let mut c = cfg(Stage::Takeover);
+            c.ema_gain_export_fast = 0.9;
+            c.export_fast_dead_w = dead;
+            let d = decide(&sp, &mut st, &c, 100.0);
+            let Write::Setpoint(v) = d.write else { panic!("expected setpoint") };
+            v
+        };
+        // Exporting 600 W, seed far below the law => step up at 0.9 instead of 0.5.
+        let fast = run(-600.0, -2000.0, 100.0);
+        let slow = run(-600.0, -2000.0, f64::INFINITY); // feature disabled
+        assert!(fast > slow, "export step-up must pace faster: fast {fast} vs slow {slow}");
+        // Same export but the step goes DOWN (seed above the law): symmetric pace.
+        assert_eq!(run(-600.0, 0.0, 100.0), run(-600.0, 0.0, f64::INFINITY),
+            "down-steps never use the fast gain");
+        // Importing: identical regardless of the feature.
+        assert_eq!(run(300.0, -2000.0, 100.0), run(300.0, -2000.0, f64::INFINITY),
+            "imports never use the fast gain");
+    }
+
+    #[test]
     fn takeover_first_tick_normal_dt_no_false_slew_alarm() {
         // Regression: the very first loop tick must carry a sane dt (a full
         // interval), not the ~0 that a just-initialized `prev` produces — else the
@@ -1391,7 +1438,7 @@ mod tests {
         assert!(d.safety.dt_clamped && d.safety.any());
     }
 
-    // Full-loop replay: drive the WHOLE composed decision over the real captured trace
+    // Full-loop replay (stock behavior): drive the WHOLE composed decision over the real captured trace
     // (both discharge 256 + scheduled-charge 259 regimes). Crucially the per-row command bounds
     // and force-charge decision come from the PRODUCTION code (battery_limits::BatteryBroker +
     // socguard::SocGuard fed by the row's own dbus values) — not hand-rolled constants — so this

@@ -468,6 +468,8 @@ fn main() {
         ema_adaptive: false,
         ema_gain_up: loop_core::EMA_GAIN_UP,
         ema_gain_down: loop_core::EMA_GAIN_DOWN,
+        ema_gain_export_fast: args.export_fast_gain,
+        export_fast_dead_w: args.export_fast_dead_w,
         smith: args.smith,
     };
     // Edge-triggered safety logging state (only log a trip when it newly fires).

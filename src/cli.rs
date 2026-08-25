@@ -20,6 +20,10 @@ pub struct Args {
     /// Smith-style meter-lag compensation (default on; --no-smith to disable).
     pub smith: bool,
     pub trim_ki: f64,
+    /// Export-conditional pacing (defaults from the Pareto sweep over the live
+    /// event library — see tools/pace_sweep.py; deadband INFINITY disables).
+    pub export_fast_gain: f64,
+    pub export_fast_dead_w: f64,
     /// Safety overrides — None => derive from the design power (SafetyLimits::derive).
     pub slew_w_per_s: Option<f64>,
     pub sanity_band_w: Option<f64>,
@@ -33,6 +37,8 @@ pub fn parse_args() -> Result<Args, String> {
         min_soc: 15.0,
         soc_hyst: 3.0,
         max_discharge: 0.0, // 0 => read from settings / default
+        export_fast_gain: 0.9,
+        export_fast_dead_w: 100.0,
         max_charge: 0.0,
         seconds: 0,
         confirm: false,
@@ -96,6 +102,13 @@ pub fn parse_args() -> Result<Args, String> {
             "--confirm" => a.confirm = true,
             "--quiet" => a.quiet = true,
             "--no-smith" => a.smith = false,
+            "--export-fast-gain" => {
+                a.export_fast_gain = val()?.parse().map_err(|_| "bad --export-fast-gain")?
+            }
+            "--export-fast-dead-w" => {
+                a.export_fast_dead_w = val()?.parse().map_err(|_| "bad --export-fast-dead-w")?
+            }
+            "--no-export-fast" => a.export_fast_dead_w = f64::INFINITY,
             "--telemetry" => a.telemetry = Some(val()?),
             "--telemetry-max-mb" => {
                 a.telemetry_max_mb = val()?.parse().map_err(|_| "bad --telemetry-max-mb")?
@@ -213,7 +226,7 @@ with --slew-w-per-s / --sanity-band-w. Every trip logs a stable `SAFETY:` prefix
 `reason` column; the hand-back itself is visible via Hub4Mode / Overrides (Tier-B also publishes
 /Alarms/EssSafety, the same /Alarms/* surface the HA/VRM Victron integration already reads).
 
-Rollout stages (--stage):
+Rollout stages (--stage, see):
   shadow (0)   READ-ONLY. Compute what we would command, compare to stock, never write.
   trim   (1)   Mode 1 + /Overrides/Setpoint outer-integral trim. Stock keeps ALL safety;
                we only bias the grid target. Reverts via the 300 s override watchdog.

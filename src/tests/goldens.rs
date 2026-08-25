@@ -69,6 +69,8 @@ let c = DecideCfg {
     // Captured under symmetric 0.5 write pacing — pinned for tick-exactness.
     ema_gain_up: 0.5,
     ema_gain_down: 0.5,
+    ema_gain_export_fast: 0.5,
+    export_fast_dead_w: f64::INFINITY, // captured pre-feature: conditional pacing off
     // Captures predate the Smith compensation - replay without it.
     smith: false,
 };
@@ -221,6 +223,8 @@ let c = DecideCfg {
     // Captured under symmetric 0.5 write pacing — pinned for tick-exactness.
     ema_gain_up: 0.5,
     ema_gain_down: 0.5,
+    ema_gain_export_fast: 0.5,
+    export_fast_dead_w: f64::INFINITY, // captured pre-feature: conditional pacing off
     // Captures predate the Smith compensation - replay without it.
     smith: false,
 };
@@ -378,6 +382,8 @@ let c = DecideCfg {
     ema_adaptive: false,
     ema_gain_up: 0.5,
     ema_gain_down: 0.5,
+    ema_gain_export_fast: 0.5,
+    export_fast_dead_w: f64::INFINITY, // captured pre-feature: conditional pacing off
     smith: true, // live config: Smith on
 };
 // Live controller: frozen FF at the identified leak curve, ki 0.02.
@@ -487,6 +493,8 @@ let c = DecideCfg {
     // Captured under symmetric 0.5 write pacing — pinned for tick-exactness.
     ema_gain_up: 0.5,
     ema_gain_down: 0.5,
+    ema_gain_export_fast: 0.5,
+    export_fast_dead_w: f64::INFINITY, // captured pre-feature: conditional pacing off
     // Captures predate the Smith compensation - replay without it.
     smith: false,
 };
