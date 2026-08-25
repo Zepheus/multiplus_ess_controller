@@ -2,10 +2,13 @@
 
 [![CI](https://github.com/Zepheus/multiplus_ess_controller/actions/workflows/rust.yml/badge.svg)](https://github.com/Zepheus/multiplus_ess_controller/actions/workflows/rust.yml)
 
-An experimental replacement for the grid-setpoint control loop of a Victron
-MultiPlus-II ESS on a Venus GX. It runs its own control law (with proper integral
-action) instead of the stock behaviour, to hold the grid meter at the configured
-setpoint.
+A replacement for the grid-setpoint control loop of a Victron MultiPlus-II ESS
+on a Venus GX. It runs its own control law (with proper integral action) instead
+of the stock behaviour, to hold the grid meter at the configured setpoint.
+
+On the reference system it is live-validated and in daily use, holding the grid
+to a sub-watt median error where the stock loop leaked ~+19 W (see Status). On
+*your* system it starts unproven: follow the staged rollout below.
 
 ---
 
@@ -268,6 +271,87 @@ slew-rate limit, and sanity supervisor as every other command (see Safety). The 
 power and are independent of anything learned. A corrupt or diverging estimate is caught
 downstream and cannot leave the envelope.
 
+## Porting to a different grid meter / inverter setup
+
+Everything system-specific lives in three layers. The first two tune themselves or
+are simple flags; the third is a set of measured constants you only touch if your
+hardware differs from the reference (ET112 over RS485, 2× MultiPlus-II).
+
+### Layer 1 — self-tuning (nothing to do)
+
+The **leak curve** (`--ff-a`/`--ff-b`, or learned online) and the **integral** adapt
+to any inverter count/model — see *Tuning it to your system* above. The **safety
+envelope** (slew rate, sanity band) is derived from your inverter design power
+(`--max-charge`/`--max-discharge`, else read from the device) — never copy another
+system's numbers.
+
+### Layer 2 — flags to match your meter's data rate
+
+The control cadence should match how fast your meter actually delivers fresh data —
+writing faster than the meter refreshes just chases stale readings.
+
+| meter | data path | fresh data | suggested |
+|-------|-----------|------------|-----------|
+| ET112 / ET340 | RS485 | ~1 s (validated: metronomic 1000 ms) | defaults (`--interval 1`) |
+| EM24 RS485 | RS485 | ~750 ms | defaults |
+| EM540 | RS485 | ~100–200 ms | `--interval` can stay 1 s; consider adaptive EMA (below) |
+| VM-3P75CT | VE.Can | ~100 ms | same as EM540 |
+| CT on the Multi (no external meter) | internal | fast but measures the wrong node | not supported — the loop regulates the *grid* meter |
+
+- **`--interval <s>`** — control tick. Keep at the meter's refresh period or slower.
+- **Write pacing** (`ema_gain` 0.5 symmetric) mimics the stock loop and is right for
+  ~1 s meters. The stock firmware only enables its *adaptive* (faster) pacing for
+  sub-250 ms meters; with a fast meter you can try the same via the adaptive-EMA
+  config, but measure before/after with the scoreboard rather than assuming.
+- **Smith meter-lag compensation** (`--no-smith` to disable) exists precisely
+  *because* slow meters report ~1 s stale. With a genuinely fast meter (EM540,
+  VM-3P75CT) most of its benefit is already in the hardware — set the meter-lag
+  constant to your measured value (Layer 3) or disable it and compare.
+
+### Layer 3 — the identified plant model (constants, measure before touching)
+
+`src/loop_core.rs` (`mod plant`) pins the reference system's identified response:
+
+```rust
+pub const A: f64 = 4.7;        // W   — inverter reporting offset
+pub const B: f64 = 0.9562;     //     — inverter gain (reported per commanded W)
+pub const ALPHA: f64 = 0.8;    //     — first-order response per tick
+pub const DELAY_S: usize = 1;  // s   — command-to-response transport delay
+pub const METER_LAG_S: usize = 1; // s — how stale the meter reading is
+```
+
+These drive the Smith compensation and the replay/postdiction test harness. They are
+**per-system measurements**, not universal truths. To fit yours:
+
+1. **Capture**: run a takeover session (or shadow while the stock loop drives) with
+   `--telemetry`, so you have per-tick `(write, reported, grid)` — an hour with a few
+   large appliance events (kettle, oven) is enough.
+2. **Fit**: regress `reported` against the lag-filtered write history — `A`/`B` from
+   the steady rows, `ALPHA`/`DELAY_S` from step events, `METER_LAG_S` from the offset
+   that best aligns meter moves with inverter (`vebus` AC-in) moves. The repo's
+   approach is in `src/tests/replay.rs` (the plant + meter model) and
+   `tools/event_scoreboard.py` (event extraction).
+3. **Gate**: before trusting the fit, make the replay reproduce *your* captured
+   events the way the built-in postdiction gates reproduce the reference ones
+   (`postdiction_gate_*` tests) — a plant model that can't postdict your own traces
+   has no business predicting for them.
+4. Rebuild, and validate live with short supervised A/B sessions per
+   `docs/AB-PROTOCOL.md`.
+
+If you skip Layer 3 entirely on different hardware: the controller still holds the
+setpoint (integral + leak model are self-tuning) — you only lose transient-response
+optimality, and `--no-smith` is the safe conservative choice until you've measured.
+
+### What actually varies between systems (checklist)
+
+- **Leak curve** — always different; learned or measured (Layer 1).
+- **Meter refresh + lag** — per meter model (Layer 2/3).
+- **Inverter response (`ALPHA`, `DELAY_S`)** — per inverter model/count (Layer 3).
+- **Design power / safety envelope** — per install; derived, or set `--max-*`.
+- **Phases** — the reference is single-phase L1. Multi-phase setpoint writing is
+  per-phase in the stock loop; this controller currently drives L1 (see source)
+  — three-phase installs are untested territory.
+
 ## Safety model
 
 - **Double-gated live:** needs both `--confirm` and env `VENUS_ESS_LIVE=I_UNDERSTAND`.
@@ -303,12 +387,34 @@ only configuration it has actually run on. Treat anything else as untested.
 
 ## Status
 
-Experimental but **live-validated**. On the reference system: five days of
-shadow at watt-level fidelity to the stock loop (including scheduled-charge
-windows and low-SOC dispatches), followed by supervised live takeover
-sessions. Measured live: standing grid error ~+1 W vs the stock loop's +19 W
-(the leak, fixed), appliance step-off export peaks at-or-shallower than the
-stock loop's own class, zero charging outside charge regimes, clean
-hand-backs. The full-adaptive learning mode remains the one experimental
-corner (cold-start fragility, documented in the test suite) — use `frozen`
-or `observe`. Run live sessions supervised and follow `docs/AB-PROTOCOL.md`.
+**In production on the reference system** (the recommended `frozen` + Smith
+config), promoted through the pre-registered protocol in `docs/AB-PROTOCOL.md`:
+shadow validation at watt-level fidelity to the stock loop, then supervised
+takeover sessions scored per-event against the stock baseline
+(`tools/event_scoreboard.py`), then unattended production days. Measured live:
+sub-watt median grid error (vs the stock loop's ~+19 W standing leak), transient
+export peaks at-or-shallower than the stock loop's own class, zero charging
+outside charge regimes, clean hand-backs.
+
+What the test suite covers (all replayed from live captures, not synthetic):
+
+- **Stock-law fidelity** — tick-exact golden replays of the stock write law
+  (EMA pacing, AC-out frame, per-phase write) against captured stock sessions.
+- **Charge windows** — entry, in-window force-charge (TPIMF cap law), the
+  integral-freeze law, and a tick-exact golden of a full overnight
+  scheduled-charge window **exit** (the swing, the `MaxDischargePower` hold
+  engaging, the settle — no export tail).
+- **Min-SOC / dispatch** — a live Octopus dispatch (MinSOC raise) replayed
+  tick-exact, including the low-SOC hand-back and re-entry hysteresis.
+- **Transient response** — postdiction gates: the replay harness (identified
+  plant + meter-lag model, appliance profiles for kettle / microwave / aircon
+  classes) must reproduce captured live events before its predictions count.
+- **Safety envelope** — take-over seeding from the stock setpoint, slew/sanity
+  clamps, meter-guard write gating and alarm FSM, BMS-alarm charge/discharge
+  stops, force-charge and feed-in flag enactment, hand-back restoring stock
+  authority, and ownership/lifecycle edge cases.
+
+The full-adaptive learning mode remains the one experimental corner
+(cold-start fragility, documented in the test suite) — use `frozen` or
+`observe`. On a new install, run live sessions supervised and follow
+`docs/AB-PROTOCOL.md` until your own numbers are in.

@@ -272,6 +272,12 @@ impl Controller {
     /// Reset the transient loop state on hand-back to avoid integral windup while the
     /// stock firmware drives. The LEARNED model is deliberately preserved — it is
     /// long-lived knowledge about the plant, not per-episode state.
+    /// Seed the residual integral (golden replays reconstruct captured mid-run state).
+    #[cfg(test)]
+    pub fn seed_integral(&mut self, w: f64) {
+        self.i = w;
+    }
+
     pub fn reset(&mut self) {
         self.cmd = None;
         self.i = 0.0;

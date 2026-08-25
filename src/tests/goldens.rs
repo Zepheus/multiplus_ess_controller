@@ -4,11 +4,11 @@
 //! everything that spans modules.
 
 use crate::control::{AdaptiveCfg, Kind};
-use crate::gridmeter::HUB4MODE_EXTERNAL;
 use crate::loop_core::testutil::*;
+use crate::socguard;
+use crate::gridmeter::HUB4MODE_EXTERNAL;
 use crate::loop_core::*;
 use crate::shore::ShoreOut;
-use crate::socguard;
 use crate::states::{bl, sysstate};
 use crate::Stage;
 
@@ -66,9 +66,10 @@ let c = DecideCfg {
     sanity_band_w: sl.sanity_band_w,
     sanity_secs: sl.sanity_secs,
     ema_adaptive: false,
-    // Captures predate asymmetric pacing + Smith — pin the as-run config.
+    // Captured under symmetric 0.5 write pacing — pinned for tick-exactness.
     ema_gain_up: 0.5,
     ema_gain_down: 0.5,
+    // Captures predate the Smith compensation - replay without it.
     smith: false,
 };
 let mut st = state(Kind::Stock);
@@ -181,7 +182,7 @@ assert_eq!(st.sanity_trips, 0, "the dispatch must not count as a sanity trip");
 ///   TARGET-SOC HOLD TRANSITION (t=54389..54394): ForceCharge drops to 0 the tick the
 ///   target SOC is reached, but MaxDischargePower=1 lands only ~6 s LATER — an
 ///   unguarded gap in which the raw law transiently commands −1.6/−2.1 kW (the grid
-///   meter still shows the collapsing 2.3 kW charge). The stock daemon coasts through
+///   meter still shows the collapsing 2.3 kW charge). Stock the stock daemon coasts through
 ///   it on its own write smoothing (−192 W held). We pass the raw law through — a
 ///   KNOWN, bounded divergence (≈2 ticks, ≲1 Wh, well inside the slew envelope) that
 ///   this test pins so any future "fix" is a deliberate decision, not drift.
@@ -217,9 +218,10 @@ let c = DecideCfg {
     sanity_band_w: sl.sanity_band_w,
     sanity_secs: sl.sanity_secs,
     ema_adaptive: false,
-    // Captures predate asymmetric pacing + Smith — pin the as-run config.
+    // Captured under symmetric 0.5 write pacing — pinned for tick-exactness.
     ema_gain_up: 0.5,
     ema_gain_down: 0.5,
+    // Captures predate the Smith compensation - replay without it.
     smith: false,
 };
 let mut st = state(Kind::Stock);
@@ -322,6 +324,122 @@ assert!(st.owner_us, "still owning after the window");
 /// Includes the subtle edges seen live: rounding at exactly .5 (−75.5 → −76,
 /// 2.5 → 3, 31.5 → 32) and NEGATIVE measured acOut (−16/−20 W) pushing the floor
 /// slightly below −1.
+/// 2026-08-25 overnight: the FIRST full 5.26 h scheduled-charge window under the
+/// integral-freeze fix, replayed tick-exact across the window EXIT — the exact
+/// scenario of the fixed window-integral bug. Pins that (1) the frozen-FF + Smith
+/// live config reproduces the recorded writes, and (2) the exit is a bounded
+/// ~10 s plant-lag transient that settles to the MaxDischargePower=1 hold value,
+/// with NO sustained export tail (the bug railed ~-300 W for minutes).
+#[test]
+fn golden_charge_window_exit_overnight_2026_08_25() {
+// (t, grid, reported, soc, ovr_fc, ovr_maxdis, acout, recorded_write)
+type Row = (f64, f64, f64, f64, bool, f64, f64, f64);
+#[rustfmt::skip]
+let rows: &[Row] = &[
+    (55922.0, 2407.5, 2172.0, 89.0, true,  f64::NAN, 10.0, -338.0),
+    (55923.0, 2387.6, 2170.0, 89.0, true,  f64::NAN, 12.0, -331.0),
+    (55924.0, 2374.8, 2168.0, 89.0, true,  f64::NAN, 17.0, -324.0),
+    (55925.0, 2389.0, 2155.0, 89.0, true,  f64::NAN, 27.0, -340.0),
+    (55926.0, 2370.6, 2143.0, 89.0, true,  f64::NAN, 33.0, -337.0),
+    (55927.0, 2357.9, 2159.0, 89.0, true,  f64::NAN, 23.0, -319.0),
+    (55928.0, 2379.3, 2160.0, 89.0, true,  f64::NAN, 26.0, -333.0),
+    (55929.0, 2379.8, 2165.0, 90.0, false, f64::NAN, 23.0, -335.0), // window exit
+    (55930.0, 2361.0, 1537.0, 90.0, false, f64::NAN, 33.0, -618.0),
+    (55931.0, 1641.6,  262.0, 90.0, false, f64::NAN, 42.0, -905.0),
+    (55933.0,  435.6, -311.0, 90.0, false, f64::NAN, 29.0, -603.0),
+    (55934.0,  113.8, -1090.0, 90.0, false, f64::NAN, 37.0, -896.0),
+    (55935.0, -1210.4, -784.0, 90.0, false, 1.0,     16.0, -440.0), // hold engages
+    (55936.0, -586.0, -672.0, 90.0, false, 1.0,      35.0, -203.0),
+    (55937.0, -506.7, -559.0, 90.0, false, 1.0,      29.0,  -88.0),
+    (55938.0, -420.6, -434.0, 90.0, false, 1.0,       8.0,  -41.0),
+    (55939.0, -260.7, -234.0, 90.0, false, 1.0,      16.0,  -13.0),
+    (55940.0,  -68.3, -199.0, 90.0, false, 1.0,     -17.0,  -16.0),
+    (55941.0,   42.0, -101.0, 90.0, false, 1.0,       9.0,   -4.0),
+    (55942.0,   91.7,  -66.0, 90.0, false, 1.0,      25.0,   10.0),
+    (55944.0,  118.3,  -53.0, 90.0, false, 1.0,      27.0,   18.0),
+    (55945.0,  138.4,  -21.0, 90.0, false, 1.0,      47.0,   32.0),
+    (55946.0,  142.9,   -7.0, 90.0, false, 1.0,      57.0,   44.0),
+    (55947.0,  148.6,  -10.0, 90.0, false, 1.0,      53.0,   48.0),
+    (55948.0,  153.0,   11.0, 90.0, false, 1.0,      60.0,   54.0),
+    (55949.0,  160.0,   14.0, 90.0, false, 1.0,      59.0,   56.0),
+    (55950.0,  166.3,   19.0, 90.0, false, 1.0,      60.0,   58.0),
+];
+let sl = SafetyLimits::derive(7030.0, 1.0, None, None);
+let c = DecideCfg {
+    stage: Stage::Shadow, // real write path, exactly as captured
+    soc_hyst: 3.0,
+    min_dwell_s: 30.0,
+    trim_ki: 0.02,
+    orig_mode: 1,
+    state_recharge: sysstate::RECHARGE,
+    slew_w_per_s: sl.slew_w_per_s,
+    sanity_band_w: sl.sanity_band_w,
+    sanity_secs: sl.sanity_secs,
+    ema_adaptive: false,
+    ema_gain_up: 0.5,
+    ema_gain_down: 0.5,
+    smith: true, // live config: Smith on
+};
+// Live controller: frozen FF at the identified leak curve, ki 0.02.
+let mut acfg = crate::control::AdaptiveCfg::tuned();
+acfg.mode = crate::control::FfMode::Frozen;
+acfg.a0 = -4.9;
+acfg.b0 = -0.0458;
+acfg.seeded = true;
+acfg.ki = 0.02;
+let mut st = state(Kind::Adaptive(acfg));
+st.owner_us = true;
+st.last_flip_t = 0.0;
+st.last_out = Some(-338.0); // the write at the seed row (55922)
+// Steady mid-window Smith state: w_eff has long converged onto the written cap.
+st.smith_weff = -338.0;
+st.smith_weff_lag = -338.0;
+st.smith_prev_write = -338.0;
+// The residual integral as live had it: frozen through the 5.26 h window at the
+// pre-window value (solved from the 15 exact hold-regime rows; see diff pattern).
+st.ctrl.seed_integral(-17.0);
+
+let mut prev_t = 55921.0;
+let mut worst: f64 = 0.0; // over the exit rows; the in-window rows warm up the
+                          // reconstructed seeds (EMA/Smith/integral) unasserted
+for &(t, grid, reported, soc, ovr_fc, ovr_maxdis, acout, expect) in &rows[1..] {
+    let sg = socguard::enact(&socguard::Inputs {
+        bl_state: bl::SOCG_DEFAULT,
+        min_soc: 10.0,
+        charge_request: false,
+        dc_voltage: 52.0,
+        eff_max_charge_w: f64::NAN,
+        multi_supports_tpimf: true,
+        override_force_charge: ovr_fc,
+        ovr_max_discharge_w: ovr_maxdis,
+    });
+    let snap = Snapshot {
+        s: Sensors { grid, reported, target: 5.0, soc, state: sysstate::SCHEDULED_CHARGE },
+        dt: t - prev_t,
+        dt_clamped: false,
+        min_soc: 10.0,
+        lo: -7030.0,
+        hi: 7030.0,
+        effective_target: 5.0,
+        sg,
+        feed_block_charge: false,
+        feed_force_flat: false,
+        gen_disable_export: false,
+        gm_should_write: true,
+        shore_out: ShoreOut::default(),
+        hub4_actual: None,
+        ac_out_w: acout,
+        hub4mode_live: None,
+    };
+    let d = decide(&snap, &mut st, &c, t);
+    if t >= 55929.0 {
+        worst = worst.max((d.display_cmd - expect).abs());
+    }
+    prev_t = t;
+}
+assert!(worst <= 2.0, "window-exit replay drifted from the live capture: worst {worst:.1} W");
+}
+
 #[test]
 fn golden_window_tail_ema_replay_is_tick_exact() {
 // (t, grid, reported, soc, ovr_fc, ovr_maxdis, acout, expected_write) — live rows;
@@ -366,9 +484,10 @@ let c = DecideCfg {
     sanity_band_w: sl.sanity_band_w,
     sanity_secs: sl.sanity_secs,
     ema_adaptive: false,
-    // Captures predate asymmetric pacing + Smith — pin the as-run config.
+    // Captured under symmetric 0.5 write pacing — pinned for tick-exactness.
     ema_gain_up: 0.5,
     ema_gain_down: 0.5,
+    // Captures predate the Smith compensation - replay without it.
     smith: false,
 };
 let mut st = state(Kind::Stock);
