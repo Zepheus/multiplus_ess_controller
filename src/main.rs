@@ -450,6 +450,9 @@ fn main() {
         smith_prev_write: f64::NAN,
         oob_since: None,
         prev_force_charge: false,        ceded_external: false,
+        cyc_edges: [f64::NEG_INFINITY; loop_core::CYC_EDGES_MAX],
+        cyc_prev_load: f64::NAN,
+        cycling: false,
         sanity_trips: 0,
     };
     let cfg = loop_core::DecideCfg {
@@ -468,8 +471,9 @@ fn main() {
         ema_adaptive: false,
         ema_gain_up: loop_core::EMA_GAIN_UP,
         ema_gain_down: loop_core::EMA_GAIN_DOWN,
-        ema_gain_export_fast: args.export_fast_gain,
-        export_fast_dead_w: args.export_fast_dead_w,
+        errgain_dead_w: args.errgain_dead_w,
+        errgain_slope_w: args.errgain_slope_w,
+        errgain_cap: args.errgain_cap,
         smith: args.smith,
     };
     // Edge-triggered safety logging state (only log a trip when it newly fires).

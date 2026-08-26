@@ -241,6 +241,47 @@ pub struct Snapshot {
     pub hub4mode_live: Option<i32>,
 }
 
+/// Cycling-load detector parameters (identified from live hob captures; see
+/// tools/pace_sweep.py for the sweep that chose them).
+pub const CYC_EDGE_W: f64 = 300.0; // load-estimate jump that counts as an edge
+pub const CYC_DEBOUNCE_S: f64 = 3.0; // a multi-tick ramp is ONE edge
+pub const CYC_WINDOW_S: f64 = 30.0; // trailing window
+pub const CYC_COUNT: usize = 2; // >= this many edges in the window => cycling
+pub const CYC_EDGES_MAX: usize = 8;
+
+/// Update the cycling detector with this tick's load estimate (lag-corrected grid
+/// minus inverter power — the battery-side movement cancels, so our own actuation
+/// never trips it). Returns the regime decided from edges BEFORE this tick.
+fn cycling_update(st: &mut LoopState, t: f64, load_est: f64) -> bool {
+    // Decide from prior edges first: the current tick's own step must not gate itself
+    // (an isolated appliance step still deserves the fast arrest).
+    let cyc = st
+        .cyc_edges
+        .iter()
+        .filter(|&&e| e.is_finite() && t - e <= CYC_WINDOW_S)
+        .count()
+        >= CYC_COUNT;
+    let newest = st.cyc_edges.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if st.cyc_prev_load.is_finite()
+        && load_est.is_finite()
+        && (load_est - st.cyc_prev_load).abs() > CYC_EDGE_W
+        && t - newest > CYC_DEBOUNCE_S
+    {
+        // ring-buffer: overwrite the oldest slot
+        let (oldest_i, _) = st
+            .cyc_edges
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.total_cmp(b.1))
+            .expect("non-empty");
+        st.cyc_edges[oldest_i] = t;
+    }
+    if load_est.is_finite() {
+        st.cyc_prev_load = load_est;
+    }
+    cyc
+}
+
 /// State carried across ticks; `decide()` mutates it (integrator, ownership, trim state).
 pub struct LoopState {
     pub ctrl: Controller,
@@ -272,6 +313,13 @@ pub struct LoopState {
     /// another tool): we cede and never re-take until the process is restarted — a
     /// deliberate operator action must not be fought by an auto re-take.
     pub ceded_external: bool,
+    /// Cycling-load detector (see `DecideCfg::errgain_dead_w`): timestamps of the
+    /// last few debounced large load-estimate edges, plus the previous load estimate.
+    pub cyc_edges: [f64; CYC_EDGES_MAX],
+    pub cyc_prev_load: f64,
+    /// Regime the detector concluded LAST tick (edges observed strictly before the
+    /// tick being decided — the current tick's own step must not gate itself).
+    pub cycling: bool,
     /// Sanity-trip latch: how many times the sanity supervisor has forced a hand-back this
     /// run. Each trip DOUBLES the dwell required before re-takeover (capped), so a
     /// persistently-wrong controller escalates to hour-scale retries instead of flip-flopping
@@ -300,12 +348,19 @@ pub struct DecideCfg {
     /// Directional write-pacing gains (see `EMA_GAIN_UP`/`EMA_GAIN_DOWN`).
     pub ema_gain_up: f64,
     pub ema_gain_down: f64,
-    /// Export-conditional pacing: when the (lag-corrected) meter shows export beyond
-    /// `export_fast_dead_w` AND the pending step raises the setpoint (reduces export),
-    /// the up-gain becomes `ema_gain_export_fast`. `f64::INFINITY` deadband disables.
-    /// Values from the Pareto sweep over the live event library (tools/pace_sweep.py).
-    pub ema_gain_export_fast: f64,
-    pub export_fast_dead_w: f64,
+    /// Error-magnitude write pacing (error-squared-family nonlinear PI, standard in
+    /// process control): outside the cycling regime, the pacing gain scales with how
+    /// far the (lag-corrected) meter is from target —
+    ///   gain = base                                   for |err| <= errgain_dead_w
+    ///   gain = min(cap, base + (|err|-dead)/slope)    beyond it, both directions.
+    /// In a DETECTED CYCLING regime (see `cycling`) the gain stays at base and the
+    /// integrator freezes: near-Nyquist load cycles (induction hob) cannot be
+    /// rejected, chasing them amplifies, and their aliased residue would walk the
+    /// integral. `errgain_dead_w = f64::INFINITY` disables the feature entirely.
+    /// Values from the literature-idea sweep over live captures (tools/pace_sweep.py).
+    pub errgain_dead_w: f64,
+    pub errgain_slope_w: f64,
+    pub errgain_cap: f64,
     /// Smith-style meter-lag compensation (see `decide`). Event-library study
     /// (233 events, 2026-08-22): with compensation + 0.5 pacing the loop beats
     /// stock on export (-11%), import (-30%) AND export duration (-15%);
@@ -351,12 +406,17 @@ pub fn composed_command(
     ctrl: &mut Controller,
     actuating: bool,
     meter_corr_w: f64,
+    cycling: bool,
 ) -> f64 {
     let s = &snap.s;
     // Integrate only when OUR law is what the plant follows: not during force-charge
-    // (firmware drives) and not during an external discharge hold (floor drives).
-    let integrate =
-        actuating && !snap.sg.force_charge && !snap.sg.max_discharge_w.is_finite();
+    // (firmware drives), not during an external discharge hold (floor drives), and
+    // not in a cycling regime (the aliased residue of a near-Nyquist load cycle
+    // reads as slow drift and would walk the integral).
+    let integrate = actuating
+        && !snap.sg.force_charge
+        && !snap.sg.max_discharge_w.is_finite()
+        && !cycling;
     let mut cmd = ctrl.update(
         s.grid + meter_corr_w,
         s.reported,
@@ -553,7 +613,10 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
         st.smith_weff = f64::NAN;
         0.0
     };
-    let cmd = composed_command(snap, &mut st.ctrl, actuating, meter_corr);
+    // Cycling-load regime: decided from load-estimate edges BEFORE this tick.
+    let load_est = (snap.s.grid + meter_corr) - snap.s.reported;
+    st.cycling = cycling_update(st, t, load_est);
+    let cmd = composed_command(snap, &mut st.ctrl, actuating, meter_corr, st.cycling);
 
     // 3. Per-stage RAW write target (pre-slew).
     let mut display_cmd = cmd;
@@ -603,14 +666,18 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
         // pathological steps), then the hard design envelope.
         match raw {
             Write::Setpoint(v) => {
-                // Export-conditional pacing: arrest a measured export faster than the
-                // symmetric pace, but ONLY toward reducing it — never toward export,
-                // never on imports (sweep-validated on the live event library:
-                // shorter/shallower export, no oscillation on cycling loads).
-                let exporting = snap.s.grid + meter_corr < -cfg.export_fast_dead_w;
-                let step_up = st.last_out.is_some_and(|p| v > p);
-                let gain_up = if exporting && step_up { cfg.ema_gain_export_fast } else { cfg.ema_gain_up };
-                let ema = stock_write_ema(st.last_out, v, cfg.ema_adaptive, gain_up, cfg.ema_gain_down);
+                // Error-magnitude pacing (see DecideCfg::errgain_dead_w): big errors
+                // get arrested harder in BOTH directions; inside the deadband — and
+                // always in a cycling regime — stock-parity base gains apply.
+                let err = (snap.s.grid + meter_corr - snap.effective_target).abs();
+                let g = if !st.cycling && err.is_finite() && err > cfg.errgain_dead_w {
+                    (cfg.ema_gain_up + (err - cfg.errgain_dead_w) / cfg.errgain_slope_w)
+                        .min(cfg.errgain_cap)
+                } else {
+                    f64::NAN // sentinel: use the configured base gains unchanged
+                };
+                let (gu, gd) = if g.is_finite() { (g, g) } else { (cfg.ema_gain_up, cfg.ema_gain_down) };
+                let ema = stock_write_ema(st.last_out, v, cfg.ema_adaptive, gu, gd);
                 let sv = slew_limit(st.last_out, ema, cfg.slew_w_per_s, snap.dt);
                 let sv = crate::control::clamp(sv, snap.lo, snap.hi);
                 safety.slew_clamped = (sv - ema).abs() > 1e-6;
@@ -718,6 +785,9 @@ pub mod testutil {
             smith_weff_lag: f64::NAN,
             smith_prev_write: f64::NAN,
             ceded_external: false,
+            cyc_edges: [f64::NEG_INFINITY; CYC_EDGES_MAX],
+            cyc_prev_load: f64::NAN,
+            cycling: false,
             sanity_trips: 0,
         }
     }
@@ -740,8 +810,9 @@ pub mod testutil {
             // tick-exact replays stay exact. Production defaults are asymmetric.
             ema_gain_up: 0.5,
             ema_gain_down: 0.5,
-            ema_gain_export_fast: 0.5,
-            export_fast_dead_w: f64::INFINITY, // captured pre-feature: conditional pacing off
+            errgain_dead_w: f64::INFINITY, // captured pre-feature: err-gain pacing off
+            errgain_slope_w: 2000.0,
+            errgain_cap: 1.0, // captured pre-feature: conditional pacing off
             // Captures predate the Smith compensation - replay without it.
             smith: false,
         }
@@ -883,7 +954,7 @@ mod tests {
             charge_floor_w: 0.0,
         };
         let mut ctrl = Controller::new(Kind::Stock);
-        let cmd = composed_command(&sp, &mut ctrl, false, 0.0);
+        let cmd = composed_command(&sp, &mut ctrl, false, 0.0, false);
         assert_eq!(cmd, 4700.0);
     }
 
@@ -906,7 +977,7 @@ mod tests {
             charge_floor_w: 0.0,
         };
         let mut ctrl = Controller::new(Kind::Stock);
-        let cmd = composed_command(&sp, &mut ctrl, false, 0.0);
+        let cmd = composed_command(&sp, &mut ctrl, false, 0.0, false);
         // Normal law: reported + (target − grid) = 2513 + 5 − 2771.7 = −253.7 W.
         // the stock daemon wrote −230 W on this row (Δ = meter/tick noise).
         assert!((cmd - (-253.7)).abs() < 1.0, "normal law must pass through, got {cmd}");
@@ -928,7 +999,7 @@ mod tests {
         sp.sg.max_discharge_w = 1.0; // enact() of /Overrides/MaxDischargePower = 1
         sp.ac_out_w = 49.0; // measured Multi AC-out that morning
         let mut ctrl = Controller::new(Kind::Stock);
-        let cmd = composed_command(&sp, &mut ctrl, false, 0.0);
+        let cmd = composed_command(&sp, &mut ctrl, false, 0.0, false);
         // Stock's hold write = clamp(−1 W) + acOut = +48 W — live-verified frame
         // (see composed_command) and the EXACT value the stock daemon wrote on this live row.
         assert!((cmd - 48.0).abs() < 1e-9, "hold must float at −cap + acOut, got {cmd}");
@@ -936,7 +1007,7 @@ mod tests {
         // acOut unread (NaN): degrade to the bare cap — still no discharge.
         sp.ac_out_w = f64::NAN;
         let mut ctrl = Controller::new(Kind::Stock);
-        let cmd = composed_command(&sp, &mut ctrl, false, 0.0);
+        let cmd = composed_command(&sp, &mut ctrl, false, 0.0, false);
         assert!((cmd - (-1.0)).abs() < 1e-9, "NaN acOut degrades to the bare cap, got {cmd}");
 
         // Same row with the override cleared (window exit, or an AllowDischarge schedule
@@ -944,7 +1015,7 @@ mod tests {
         sp.sg = sg_free();
         sp.ac_out_w = 49.0;
         let mut ctrl = Controller::new(Kind::Stock);
-        let cmd = composed_command(&sp, &mut ctrl, false, 0.0);
+        let cmd = composed_command(&sp, &mut ctrl, false, 0.0, false);
         assert!(cmd < -1500.0, "cleared override must discharge normally, got {cmd}");
     }
 
@@ -959,12 +1030,12 @@ mod tests {
         sp.sg.max_discharge_w = 0.0; // BL no-discharge state
         sp.ac_out_w = 15.0;
         let mut ctrl = Controller::new(Kind::Stock);
-        let cmd = composed_command(&sp, &mut ctrl, false, 0.0);
+        let cmd = composed_command(&sp, &mut ctrl, false, 0.0, false);
         assert!((cmd - 15.0).abs() < 1e-9, "inhibit floor lifts to acOut, got {cmd}");
 
         sp.sg.charge_floor_w = 260.0; // state 6: dcV·5A
         let mut ctrl = Controller::new(Kind::Stock);
-        let cmd = composed_command(&sp, &mut ctrl, false, 0.0);
+        let cmd = composed_command(&sp, &mut ctrl, false, 0.0, false);
         assert!((cmd - 275.0).abs() < 1e-9, "charge floor lifts to dcV·5 + acOut, got {cmd}");
     }
 
@@ -1288,10 +1359,10 @@ mod tests {
     }
 
     #[test]
-    fn export_fast_pacing_arrests_export_faster_only() {
-        // Sweep-chosen export-conditional pacing (0.9 over 100 W deadband): a
-        // measured export with a rising setpoint paces at the fast gain; the same
-        // rise WITHOUT export (and any fall) keeps the symmetric 0.5.
+    fn errgain_paces_by_error_magnitude_both_directions() {
+        // Error-magnitude pacing: outside the deadband the write moves further per
+        // tick than base 0.5 — in BOTH directions; inside the deadband, and with the
+        // feature disabled, base pacing is unchanged.
         let run = |grid: f64, seed: f64, dead: f64| {
             let mut st = state(Kind::Stock);
             st.owner_us = true;
@@ -1301,22 +1372,87 @@ mod tests {
             sp.s.grid = grid;
             sp.s.reported = -900.0;
             let mut c = cfg(Stage::Takeover);
-            c.ema_gain_export_fast = 0.9;
-            c.export_fast_dead_w = dead;
+            c.errgain_dead_w = dead;
             let d = decide(&sp, &mut st, &c, 100.0);
             let Write::Setpoint(v) = d.write else { panic!("expected setpoint") };
             v
         };
-        // Exporting 600 W, seed far below the law => step up at 0.9 instead of 0.5.
-        let fast = run(-600.0, -2000.0, 100.0);
-        let slow = run(-600.0, -2000.0, f64::INFINITY); // feature disabled
-        assert!(fast > slow, "export step-up must pace faster: fast {fast} vs slow {slow}");
-        // Same export but the step goes DOWN (seed above the law): symmetric pace.
-        assert_eq!(run(-600.0, 0.0, 100.0), run(-600.0, 0.0, f64::INFINITY),
-            "down-steps never use the fast gain");
-        // Importing: identical regardless of the feature.
-        assert_eq!(run(300.0, -2000.0, 100.0), run(300.0, -2000.0, f64::INFINITY),
-            "imports never use the fast gain");
+        // Export error 1.6 kW: arrest paces harder than base.
+        let fast = run(-1600.0, -3000.0, 300.0);
+        let base = run(-1600.0, -3000.0, f64::INFINITY);
+        assert!(fast > base, "export arrest must pace harder: {fast} vs {base}");
+        // Import error 1.6 kW: ALSO paces harder (both directions, unlike the old
+        // directional feature) — the write moves further toward more discharge.
+        let fast_i = run(1600.0, 0.0, 300.0);
+        let base_i = run(1600.0, 0.0, f64::INFINITY);
+        assert!(fast_i < base_i, "import chase must pace harder: {fast_i} vs {base_i}");
+        // Inside the deadband: identical to base.
+        assert_eq!(run(150.0, -700.0, 300.0), run(150.0, -700.0, f64::INFINITY));
+    }
+
+    #[test]
+    fn cycling_detector_gates_errgain_and_freezes_integral() {
+        // A modulating load (edge train) flips the regime; an isolated edge does not.
+        // In the regime: err-gain reverts to base pacing and the integral freezes.
+        let mut c = cfg(Stage::Takeover);
+        c.errgain_dead_w = 300.0;
+        let mut st = state(Kind::Stock);
+        st.owner_us = true;
+        st.last_flip_t = 0.0;
+        st.last_out = Some(-500.0);
+        let mut t = 100.0;
+        let tick = |st: &mut LoopState, grid: f64, rep: f64, t: f64| {
+            let mut sp = snap(true);
+            sp.s.grid = grid;
+            sp.s.reported = rep;
+            decide(&sp, st, &c, t)
+        };
+        // Quiet baseline, then ONE isolated 2 kW load edge: regime must stay off
+        // on the edge tick itself (isolated steps deserve the fast arrest).
+        for _ in 0..5 {
+            tick(&mut st, 20.0, -500.0, t);
+            t += 1.0;
+        }
+        tick(&mut st, -1980.0, -500.0, t); // load dropped 2 kW -> export
+        assert!(!st.cycling, "one edge is not a cycling regime");
+        t += 1.0;
+        // Hob-like train: alternate the load estimate every ~6 s.
+        for k in 0..4 {
+            let grid = if k % 2 == 0 { 1500.0 } else { -1500.0 };
+            for _ in 0..6 {
+                tick(&mut st, grid, -500.0, t);
+                t += 1.0;
+            }
+        }
+        assert!(st.cycling, "edge train must flip the cycling regime");
+        // Integral frozen while cycling: exporting hard for many ticks must not
+        // walk the integral (its export tail would otherwise persist post-regime).
+        let i_before = st.ctrl.integral_w();
+        for _ in 0..10 {
+            tick(&mut st, -800.0, -500.0, t);
+            t += 1.0;
+        }
+        assert_eq!(st.ctrl.integral_w(), i_before, "integral must freeze in cycling");
+    }
+
+    #[test]
+    fn cycling_detector_ignores_own_actuation() {
+        // The detector watches the LOAD estimate (grid - reported): the battery
+        // ramping itself (both moving together) must never create edges.
+        let mut c = cfg(Stage::Takeover);
+        c.errgain_dead_w = 300.0;
+        let mut st = state(Kind::Stock);
+        st.owner_us = true;
+        st.last_flip_t = 0.0;
+        st.last_out = Some(0.0);
+        for k in 0..12 {
+            let ramp = -(k as f64) * 400.0; // battery ramping 0 -> -4.4 kW
+            let mut sp = snap(true);
+            sp.s.reported = ramp;
+            sp.s.grid = 20.0 + ramp; // grid moves WITH reported: load-est constant
+            decide(&sp, &mut st, &c, 100.0 + k as f64);
+        }
+        assert!(!st.cycling, "own actuation must not read as a cycling load");
     }
 
     #[test]

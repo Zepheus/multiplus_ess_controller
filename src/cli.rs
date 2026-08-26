@@ -20,10 +20,12 @@ pub struct Args {
     /// Smith-style meter-lag compensation (default on; --no-smith to disable).
     pub smith: bool,
     pub trim_ki: f64,
-    /// Export-conditional pacing (defaults from the Pareto sweep over the live
-    /// event library — see tools/pace_sweep.py; deadband INFINITY disables).
-    pub export_fast_gain: f64,
-    pub export_fast_dead_w: f64,
+    /// Error-magnitude pacing (see loop_core::DecideCfg::errgain_dead_w).
+    /// Default OFF (deadband INFINITY); enable with --errgain-dead-w (300 is the
+    /// sweep-chosen value; see tools/pace_sweep.py).
+    pub errgain_dead_w: f64,
+    pub errgain_slope_w: f64,
+    pub errgain_cap: f64,
     /// Safety overrides — None => derive from the design power (SafetyLimits::derive).
     pub slew_w_per_s: Option<f64>,
     pub sanity_band_w: Option<f64>,
@@ -37,8 +39,9 @@ pub fn parse_args() -> Result<Args, String> {
         min_soc: 15.0,
         soc_hyst: 3.0,
         max_discharge: 0.0, // 0 => read from settings / default
-        export_fast_gain: 0.9,
-        export_fast_dead_w: 100.0,
+        errgain_dead_w: f64::INFINITY,
+        errgain_slope_w: 2000.0,
+        errgain_cap: 1.0,
         max_charge: 0.0,
         seconds: 0,
         confirm: false,
@@ -102,13 +105,16 @@ pub fn parse_args() -> Result<Args, String> {
             "--confirm" => a.confirm = true,
             "--quiet" => a.quiet = true,
             "--no-smith" => a.smith = false,
-            "--export-fast-gain" => {
-                a.export_fast_gain = val()?.parse().map_err(|_| "bad --export-fast-gain")?
+            "--errgain-dead-w" => {
+                a.errgain_dead_w = val()?.parse().map_err(|_| "bad --errgain-dead-w")?
             }
-            "--export-fast-dead-w" => {
-                a.export_fast_dead_w = val()?.parse().map_err(|_| "bad --export-fast-dead-w")?
+            "--errgain-slope-w" => {
+                a.errgain_slope_w = val()?.parse().map_err(|_| "bad --errgain-slope-w")?
             }
-            "--no-export-fast" => a.export_fast_dead_w = f64::INFINITY,
+            "--errgain-cap" => {
+                a.errgain_cap = val()?.parse().map_err(|_| "bad --errgain-cap")?
+            }
+            "--no-errgain" => a.errgain_dead_w = f64::INFINITY,
             "--telemetry" => a.telemetry = Some(val()?),
             "--telemetry-max-mb" => {
                 a.telemetry_max_mb = val()?.parse().map_err(|_| "bad --telemetry-max-mb")?

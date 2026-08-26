@@ -278,6 +278,12 @@ impl Controller {
         self.i = w;
     }
 
+    /// Read the residual integral (regime tests assert the freeze).
+    #[cfg(test)]
+    pub fn integral_w(&self) -> f64 {
+        self.i
+    }
+
     pub fn reset(&mut self) {
         self.cmd = None;
         self.i = 0.0;

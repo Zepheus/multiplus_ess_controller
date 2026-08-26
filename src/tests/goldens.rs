@@ -69,8 +69,9 @@ let c = DecideCfg {
     // Captured under symmetric 0.5 write pacing — pinned for tick-exactness.
     ema_gain_up: 0.5,
     ema_gain_down: 0.5,
-    ema_gain_export_fast: 0.5,
-    export_fast_dead_w: f64::INFINITY, // captured pre-feature: conditional pacing off
+    errgain_dead_w: f64::INFINITY, // captured pre-feature: err-gain pacing off
+    errgain_slope_w: 2000.0,
+    errgain_cap: 1.0,
     // Captures predate the Smith compensation - replay without it.
     smith: false,
 };
@@ -223,8 +224,9 @@ let c = DecideCfg {
     // Captured under symmetric 0.5 write pacing — pinned for tick-exactness.
     ema_gain_up: 0.5,
     ema_gain_down: 0.5,
-    ema_gain_export_fast: 0.5,
-    export_fast_dead_w: f64::INFINITY, // captured pre-feature: conditional pacing off
+    errgain_dead_w: f64::INFINITY, // captured pre-feature: err-gain pacing off
+    errgain_slope_w: 2000.0,
+    errgain_cap: 1.0,
     // Captures predate the Smith compensation - replay without it.
     smith: false,
 };
@@ -382,8 +384,9 @@ let c = DecideCfg {
     ema_adaptive: false,
     ema_gain_up: 0.5,
     ema_gain_down: 0.5,
-    ema_gain_export_fast: 0.5,
-    export_fast_dead_w: f64::INFINITY, // captured pre-feature: conditional pacing off
+    errgain_dead_w: f64::INFINITY, // captured pre-feature: err-gain pacing off
+    errgain_slope_w: 2000.0,
+    errgain_cap: 1.0,
     smith: true, // live config: Smith on
 };
 // Live controller: frozen FF at the identified leak curve, ki 0.02.
@@ -446,6 +449,253 @@ for &(t, grid, reported, soc, ovr_fc, ovr_maxdis, acout, expect) in &rows[1..] {
 assert!(worst <= 2.0, "window-exit replay drifted from the live capture: worst {worst:.1} W");
 }
 
+/// Drive the FULL decide() write path (EMA + err-gain + cycling detector +
+/// Smith) over a synthetic load on the identified plant. Returns the grid
+/// trace and whether the cycling regime ever engaged.
+fn sim_decide_plant(load: &[f64], errgain: bool) -> (Vec<f64>, bool) {
+    use crate::loop_core::plant;
+    let sl = SafetyLimits::derive(7030.0, 1.0, None, None);
+    let c = DecideCfg {
+        stage: Stage::Takeover,
+        soc_hyst: 3.0,
+        min_dwell_s: 30.0,
+        trim_ki: 0.02,
+        orig_mode: 1,
+        state_recharge: sysstate::RECHARGE,
+        slew_w_per_s: sl.slew_w_per_s,
+        sanity_band_w: sl.sanity_band_w,
+        sanity_secs: sl.sanity_secs,
+        ema_adaptive: false,
+        ema_gain_up: 0.5,
+        ema_gain_down: 0.5,
+        errgain_dead_w: if errgain { 300.0 } else { f64::INFINITY },
+        errgain_slope_w: 2000.0,
+        errgain_cap: 1.0,
+        smith: true,
+    };
+    let mut st = state(Kind::Pi { ki: 0.02, i_max: 300.0 });
+    st.owner_us = true;
+    st.last_flip_t = 0.0;
+    let (mut weff, mut pending) = (0.0f64, 0.0f64);
+    let mut grid_ring: Vec<f64> = vec![];
+    let mut trace = vec![];
+    let mut saw_cycling = false;
+    for (k, &ld) in load.iter().enumerate() {
+        weff += plant::ALPHA * (pending - weff);
+        let rep = plant::A + plant::B * weff;
+        let grid_true = ld + rep;
+        grid_ring.push(grid_true);
+        let lag = plant::METER_LAG_S;
+        let gm = if grid_ring.len() > lag { grid_ring[grid_ring.len() - 1 - lag] } else { grid_true };
+        let sg = socguard::enact(&socguard::Inputs {
+            bl_state: bl::SOCG_DEFAULT,
+            min_soc: 10.0,
+            charge_request: false,
+            dc_voltage: 52.0,
+            eff_max_charge_w: f64::NAN,
+            multi_supports_tpimf: true,
+            override_force_charge: false,
+            ovr_max_discharge_w: f64::NAN,
+        });
+        let snap = Snapshot {
+            s: Sensors { grid: gm, reported: rep, target: 5.0, soc: 70.0, state: sysstate::DISCHARGING },
+            dt: 1.0,
+            dt_clamped: false,
+            min_soc: 10.0,
+            lo: -7030.0,
+            hi: 7030.0,
+            effective_target: 5.0,
+            sg,
+            feed_block_charge: false,
+            feed_force_flat: false,
+            gen_disable_export: false,
+            gm_should_write: true,
+            shore_out: ShoreOut::default(),
+            hub4_actual: None,
+            ac_out_w: 20.0,
+            hub4mode_live: None,
+        };
+        let d = decide(&snap, &mut st, &c, k as f64);
+        saw_cycling |= st.cycling;
+        if let Write::Setpoint(v) = d.write {
+            pending = v - 20.0; // acOut feed-forward frame back to battery-side
+        }
+        trace.push(grid_true);
+    }
+    (trace, saw_cycling)
+}
+
+/// Err-gain regime behavior on the identified plant: (a) a modulating (hob-like)
+/// load flips the cycling regime and the feature goes NEUTRAL — same exchange as
+/// base pacing within a few percent; (b) an ISOLATED step-off arrests strictly
+/// faster with the feature on. This pins the whole design contract.
+#[test]
+fn errgain_hob_neutral_isolated_step_faster() {
+    // (a) hob: 300 s of 3 kW square wave, 8 s per phase, after a quiet warm-up.
+    let mut hob = vec![400.0f64; 60];
+    for k in 0..300 {
+        hob.push(if (k / 8) % 2 == 0 { 3400.0 } else { 400.0 });
+    }
+    let (t_on, cyc_on) = sim_decide_plant(&hob, true);
+    let (t_off, _) = sim_decide_plant(&hob, false);
+    assert!(cyc_on, "hob square wave must engage the cycling regime");
+    let xchg = |tr: &[f64]| -> f64 {
+        tr[60..].iter().map(|g| (g - 5.0).abs()).sum::<f64>() / 3600.0
+    };
+    let (a, b) = (xchg(&t_on), (xchg(&t_off)));
+    assert!(
+        (a - b).abs() / b < 0.05,
+        "err-gain must be neutral on the hob: on {a:.2} Wh vs off {b:.2} Wh"
+    );
+    // (b) isolated 1.5 kW step-off out of quiet: strictly faster arrest.
+    let mut step = vec![1900.0f64; 120];
+    step.extend(vec![400.0f64; 60]);
+    let (t_on, _) = sim_decide_plant(&step, true);
+    let (t_off, _) = sim_decide_plant(&step, false);
+    let exp = |tr: &[f64]| -> (f64, usize) {
+        let e: f64 = tr[120..].iter().filter(|&&g| g < 0.0).map(|g| -g / 3600.0).sum();
+        let d = tr[120..].iter().filter(|&&g| g < -100.0).count();
+        (e, d)
+    };
+    let (e_on, d_on) = exp(&t_on);
+    let (e_off, d_off) = exp(&t_off);
+    assert!(
+        e_on < e_off && d_on <= d_off,
+        "err-gain must arrest an isolated step-off faster: on {e_on:.2}Wh/{d_on}s vs off {e_off:.2}Wh/{d_off}s"
+    );
+}
+
+/// 2026-08-26 live: a ~1.3 kW microwave step-off onto a discharging battery —
+/// the isolated-appliance export-arrest case, replayed tick-exact under the live
+/// config (symmetric 0.5, Smith, frozen FF, ki 0.02). Pins today's recovery shape
+/// (the err-gain feature replays OFF here: the capture predates it).
+#[test]
+fn golden_microwave_stepoff_2026_08_26() {
+// (t, grid, reported, soc, ovr_fc, ovr_maxdis, acout, recorded_write)
+type Row = (f64, f64, f64, f64, bool, f64, f64, f64);
+#[rustfmt::skip]
+let rows: &[Row] = &[
+    (45590.0, -54.6, -1728.0, 85.0, false, f64::NAN, 25.0, -1811.0),
+    (45591.0, 4.6, -1720.0, 85.0, false, f64::NAN, 27.0, -1827.0),
+    (45592.0, 39.4, -1652.0, 85.0, false, f64::NAN, 5.0, -1816.0),
+    (45593.0, 98.1, -1694.0, 85.0, false, f64::NAN, 11.0, -1858.0),
+    (45595.0, 34.0, -1706.0, 85.0, false, f64::NAN, 13.0, -1843.0),
+    (45596.0, 19.1, -1567.0, 85.0, false, f64::NAN, 8.0, -1755.0),
+    (45597.0, -1034.6, -1682.0, 85.0, false, f64::NAN, 1.0, -1292.0),
+    (45598.0, -1261.8, -1587.0, 85.0, false, f64::NAN, 8.0, -1078.0),
+    (45599.0, -1003.1, -1368.0, 85.0, false, f64::NAN, 15.0, -1069.0),
+    (45600.0, -749.8, -1164.0, 85.0, false, f64::NAN, -17.0, -927.0),
+    (45601.0, -712.6, -1107.0, 85.0, false, f64::NAN, -1.0, -784.0),
+    (45602.0, -656.5, -997.0, 85.0, false, f64::NAN, 21.0, -722.0),
+    (45603.0, -566.6, -831.0, 85.0, false, f64::NAN, 14.0, -625.0),
+    (45605.0, -401.4, -758.0, 85.0, false, f64::NAN, 9.0, -598.0),
+    (45606.0, -314.5, -672.0, 85.0, false, f64::NAN, 5.0, -564.0),
+    (45607.0, -277.6, -647.0, 85.0, false, f64::NAN, 9.0, -524.0),
+    (45608.0, -271.8, -667.0, 85.0, false, f64::NAN, 16.0, -515.0),
+    (45609.0, -227.7, -575.0, 85.0, false, f64::NAN, 21.0, -474.0),
+    (45610.0, -179.0, -550.0, 85.0, false, f64::NAN, 30.0, -462.0),
+    (45611.0, -156.3, -505.0, 85.0, false, f64::NAN, 45.0, -444.0),
+    (45612.0, -135.0, -494.0, 85.0, false, f64::NAN, 51.0, -430.0),
+    (45613.0, -118.5, -487.0, 85.0, false, f64::NAN, 50.0, -425.0),
+    (45614.0, -100.7, -439.0, 85.0, false, f64::NAN, 61.0, -401.0),
+    (45616.0, -96.2, -413.0, 85.0, false, f64::NAN, 64.0, -379.0),
+    (45617.0, -56.5, -410.0, 85.0, false, f64::NAN, 56.0, -393.0),
+    (45618.0, -44.1, -402.0, 85.0, false, f64::NAN, 60.0, -389.0),
+    (45619.0, -49.6, -413.0, 85.0, false, f64::NAN, 48.0, -380.0),
+    (45620.0, -45.7, -407.0, 85.0, false, f64::NAN, 49.0, -380.0),
+    (45621.0, -62.0, -422.0, 85.0, false, f64::NAN, 49.0, -379.0),
+    (45622.0, -64.7, -418.0, 85.0, false, f64::NAN, 47.0, -371.0),
+    (45623.0, -45.0, -396.0, 85.0, false, f64::NAN, 52.0, -368.0),
+    (45624.0, -43.1, -394.0, 85.0, false, f64::NAN, 45.0, -367.0),
+    (45626.0, -44.5, -375.0, 85.0, false, f64::NAN, 51.0, -353.0),
+    (45627.0, -30.4, -389.0, 85.0, false, f64::NAN, 46.0, -364.0),
+    (45628.0, -37.1, -377.0, 85.0, false, f64::NAN, 48.0, -355.0),
+    (45629.0, -18.9, -357.0, 85.0, false, f64::NAN, 51.0, -347.0),
+    (45630.0, -14.7, -334.0, 85.0, false, f64::NAN, 60.0, -339.0),
+    (45631.0, -6.0, -337.0, 85.0, false, f64::NAN, 56.0, -342.0),
+    (45632.0, -6.5, -340.0, 85.0, false, f64::NAN, 57.0, -341.0),
+    (45633.0, -9.0, -336.0, 85.0, false, f64::NAN, 63.0, -334.0),
+    (45634.0, -5.6, -329.0, 85.0, false, f64::NAN, 59.0, -331.0),
+    (45635.0, -10.2, -327.0, 85.0, false, f64::NAN, 50.0, -328.0),
+    (45636.0, -11.7, -326.0, 85.0, false, f64::NAN, 58.0, -323.0),
+    (45638.0, -5.3, -321.0, 85.0, false, f64::NAN, 55.0, -322.0),
+    (45639.0, -11.3, -317.0, 85.0, false, f64::NAN, 46.0, -316.0),
+    (45640.0, 15.0, -316.0, 85.0, false, f64::NAN, 47.0, -326.0),
+];
+let sl = SafetyLimits::derive(7030.0, 1.0, None, None);
+let c = DecideCfg {
+    stage: Stage::Takeover, // the capture is a LIVE takeover: the integral runs
+    soc_hyst: 3.0,
+    min_dwell_s: 30.0,
+    trim_ki: 0.02,
+    orig_mode: 1,
+    state_recharge: sysstate::RECHARGE,
+    slew_w_per_s: sl.slew_w_per_s,
+    sanity_band_w: sl.sanity_band_w,
+    sanity_secs: sl.sanity_secs,
+    ema_adaptive: false,
+    ema_gain_up: 0.5,
+    ema_gain_down: 0.5,
+    errgain_dead_w: f64::INFINITY, // capture predates the feature
+    errgain_slope_w: 2000.0,
+    errgain_cap: 1.0,
+    smith: true,
+};
+let mut acfg = crate::control::AdaptiveCfg::tuned();
+acfg.mode = crate::control::FfMode::Frozen;
+acfg.a0 = -4.9;
+acfg.b0 = -0.0458;
+acfg.seeded = true;
+acfg.ki = 0.02;
+let mut st = state(Kind::Adaptive(acfg));
+st.owner_us = true;
+st.last_flip_t = 0.0;
+st.last_out = Some(-1811.0);
+st.smith_weff = -1811.0;
+st.smith_weff_lag = -1811.0;
+st.smith_prev_write = -1811.0;
+st.ctrl.seed_integral(-32.0); // steady-state residual solved from the pre-event rows
+
+let mut prev_t = 45589.0;
+let mut worst: f64 = 0.0; // asserted from the step-off onward; earlier rows warm up seeds
+for &(t, grid, reported, soc, ovr_fc, ovr_maxdis, acout, expect) in &rows[1..] {
+    let sg = socguard::enact(&socguard::Inputs {
+        bl_state: bl::SOCG_DEFAULT,
+        min_soc: 10.0,
+        charge_request: false,
+        dc_voltage: 52.0,
+        eff_max_charge_w: f64::NAN,
+        multi_supports_tpimf: true,
+        override_force_charge: ovr_fc,
+        ovr_max_discharge_w: ovr_maxdis,
+    });
+    let snap = Snapshot {
+        s: Sensors { grid, reported, target: 5.0, soc, state: sysstate::DISCHARGING },
+        dt: t - prev_t,
+        dt_clamped: false,
+        min_soc: 10.0,
+        lo: -7030.0,
+        hi: 7030.0,
+        effective_target: 5.0,
+        sg,
+        feed_block_charge: false,
+        feed_force_flat: false,
+        gen_disable_export: false,
+        gm_should_write: true,
+        shore_out: ShoreOut::default(),
+        hub4_actual: None,
+        ac_out_w: acout,
+        hub4mode_live: None,
+    };
+    let d = decide(&snap, &mut st, &c, t);
+    if t >= 45597.0 {
+        worst = worst.max((d.display_cmd - expect).abs());
+    }
+    prev_t = t;
+}
+assert!(worst <= 4.0, "microwave replay drifted from the live capture: worst {worst:.1} W");
+}
+
 #[test]
 fn golden_window_tail_ema_replay_is_tick_exact() {
 // (t, grid, reported, soc, ovr_fc, ovr_maxdis, acout, expected_write) — live rows;
@@ -493,8 +743,9 @@ let c = DecideCfg {
     // Captured under symmetric 0.5 write pacing — pinned for tick-exactness.
     ema_gain_up: 0.5,
     ema_gain_down: 0.5,
-    ema_gain_export_fast: 0.5,
-    export_fast_dead_w: f64::INFINITY, // captured pre-feature: conditional pacing off
+    errgain_dead_w: f64::INFINITY, // captured pre-feature: err-gain pacing off
+    errgain_slope_w: 2000.0,
+    errgain_cap: 1.0,
     // Captures predate the Smith compensation - replay without it.
     smith: false,
 };

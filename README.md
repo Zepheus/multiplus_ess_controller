@@ -300,17 +300,20 @@ writing faster than the meter refreshes just chases stale readings.
 
 - **`--interval <s>`** — control tick. Keep at the meter's refresh period or slower.
 - **Write pacing** (`ema_gain` 0.5 symmetric) mimics the stock loop and is right for
-  ~1 s meters. On top of it sits **export-conditional pacing** (default
-  `--export-fast-gain 0.9 --export-fast-dead-w 100`; `--no-export-fast` to
-  disable): when the meter shows real export beyond the deadband and the pending
-  step would reduce it, the correction paces faster — arresting appliance
-  step-off exports sooner without touching import behaviour or down-steps. The
-  shipped values are the knee of a Pareto sweep over a full day's live event
-  library (shorter and shallower export, no oscillation on cycling loads);
-  **`tools/pace_sweep.py` documents the method and re-derives them for your
-  system** from your own telemetry captures. The stock firmware's own adaptive
-  pacing exists only for sub-250 ms meters; measure before assuming either
-  mechanism helps on yours.
+  ~1 s meters. On top of it sits optional **error-magnitude pacing with a
+  cycling-load gate** (`--errgain-dead-w 300` to enable; off by default): outside
+  a detected cycling regime, the pacing gain scales with how far the meter is
+  from target (0.5 inside the deadband, up to 1.0 at multi-kW errors, both
+  directions) — arresting isolated appliance step-offs/ons faster. A built-in
+  detector counts large *load-estimate* edges (battery-side movement cancels, so
+  the loop's own actuation never trips it); two or more edges in 30 s means a
+  modulating load (induction hob), where near-Nyquist cycles cannot be chased —
+  pacing reverts to stock-parity 0.5 and the integrator freezes so aliased
+  residue cannot walk it. Values are from a literature-and-sweep study over live
+  captures (**`tools/pace_sweep.py`** documents the method; re-derive for your
+  system from your own telemetry). The stock firmware's own adaptive pacing
+  exists only for sub-250 ms meters; measure before assuming any of this helps
+  on yours.
 - **Smith meter-lag compensation** (`--no-smith` to disable) exists precisely
   *because* slow meters report ~1 s stale. With a genuinely fast meter (EM540,
   VM-3P75CT) most of its benefit is already in the hardware — set the meter-lag
