@@ -1,13 +1,13 @@
 //! Battery charge/discharge limit broker (Tier A).
 //!
 //! Converts the live BMS/DVCC current limits into the AC-side (lo, hi) power clamp
-//! the control loop uses, so we never command past what the battery allows. This is
+//! the ControlLoop uses, so we never command past what the battery allows. This is
 //! the safety-critical piece the earlier build was missing: it clamped discharge to
 //! a *static* startup value and never tracked the live BMS discharge-current limit,
 //! so if the BMS lowers its limit (cold / low SOC / cell imbalance) we would not
 //! follow it down.
 //!
-//! empirically modelled and validated live (280 A × 52.44 V × 0.9 = 13214.9 W matched
+//! Validated live (280 A × 52.44 V × 0.9 = 13214.9 W matched
 //! the published /MaxDischargePower to the watt).
 //!
 //! Tier A scope: the read-only broker + clamp only. No hub4 D-Bus server and no
@@ -267,9 +267,9 @@ impl BatteryBroker {
     }
 
     /// Read live inputs and recompute limits. Returns both the PUBLISHED limits
-    /// (what the stock ESS loop puts on `/MaxChargePower` / `/MaxDischargePower`, pre-
+    /// (what the stock daemon puts on `/MaxChargePower` / `/MaxDischargePower`, pre-
     /// tightening — used for golden regression) and the ENFORCED clamp for the
-    /// control loop (discharge additionally zeroed in BatteryLife discharged states
+    /// ControlLoop (discharge additionally zeroed in BatteryLife discharged states
     /// {5,6,8,11,12}). Reads are cheap; call once per tick, not the control hot path.
     pub fn tick(&mut self, bus: &dyn Bus) -> TickResult {
         let i = self.read(bus);
@@ -309,6 +309,18 @@ pub fn clamp_bounds(enforced: Limits, env_lo: f64, env_hi: f64) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamp_bounds_follow_stock_with_absurdity_envelope() {
+        // Stock parity: the loop bound is the BMS/user/override discharge bound
+        // (live: 280 A x 52.6 V x 0.9 = 13245 W), NOT an inverter-capacity constant.
+        // The envelope is only the +-138 kW absurdity ceiling stock also applies.
+        let enforced = Limits { max_charge_power: f64::NAN, max_discharge_power: 13245.0 };
+        let (lo, hi) = clamp_bounds(enforced, -crate::loop_core::ABSURD_CLAMP_W, crate::loop_core::ABSURD_CLAMP_W);
+        assert!((lo + 13245.0).abs() < 1e-9, "discharge bound must be the BMS figure, got {lo}");
+        assert!((hi - crate::loop_core::ABSURD_CLAMP_W).abs() < 1e-9 || hi >= 0.0);
+    }
+
     use crate::control::clamp;
     use std::collections::HashMap;
 
@@ -488,7 +500,7 @@ mod tests {
         }
     }
 
-    // ---- GOLDEN REPLAY: real captured snapshots vs the stock ESS loop's actual output ----
+    // ---- GOLDEN REPLAY: real captured snapshots vs the stock daemon's actual output ----
 
     #[test]
     fn golden_replay_matches_hub4_maxdischarge() {

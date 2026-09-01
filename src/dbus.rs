@@ -23,6 +23,8 @@ pub const P_MAXDISCHARGE: &str = "/Settings/CGwacs/MaxDischargePower";
 pub const P_MAXCHARGE: &str = "/Settings/CGwacs/MaxChargePower";
 /// The per-phase command we write in mode 3 (on the vebus service).
 pub const P_HUB4_SETPOINT: &str = "/Hub4/L1/AcPowerSetpoint";
+/// Inverter pair's advertised nominal power (W); saturation reference for the loop.
+pub const P_NOMINAL_INVERTER: &str = "/Ac/Out/L1/NominalInverterPower";
 
 // --- battery-limit broker inputs (Tier A) ---
 pub const P_DVCC: &str = "/Control/Dvcc"; // SYS, bool

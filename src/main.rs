@@ -374,11 +374,14 @@ fn main() {
         None => None,
     };
 
-    // Outer envelope (defence in depth): CLI --max-* if given, else the hard sanity
-    // clamp. The battery broker supplies the live BMS-derived ceiling per tick on top
-    // of this, so the effective clamp tracks the battery's dynamic limits.
-    let env_lo = -pick_limit(args.max_discharge, None, HARD_CLAMP_W).min(HARD_CLAMP_W);
-    let env_hi = pick_limit(args.max_charge, None, HARD_CLAMP_W).min(HARD_CLAMP_W);
+    // Outer envelope: CLI --max-* if given, else the +-138 kW absurdity ceiling the
+    // stock writer applies. The command bound itself follows stock: the battery
+    // broker's live BMS/user/override discharge limit (verified in the stock binary —
+    // there is no inverter-capacity term; the inverters police their own capacity).
+    let env_lo = -pick_limit(args.max_discharge, None, loop_core::ABSURD_CLAMP_W)
+        .min(loop_core::ABSURD_CLAMP_W);
+    let env_hi = pick_limit(args.max_charge, None, loop_core::ABSURD_CLAMP_W)
+        .min(loop_core::ABSURD_CLAMP_W);
 
     // Design-power anchor for the safety layer: the explicit --max-* envelope if given, else the
     // inverter design capacity. slew / sanity-band / dt-clamp all DERIVE from this (each still
@@ -453,8 +456,20 @@ fn main() {
         cyc_edges: [f64::NEG_INFINITY; loop_core::CYC_EDGES_MAX],
         cyc_prev_load: f64::NAN,
         cycling: false,
+        prev_saturated: 0,
         sanity_trips: 0,
     };
+    // Saturation reference: the pair's advertised nominal power. Unknown => INFINITY
+    // (saturation then only detectable at the clamp bounds).
+    let inverter_nominal_w = bus
+        .get_f64(VEBUS, P_NOMINAL_INVERTER)
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(f64::INFINITY);
+    eprintln!(
+        "inverter nominal {inverter_nominal_w:.0} W (saturation beyond {:.0} W); bounds follow stock: BMS/user/override, +-{:.0} W ceiling",
+        inverter_nominal_w * loop_core::CAPACITY_MARGIN,
+        loop_core::ABSURD_CLAMP_W
+    );
     let cfg = loop_core::DecideCfg {
         stage: args.stage,
         soc_hyst: args.soc_hyst,
@@ -474,6 +489,7 @@ fn main() {
         errgain_dead_w: args.errgain_dead_w,
         errgain_slope_w: args.errgain_slope_w,
         errgain_cap: args.errgain_cap,
+        inverter_nominal_w,
         smith: args.smith,
     };
     // Edge-triggered safety logging state (only log a trip when it newly fires).

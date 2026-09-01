@@ -72,6 +72,7 @@ let c = DecideCfg {
     errgain_dead_w: f64::INFINITY, // captured pre-feature: err-gain pacing off
     errgain_slope_w: 2000.0,
     errgain_cap: 1.0,
+    inverter_nominal_w: f64::INFINITY,
     // Captures predate the Smith compensation - replay without it.
     smith: false,
 };
@@ -227,6 +228,7 @@ let c = DecideCfg {
     errgain_dead_w: f64::INFINITY, // captured pre-feature: err-gain pacing off
     errgain_slope_w: 2000.0,
     errgain_cap: 1.0,
+    inverter_nominal_w: f64::INFINITY,
     // Captures predate the Smith compensation - replay without it.
     smith: false,
 };
@@ -387,6 +389,7 @@ let c = DecideCfg {
     errgain_dead_w: f64::INFINITY, // captured pre-feature: err-gain pacing off
     errgain_slope_w: 2000.0,
     errgain_cap: 1.0,
+    inverter_nominal_w: f64::INFINITY,
     smith: true, // live config: Smith on
 };
 // Live controller: frozen FF at the identified leak curve, ki 0.02.
@@ -471,6 +474,7 @@ fn sim_decide_plant(load: &[f64], errgain: bool) -> (Vec<f64>, bool) {
         errgain_dead_w: if errgain { 300.0 } else { f64::INFINITY },
         errgain_slope_w: 2000.0,
         errgain_cap: 1.0,
+        inverter_nominal_w: f64::INFINITY,
         smith: true,
     };
     let mut st = state(Kind::Pi { ki: 0.02, i_max: 300.0 });
@@ -639,6 +643,7 @@ let c = DecideCfg {
     errgain_dead_w: f64::INFINITY, // capture predates the feature
     errgain_slope_w: 2000.0,
     errgain_cap: 1.0,
+    inverter_nominal_w: f64::INFINITY,
     smith: true,
 };
 let mut acfg = crate::control::AdaptiveCfg::tuned();
@@ -746,6 +751,7 @@ let c = DecideCfg {
     errgain_dead_w: f64::INFINITY, // captured pre-feature: err-gain pacing off
     errgain_slope_w: 2000.0,
     errgain_cap: 1.0,
+    inverter_nominal_w: f64::INFINITY,
     // Captures predate the Smith compensation - replay without it.
     smith: false,
 };

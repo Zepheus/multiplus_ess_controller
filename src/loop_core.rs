@@ -28,8 +28,14 @@ use crate::Stage;
 pub const INVERTER_CONT_PAIR_W: f64 = 7400.0;
 /// Never command past this fraction of continuous rating.
 pub const CAPACITY_MARGIN: f64 = 0.95;
-/// Absolute design-capacity command clamp (W), both directions.
+/// Design-capacity anchor (W) for the DERIVED safety parameters (slew rate, sanity
+/// band). NOT a command bound any more: the loop bound follows stock — the
+/// BMS/user/override discharge limit — and the inverters police their own
+/// capacity (verified in the stock binary: no inverter-capacity term exists).
 pub const HARD_CLAMP_W: f64 = INVERTER_CONT_PAIR_W * CAPACITY_MARGIN;
+/// Absurdity ceiling on any written setpoint, both directions — the same +-138 kW
+/// the stock writer applies (constants read from the binary: 138000.0 / -138000.0).
+pub const ABSURD_CLAMP_W: f64 = 138_000.0;
 
 /// Glitch-guard slew allows at most a full design-range move in this many seconds — so it only
 /// blunts a gross single-tick jump, never normal control (the Multi already ramps ~400 W/s).
@@ -320,6 +326,11 @@ pub struct LoopState {
     /// Regime the detector concluded LAST tick (edges observed strictly before the
     /// tick being decided — the current tick's own step must not gate itself).
     pub cycling: bool,
+    /// Envelope saturation of the LAST write: -1 pinned at `lo` (max discharge),
+    /// +1 pinned at `hi` (max charge), 0 free. A persistent grid error while pinned
+    /// in the matching direction is capacity, not a fault — the sanity supervisor
+    /// must not hand back for it (stock simply imports/exports the remainder).
+    pub prev_saturated: i8,
     /// Sanity-trip latch: how many times the sanity supervisor has forced a hand-back this
     /// run. Each trip DOUBLES the dwell required before re-takeover (capped), so a
     /// persistently-wrong controller escalates to hour-scale retries instead of flip-flopping
@@ -361,6 +372,12 @@ pub struct DecideCfg {
     pub errgain_dead_w: f64,
     pub errgain_slope_w: f64,
     pub errgain_cap: f64,
+    /// The inverter pair's advertised nominal power (`/Ac/Out/L1/NominalInverterPower`,
+    /// live 9000 W). A request beyond `CAPACITY_MARGIN x` this is treated as plant
+    /// saturation (see `LoopState::prev_saturated`): the inverters limit themselves
+    /// and the grid carries the remainder — capacity, not a control fault.
+    /// `f64::INFINITY` when unknown (then only the clamp bounds detect saturation).
+    pub inverter_nominal_w: f64,
     /// Smith-style meter-lag compensation (see `decide`). Event-library study
     /// (233 events, 2026-08-22): with compensation + 0.5 pacing the loop beats
     /// stock on export (-11%), import (-30%) AND export duration (-15%);
@@ -406,17 +423,18 @@ pub fn composed_command(
     ctrl: &mut Controller,
     actuating: bool,
     meter_corr_w: f64,
-    cycling: bool,
+    freeze_integral: bool,
 ) -> f64 {
     let s = &snap.s;
     // Integrate only when OUR law is what the plant follows: not during force-charge
     // (firmware drives), not during an external discharge hold (floor drives), and
-    // not in a cycling regime (the aliased residue of a near-Nyquist load cycle
-    // reads as slow drift and would walk the integral).
+    // not when the caller says freeze — a cycling regime (aliased residue of a
+    // near-Nyquist load cycle reads as slow drift) or plant saturation (the error
+    // cannot be closed; winding would only overshoot when the load drops).
     let integrate = actuating
         && !snap.sg.force_charge
         && !snap.sg.max_discharge_w.is_finite()
-        && !cycling;
+        && !freeze_integral;
     let mut cmd = ctrl.update(
         s.grid + meter_corr_w,
         s.reported,
@@ -487,10 +505,16 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
     // driving, hand back after `sanity_secs` and let stock + its meter guard deal with it
     // (a NaN must not silently RESET the out-of-band timer).
     let gerr = s.grid - s.target;
+    // Pinned at the envelope in the direction of the error: the plant is out of
+    // capacity, not out of control (live 2026-09-01: a 9.8 kW load at the 7 kW
+    // envelope). Never a sanity fault.
+    let capacity_limited = (st.prev_saturated < 0 && gerr > 0.0)
+        || (st.prev_saturated > 0 && gerr < 0.0);
     let oob = st.owner_us
         && cfg.stage.writes()
         && snap.gm_should_write
         && !st.prev_force_charge
+        && !capacity_limited
         && (!gerr.is_finite() || gerr.abs() > cfg.sanity_band_w);
     st.oob_since = if oob { Some(st.oob_since.unwrap_or(t)) } else { None };
     let sanity_tripped = st.oob_since.is_some_and(|t0| t - t0 >= cfg.sanity_secs);
@@ -616,7 +640,8 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
     // Cycling-load regime: decided from load-estimate edges BEFORE this tick.
     let load_est = (snap.s.grid + meter_corr) - snap.s.reported;
     st.cycling = cycling_update(st, t, load_est);
-    let cmd = composed_command(snap, &mut st.ctrl, actuating, meter_corr, st.cycling);
+    let freeze = st.cycling || st.prev_saturated != 0;
+    let cmd = composed_command(snap, &mut st.ctrl, actuating, meter_corr, freeze);
 
     // 3. Per-stage RAW write target (pre-slew).
     let mut display_cmd = cmd;
@@ -681,6 +706,14 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
                 let sv = slew_limit(st.last_out, ema, cfg.slew_w_per_s, snap.dt);
                 let sv = crate::control::clamp(sv, snap.lo, snap.hi);
                 safety.slew_clamped = (sv - ema).abs() > 1e-6;
+                let nominal = cfg.inverter_nominal_w * CAPACITY_MARGIN;
+                st.prev_saturated = if sv <= snap.lo + 1.0 || sv <= -nominal {
+                    -1
+                } else if sv >= snap.hi - 1.0 || sv >= nominal {
+                    1
+                } else {
+                    0
+                };
                 st.last_out = Some(sv);
                 st.smith_prev_write = sv; // enters the plant model next tick
                 display_cmd = sv;
@@ -788,6 +821,7 @@ pub mod testutil {
             cyc_edges: [f64::NEG_INFINITY; CYC_EDGES_MAX],
             cyc_prev_load: f64::NAN,
             cycling: false,
+            prev_saturated: 0,
             sanity_trips: 0,
         }
     }
@@ -812,7 +846,8 @@ pub mod testutil {
             ema_gain_down: 0.5,
             errgain_dead_w: f64::INFINITY, // captured pre-feature: err-gain pacing off
             errgain_slope_w: 2000.0,
-            errgain_cap: 1.0, // captured pre-feature: conditional pacing off
+            errgain_cap: 1.0,
+            inverter_nominal_w: f64::INFINITY, // captured pre-feature: conditional pacing off
             // Captures predate the Smith compensation - replay without it.
             smith: false,
         }
@@ -1453,6 +1488,118 @@ mod tests {
             decide(&sp, &mut st, &c, 100.0 + k as f64);
         }
         assert!(!st.cycling, "own actuation must not read as a cycling load");
+    }
+
+    #[test]
+    fn sanity_supervisor_ignores_envelope_saturation() {
+        // Live 2026-09-01: a ~9.8 kW load pinned the command at the -7030 W envelope
+        // while the house imported ~1.2 kW. That is CAPACITY, not a control fault
+        // -- stock in the same spot simply imports the remainder -- but the sanity
+        // supervisor read the persistent error as a fault and handed back (twice).
+        // Saturated at the envelope in the direction of the error => no trip.
+        let c = cfg(Stage::Takeover);
+        let mut st = state(Kind::Stock);
+        st.owner_us = true;
+        st.last_flip_t = 0.0;
+        st.last_out = Some(-7030.0);
+        let mut t = 100.0;
+        let mut d = None;
+        for _ in 0..(c.sanity_secs as usize + 5) {
+            let mut sp = snap(true);
+            sp.s.grid = 1200.0; // importing 1.2 kW ...
+            sp.s.reported = -6900.0; // ... with the Multis flat out
+            sp.lo = -7030.0;
+            sp.hi = 7030.0;
+            d = Some(decide(&sp, &mut st, &c, t));
+            t += 1.0;
+        }
+        let d = d.unwrap();
+        assert!(!d.safety.sanity_tripped, "saturated at the envelope must not trip sanity");
+        assert!(d.owner_us, "must keep ownership (import the remainder, as stock does)");
+    }
+
+    #[test]
+    fn sanity_supervisor_ignores_inverter_nominal_saturation() {
+        // With stock-parity bounds the clamp sits at the BMS figure (-13.2 kW), far
+        // beyond what the inverters can deliver (nominal 9 kW). A 9.8 kW load pins
+        // the request beyond the inverters' nominal; they saturate internally and
+        // the grid imports the remainder. That is capacity, not a fault: no trip.
+        let mut c = cfg(Stage::Takeover);
+        c.inverter_nominal_w = 9000.0;
+        let mut st = state(Kind::Stock);
+        st.owner_us = true;
+        st.last_flip_t = 0.0;
+        st.last_out = Some(-9800.0);
+        let mut t = 100.0;
+        let mut d = None;
+        for _ in 0..(c.sanity_secs as usize + 5) {
+            let mut sp = snap(true);
+            sp.s.grid = 1200.0; // importing while ...
+            sp.s.reported = -8600.0; // ... the pair is flat out below the request
+            sp.lo = -13245.0;
+            sp.hi = 13245.0;
+            d = Some(decide(&sp, &mut st, &c, t));
+            t += 1.0;
+        }
+        let d = d.unwrap();
+        assert!(!d.safety.sanity_tripped, "asking beyond the inverter nominal is saturation, not a fault");
+        assert!(d.owner_us);
+    }
+
+    #[test]
+    fn integral_freezes_while_saturated() {
+        // While the request sits beyond what the plant can deliver, the persistent
+        // error must not wind the integral (bounded by the clip, but must not move).
+        let mut c = cfg(Stage::Takeover);
+        c.inverter_nominal_w = 9000.0;
+        let mut st = state(Kind::Pi { ki: 0.05, i_max: 300.0 });
+        st.owner_us = true;
+        st.last_flip_t = 0.0;
+        st.last_out = Some(-9800.0);
+        let mut t = 100.0;
+        // one tick to establish the saturation flag from the write
+        let mut sp = snap(true);
+        sp.s.grid = 1200.0;
+        sp.s.reported = -8600.0;
+        sp.lo = -13245.0;
+        sp.hi = 13245.0;
+        decide(&sp, &mut st, &c, t);
+        let i0 = st.ctrl.integral_w();
+        for _ in 0..20 {
+            t += 1.0;
+            let mut sp = snap(true);
+            sp.s.grid = 1200.0;
+            sp.s.reported = -8600.0;
+            sp.lo = -13245.0;
+            sp.hi = 13245.0;
+            decide(&sp, &mut st, &c, t);
+        }
+        assert_eq!(st.ctrl.integral_w(), i0, "integral must freeze while saturated");
+    }
+
+    #[test]
+    fn sanity_supervisor_still_trips_when_unsaturated() {
+        // The same persistent 1.2 kW error with headroom left IS a fault: trip.
+        let c = cfg(Stage::Takeover);
+        let mut st = state(Kind::Stock);
+        st.owner_us = true;
+        st.last_flip_t = 0.0;
+        st.last_out = Some(-500.0);
+        let mut t = 100.0;
+        let mut tripped = false;
+        for _ in 0..(c.sanity_secs as usize + 5) {
+            let mut sp = snap(true);
+            sp.s.grid = 1200.0;
+            sp.s.reported = -500.0;
+            // Freeze the law so the command cannot chase: hold reported/grid constant and
+            // keep the write far from the envelope.
+            sp.lo = -7030.0;
+            sp.hi = 7030.0;
+            let d = decide(&sp, &mut st, &c, t);
+            tripped |= d.safety.sanity_tripped;
+            t += 1.0;
+        }
+        assert!(tripped, "an unsaturated persistent error must still trip");
     }
 
     #[test]

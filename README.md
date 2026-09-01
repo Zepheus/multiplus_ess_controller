@@ -369,7 +369,11 @@ optimality, and `--no-smith` is the safe conservative choice until you've measur
 - **Envelope:** only discharges/idles within limits; below `--min-soc` (hysteresis) or on
   a force-charge state it hands control back to the stock firmware so charging / sustain /
   scheduling still work.
-- **Clamps:** commands bounded by configured charge/discharge power and a hard sanity bound.
+- **Bounds follow the stock loop:** the command is clamped to the live BMS/user/override
+  discharge limit (and the charge override), with the same ±138 kW absurdity ceiling the
+  stock writer applies — there is no inverter-capacity clamp; the inverters police their
+  own capacity. When the request exceeds what they deliver, the grid carries the remainder,
+  and the loop treats that as saturation (integral frozen, no hand-back), not a fault.
 - **Watchdog:** in `Hub4Mode 3` the inverter reverts to passthru if no setpoint arrives
   within 60 s (official docs for older firmware say as low as 10 s; 60 s is the conservative
   upper bound), so any crash/kill → passthru within a minute (house on grid, battery idle).
