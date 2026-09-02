@@ -17,11 +17,6 @@ pub struct Args {
     pub quiet: bool,
     pub telemetry: Option<String>,
     pub telemetry_max_mb: u64,
-    /// Durable archive of whole telemetry generations (the one sanctioned flash
-    /// writer: bulk copies on rotation/restart + a periodic live snapshot).
-    pub telemetry_archive_dir: Option<String>,
-    pub telemetry_archive_keep: usize,
-    pub telemetry_snapshot_hours: f64,
     /// Smith-style meter-lag compensation (default on; --no-smith to disable).
     pub smith: bool,
     pub trim_ki: f64,
@@ -53,9 +48,6 @@ pub fn parse_args() -> Result<Args, String> {
         quiet: false,
         telemetry: None,
         telemetry_max_mb: 4,
-        telemetry_archive_dir: None,
-        telemetry_archive_keep: 14,
-        telemetry_snapshot_hours: 6.0,
         smith: true,
         // Outer-integral gain for Stage-1 trim: override_delta = trim_ki * grid_error_W * dt_s.
         // Small + slow — it only trims steady-state bias on top of stock's fast inner loop.
@@ -126,13 +118,6 @@ pub fn parse_args() -> Result<Args, String> {
             "--telemetry" => a.telemetry = Some(val()?),
             "--telemetry-max-mb" => {
                 a.telemetry_max_mb = val()?.parse().map_err(|_| "bad --telemetry-max-mb")?
-            }
-            "--telemetry-archive-dir" => a.telemetry_archive_dir = Some(val()?),
-            "--telemetry-archive-keep" => {
-                a.telemetry_archive_keep = val()?.parse().map_err(|_| "bad --telemetry-archive-keep")?
-            }
-            "--telemetry-snapshot-hours" => {
-                a.telemetry_snapshot_hours = val()?.parse().map_err(|_| "bad --telemetry-snapshot-hours")?
             }
             "-h" | "--help" => return Err(help()),
             other => return Err(format!("unknown arg {other}\n{}", help())),
@@ -218,7 +203,7 @@ pub fn help() -> String {
 venus-ess-controller [--stage shadow|trim|takeover] [--controller stock|pi|true-integral|adaptive]
   [--ki F] [--i-max F] [--trim-ki F] [--slew-w-per-s F] [--sanity-band-w F] [--interval S]
   [--min-soc %] [--max-discharge W] [--max-charge W] [--seconds N] [--confirm] [--quiet]
-  [--telemetry PATH] [--telemetry-archive-dir DIR] [--telemetry-archive-keep N] [--telemetry-snapshot-hours H]
+  [--telemetry PATH]
 
 adaptive: PI + a continuously-learned feed-forward leak(throughput) ~= a + b*|reported|
   (RLS, in-memory, no persistence). The model is taught by the integral and earns actuation
