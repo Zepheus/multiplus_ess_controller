@@ -305,7 +305,7 @@ fn actuate(
             eprintln!("skipping setpoint write ({v}): mode flip failed or non-finite");
         }
         loop_core::Write::Override(v) if v.is_finite() => {
-            if let Err(e) = bus.set_f64(socguard::HUB4, socguard::P_OVR_SETPOINT, v) {
+            if let Err(e) = bus.set_f64(dbus::HUB4, dbus::P_OVR_SETPOINT, v) {
                 eprintln!("override write failed: {e} (stock setpoint resumes after 300 s)");
             }
         }
@@ -720,7 +720,7 @@ fn main() {
         // watchdog is the backstop if this final write doesn't land.
         Stage::Trim => {
             let sp = bus.get_f64(SETTINGS, P_SETPOINT_SETTING).unwrap_or(0.0);
-            match bus.set_f64(socguard::HUB4, socguard::P_OVR_SETPOINT, sp) {
+            match bus.set_f64(dbus::HUB4, dbus::P_OVR_SETPOINT, sp) {
                 Ok(()) => eprintln!("trim override neutralised to {sp:.0}W (stock resumes)."),
                 Err(e) => eprintln!("override neutralise failed: {e} (reverts via 300 s watchdog)."),
             }

@@ -41,28 +41,9 @@ const MINSOC_KEEPCHARGED: f64 = 99.0;
 /// BL state-6 slow-charge current floor (A); × Dc/0/Voltage ≈ 260 W at 52 V.
 const FORCE_CHARGE_FLOOR_A: f64 = 5.0;
 
-/// New BusItem paths this module reads (not already in `dbus.rs`).
-/// On the runtime-resolved active BMS service.
-pub const P_CHARGE_REQUEST: &str = "/Info/ChargeRequest"; // BMS, int→bool
-/// On the vebus service; item *validity* = firmware supports the modern path.
-pub const P_TPIMF: &str = "/Hub4/TargetPowerIsMaxFeedIn"; // VEBUS, bool/int
-/// The external force-charge trigger. systemcalc's schedule/DESS delegate SetValues
-/// this (e.g. the scheduled off-peak charge window) — the same override surface DESS
-/// uses. In shadow we read stock hub4's published value; in Tier-B, our own served one.
-pub const HUB4: &str = "com.victronenergy.hub4";
-pub const P_OVR_FORCECHARGE: &str = "/Overrides/ForceCharge"; // hub4, int→bool
-/// The DESS/schedule setpoint-override surface. Writing it (mode 1) lets stock the stock daemon
-/// keep full authority while we bias only the grid target — the Stage-1 "trim" path, guarded
-/// by the verified 300 s override watchdog. (Read/written by main's Trim stage.)
-pub const P_OVR_SETPOINT: &str = "/Overrides/Setpoint"; // hub4, f64 (invalid = no override)
-/// External discharge-power cap. Written by systemcalc's schedule delegate as the
-/// post-target hold: once a scheduled-charge window reaches its target SOC (< 100 %),
-/// it sets this to `max(1, 0.8..0.95 × DC-PV power)` — with no PV that is **1 W**, i.e.
-/// "hold the charge, don't discharge for the rest of the window". (DESS reuses the same
-/// surface as a dynamic cap.) < 0 or invalid = no cap. Live-verified 2026-08-16: during
-/// the window tail the stock daemon held ~+48 W against a 1.9 kW house load while the
-/// unclamped normal law wanted ≈ −1.86 kW.
-pub const P_OVR_MAXDISCHARGE: &str = "/Overrides/MaxDischargePower"; // hub4, f64
+// D-Bus paths (P_CHARGE_REQUEST on the active BMS service, P_TPIMF on VEBUS, and the
+// HUB4 /Overrides/* surface) are defined and documented in dbus.rs. In shadow we read
+// stock's published override values; in takeover, our own served ones.
 
 /// Discharge-inhibit set {5,6,8,11,12} = {BLDischarged, BLForceCharge, BLLowSocCharge,
 /// SocGuardDischarged, SocGuardLowSocCharge}. the stock daemon tests it with the literal

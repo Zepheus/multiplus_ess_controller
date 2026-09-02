@@ -28,16 +28,10 @@
 //! writes into (stock behavior) is a sibling concern; here we read the applied override values
 //! through the `Bus` trait, exactly like the battery-limit broker reads its inputs.
 
-use crate::dbus::Bus;
+use crate::dbus::*;
 use std::time::{Duration, Instant};
 
-// --- DESS override paths on the stock daemon's OWN service (systemcalc is the writer) ---
-/// The service the stock daemon owns and publishes; systemcalc `SetValue`s the overrides here.
-pub const HUB4: &str = "com.victronenergy.hub4";
-/// Grid-exchange target (W). Invalid/empty-array ⇒ read as absent ⇒ fall back. Double.
-pub const P_OVR_SETPOINT: &str = "/Overrides/Setpoint";
-/// Feed-in-excess policy this slot. int32 {0=follow, 1=disable, 2=enable}. Default 0.
-pub const P_OVR_FEEDIN: &str = "/Overrides/FeedInExcess";
+// D-Bus surface (HUB4, P_OVR_SETPOINT, P_OVR_FEEDIN) is defined and documented in dbus.rs.
 
 /// Overrides watchdog period. systemcalc refreshes every 5 s; any value comfortably
 /// above that works. 300 s matches Victron's documented overrides watchdog (stock behavior);

@@ -36,13 +36,8 @@
 
 use crate::dbus::*;
 
-// --- new dbus path consts (local to this subsystem) ---
-// `P_DVCC` ("/Control/Dvcc", on SYS) already exists in dbus.rs and is reused.
-/// AC-input type enum (SYS). 0=n/a, 1=grid, 2=genset, 3=shore, 240=island.
-pub const P_ACIN_SOURCE: &str = "/Ac/ActiveIn/Source";
-/// Multi: setpoint-becomes-max-feed-in-cap flag (VEBUS, int 0/1). Its *validity*
-/// (does firmware expose it) is the "Multi supports TPIMFI" gate.
-pub const P_TPIMFI: &str = "/Hub4/TargetPowerIsMaxFeedIn";
+// D-Bus paths (P_DVCC on SYS, P_ACIN_SOURCE on SYS, P_TPIMF on VEBUS) are defined and
+// documented in dbus.rs.
 
 /// The AC-input type (`Ac/ActiveIn/Source`). Only `Genset` changes feed-in policy;
 /// every other value is grid-like.
@@ -191,7 +186,7 @@ impl Generator {
         // DVCC unknown => off (safe: a genset then degrades to charge-hard).
         self.dvcc = bus.get_bool(SYS, P_DVCC).unwrap_or(false);
         // Firmware exposes the path iff the item is valid on the bus.
-        self.tpimfi_supported = bus.get_i32(VEBUS, P_TPIMFI).is_some();
+        self.tpimfi_supported = bus.get_i32(VEBUS, P_TPIMF).is_some();
     }
 
     #[cfg_attr(not(test), allow(dead_code))] // test-consumed API
@@ -248,7 +243,7 @@ mod tests {
         }
         b.set(SYS, P_DVCC, if dvcc { 1.0 } else { 0.0 });
         if tpimfi_fw {
-            b.set(VEBUS, P_TPIMFI, 0.0); // present-and-valid => firmware supports it
+            b.set(VEBUS, P_TPIMF, 0.0); // present-and-valid => firmware supports it
         }
         b
     }

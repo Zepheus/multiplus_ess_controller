@@ -24,16 +24,8 @@
 use crate::control::clamp;
 use crate::dbus::*;
 
-// --- dbus paths this subsystem owns (defined locally; not in dbus.rs) ---
-/// Prefix enumerated to discover controllable AC PV inverters.
-pub const PVINV_PREFIX: &str = "com.victronenergy.pvinverter.";
-const P_AC_POWER: &str = "/Ac/Power"; // f64 W, actual output now
-const P_AC_POWERLIMIT: &str = "/Ac/PowerLimit"; // f64 W, writable actuator
-const P_AC_MAXPOWER: &str = "/Ac/MaxPower"; // f64 W, nameplate ceiling
-const P_POSITION: &str = "/Position"; // int: 0=AC-in, 1=AC-out, 2=AC-in-2
-const P_STATUSCODE: &str = "/StatusCode"; // int: run state
-/// Settings export cap read for the proportional "allowed total" (NaN if unset).
-const P_MAXFEEDIN: &str = "/Settings/CGwacs/MaxFeedInPower";
+// D-Bus paths (PVINV_PREFIX, P_AC_POWER/P_AC_POWERLIMIT/P_AC_MAXPOWER/P_POSITION/
+// P_STATUSCODE on each PV inverter service, P_MAXFEEDIN_SETTING) are in dbus.rs.
 
 // --- stock constants (reproduced exactly) ---
 const RELEASE_W: f64 = 200_000.0; // a stock constant "no limit / release" sentinel
@@ -214,7 +206,7 @@ impl PvLimiter {
         }
 
         // 3. A partial sink exists. `allowed` = absorb headroom + export cap.
-        let feedin = bus.get_f64(SETTINGS, P_MAXFEEDIN);
+        let feedin = bus.get_f64(SETTINGS, P_MAXFEEDIN_SETTING);
         let feedin = feedin.filter(|f| f.is_finite() && *f >= 0.0).unwrap_or(0.0);
         let headroom = if ctx.charge_headroom_w.is_finite() {
             ctx.charge_headroom_w.max(0.0)
@@ -459,7 +451,7 @@ mod tests {
     fn battery_full_export_allowed_fast_throttles() {
         // Battery full but export permitted: aggressive cut toward export cap.
         let mut bus = one_pv(5000.0, 5000.0, 5000.0);
-        bus.set(SETTINGS, P_MAXFEEDIN, 800.0);
+        bus.set(SETTINGS, P_MAXFEEDIN_SETTING, 800.0);
         let mut pv = PvLimiter::new(&bus);
         let ctx = PvContext { charge_headroom_w: 0.0, battery_full: true, export_blocked: false, limiter_enabled: true };
         let out = pv.tick(&bus, ctx);

@@ -43,6 +43,87 @@ pub const P_BMS_CCL: &str = "/Info/MaxChargeCurrent"; // A
 pub const P_BMS_DCL: &str = "/Info/MaxDischargeCurrent"; // A
 pub const BATTERY_PREFIX: &str = "com.victronenergy.battery.";
 
+// ---------------------------------------------------------------------------
+// Every D-Bus service name and path the daemon touches lives HERE, grouped by
+// service. Modules import with `use crate::dbus::*;` — one canonical name per
+// path, no duplicates.
+
+// --- hub4 (com.victronenergy.hub4): the ESS loop's OWN service; systemcalc's
+//     schedule/DESS delegates SetValue the override surface below ---
+pub const HUB4: &str = "com.victronenergy.hub4";
+/// Grid-exchange target override (W, double). Invalid/empty ⇒ absent ⇒ fall back to
+/// the setpoint setting. Also the Stage-1 "trim" write path (guarded by the 300 s
+/// override watchdog).
+pub const P_OVR_SETPOINT: &str = "/Overrides/Setpoint";
+/// Feed-in-excess policy this slot: int32 {0 = follow setting, 1 = disable, 2 = enable}.
+pub const P_OVR_FEEDIN: &str = "/Overrides/FeedInExcess";
+/// External force-charge trigger (e.g. the scheduled off-peak window). Same surface
+/// DESS uses.
+pub const P_OVR_FORCECHARGE: &str = "/Overrides/ForceCharge";
+/// External discharge-power cap (W). The schedule delegate's post-target hold: once a
+/// scheduled-charge window reaches its target SOC it sets `max(1, 0.8..0.95 × DC-PV)` —
+/// with no PV that is **1 W** = "hold, don't discharge for the rest of the window".
+/// `< 0` or invalid = no cap. Live-verified 2026-08-16 (window tail held ~+48 W against
+/// a 1.9 kW load while the unclamped law wanted ≈ −1.86 kW).
+pub const P_OVR_MAXDISCHARGE: &str = "/Overrides/MaxDischargePower";
+
+// --- settings (com.victronenergy.settings) ---
+pub const P_OVERVOLTAGE_FEEDIN: &str = "/Settings/CGwacs/OvervoltageFeedIn";
+/// System feed-in cap in WATTS (−1 = unlimited): distributed per phase to the Multi's
+/// `/Hub4/L{n}/MaxFeedInPower`; also the PV limiter's "allowed total" (NaN if unset).
+pub const P_MAXFEEDIN_SETTING: &str = "/Settings/CGwacs/MaxFeedInPower";
+/// Export-direction AC-in CURRENT limit in Amps (shore/peak-shave subsystem) — NOT the
+/// MaxFeedInPower setting (Watts).
+pub const P_AC_EXPORT_LIMIT: &str = "/Settings/CGwacs/AcExportLimit";
+/// Always-peak-shave flag (int bool 0/1): firmware "always vs only above min-SOC" policy.
+pub const P_ALWAYS_PEAKSHAVE: &str = "/Settings/CGwacs/AlwaysPeakShave";
+pub const P_RUN_WITHOUT_METER: &str = "/Settings/CGwacs/RunWithoutGridMeter";
+pub const P_GRID_METER_REQUIRED: &str = "/Settings/CGwacs/GridMeterRequired";
+/// AC-input (shore/genset) current limit in AMPS; −1 = unlimited (getter → NaN).
+pub const P_AC_INPUT_LIMIT: &str = "/Settings/CGwacs/AcInputLimit";
+
+// --- system (com.victronenergy.system) ---
+/// AC-input type enum: 0 = n/a, 1 = grid, 2 = genset, 3 = shore, 240 = island. Read on
+/// SYS (not the vebus service).
+pub const P_ACIN_SOURCE: &str = "/Ac/ActiveIn/Source";
+/// Battery charge-voltage limit (V), read on SYS.
+pub const P_CHARGE_VOLTAGE: &str = "/Dc/Battery/ChargeVoltage";
+
+// --- vebus (Multi) ---
+pub const P_NUM_PHASES: &str = "/Ac/NumberOfPhases";
+pub const P_MULTI_STATE: &str = "/State";
+pub const P_DISABLE_FEEDIN: &str = "/Hub4/DisableFeedIn";
+pub const P_DNFIO: &str = "/Hub4/DoNotFeedInOvervoltage";
+/// "Setpoint becomes the max-feed-in cap" flag (int 0/1). Its *validity* (does the
+/// firmware expose it) is the "Multi supports TPIMF" gate.
+pub const P_TPIMF: &str = "/Hub4/TargetPowerIsMaxFeedIn";
+pub const P_FIX_SOLAR: &str = "/Hub4/FixSolarOffsetTo100mV";
+/// Active input index (240 = disconnected).
+pub const P_ACTIVE_INPUT: &str = "/Ac/ActiveIn/ActiveInput";
+
+// --- grid meter services ---
+/// Grid-meter services to enumerate/adopt (`ListNames`, first in list order).
+pub const GRID_PREFIX: &str = "com.victronenergy.grid.";
+/// Aggregate AC power: total grid-meter power on an adopted `com.victronenergy.grid.*`
+/// service, and the production of a `com.victronenergy.pvinverter.*` service.
+pub const P_AC_POWER: &str = "/Ac/Power";
+/// Single-phase fallback when a meter has no aggregate `/Ac/Power`.
+pub const P_METER_L1_POWER: &str = "/Ac/L1/Power";
+
+// --- PV inverter services ---
+/// Prefix enumerated to discover controllable AC PV inverters.
+pub const PVINV_PREFIX: &str = "com.victronenergy.pvinverter.";
+/// Writable actuator: the curtailment limit (W) on a PV inverter service.
+pub const P_AC_POWERLIMIT: &str = "/Ac/PowerLimit";
+pub const P_AC_MAXPOWER: &str = "/Ac/MaxPower";
+/// Inverter position: 0 = AC input 1, 1 = AC output, 2 = AC input 2.
+pub const P_POSITION: &str = "/Position";
+pub const P_STATUSCODE: &str = "/StatusCode";
+
+// --- battery / BMS services (the runtime-resolved active BMS service) ---
+/// BMS charge request (int → bool).
+pub const P_CHARGE_REQUEST: &str = "/Info/ChargeRequest";
+
 const IFACE: &str = "com.victronenergy.BusItem";
 
 pub trait Bus {

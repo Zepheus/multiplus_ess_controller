@@ -59,20 +59,8 @@ fn is_floor_state(state: i32) -> bool {
 // --- local dbus path consts. Reused from `dbus.rs`: SETTINGS, SYS,
 // VEBUS, P_SUSTAIN, P_DC_VOLTAGE, P_DVCC, P_HUB4MODE, P_MAXDISCHARGE, P_BL_STATE,
 // P_BL_MINSOC. ---
-const P_OVERVOLTAGE_FEEDIN: &str = "/Settings/CGwacs/OvervoltageFeedIn"; // SETTINGS, bool
-const P_MAXFEEDIN_SETTING: &str = "/Settings/CGwacs/MaxFeedInPower"; // SETTINGS, W (NaN/<0 = unlimited)
-const P_ACEXPORT_LIMIT: &str = "/Settings/CGwacs/AcExportLimit"; // SETTINGS, A
-const P_ALWAYS_PEAKSHAVE: &str = "/Settings/CGwacs/AlwaysPeakShave"; // SETTINGS, bool
-const P_AC_SOURCE: &str = "/Ac/ActiveIn/Source"; // SYS, int (2 = generator)
-const P_CHARGE_VOLTAGE: &str = "/Dc/Battery/ChargeVoltage"; // SYS, V (DC-overvoltage ref)
-const P_NUM_PHASES: &str = "/Ac/NumberOfPhases"; // VEBUS, int
-const P_MULTI_STATE: &str = "/State"; // VEBUS, validity gate
 
 // Output paths on VEBUS.
-const P_DISABLE_FEEDIN: &str = "/Hub4/DisableFeedIn"; // int 0/1
-const P_DNFIO: &str = "/Hub4/DoNotFeedInOvervoltage"; // int 0/1 (fw-gated)
-const P_TPIMFI: &str = "/Hub4/TargetPowerIsMaxFeedIn"; // int 0/1 (fw-gated)
-const P_FIX_SOLAR: &str = "/Hub4/FixSolarOffsetTo100mV"; // int 0/1
 fn p_maxfeedin(n: usize) -> String {
     format!("/Hub4/L{n}/MaxFeedInPower") // f64, per phase (fw-gated)
 }
@@ -96,7 +84,7 @@ pub fn snapshot_flags(bus: &dyn Bus) -> FlagSnapshot {
     FlagSnapshot {
         disable_feedin: bus.get_i32(VEBUS, P_DISABLE_FEEDIN),
         dnfio: bus.get_i32(VEBUS, P_DNFIO),
-        tpimfi: bus.get_i32(VEBUS, P_TPIMFI),
+        tpimfi: bus.get_i32(VEBUS, P_TPIMF),
         fix_solar: bus.get_i32(VEBUS, P_FIX_SOLAR),
         maxfeedin: [
             bus.get_f64(VEBUS, &p_maxfeedin(1)),
@@ -118,7 +106,7 @@ pub fn restore_flags(bus: &dyn Bus, snap: &FlagSnapshot) {
     };
     put_i32(P_DISABLE_FEEDIN, snap.disable_feedin);
     put_i32(P_DNFIO, snap.dnfio);
-    put_i32(P_TPIMFI, snap.tpimfi);
+    put_i32(P_TPIMF, snap.tpimfi);
     put_i32(P_FIX_SOLAR, snap.fix_solar);
     for (n, v) in snap.maxfeedin.iter().enumerate() {
         if let Some(v) = *v {
@@ -220,7 +208,7 @@ impl FeedIn {
     pub fn new(bus: &dyn Bus) -> Self {
         // A path present on the bus answers GetValue; a missing item errors -> None.
         let has_dnfio = bus.get_f64(VEBUS, P_DNFIO).is_some();
-        let has_tpimfi = bus.get_f64(VEBUS, P_TPIMFI).is_some();
+        let has_tpimfi = bus.get_f64(VEBUS, P_TPIMF).is_some();
         let has_maxfeedin = bus.get_f64(VEBUS, &p_maxfeedin(1)).is_some();
         eprintln!(
             "feedin: fw-gates dnfio={has_dnfio} tpimfi={has_tpimfi} maxfeedin={has_maxfeedin}"
@@ -255,12 +243,12 @@ impl FeedIn {
             dc_voltage: bus.get_f64(VEBUS, P_DC_VOLTAGE).unwrap_or(f64::NAN),
             charge_voltage: bus.get_f64(SYS, P_CHARGE_VOLTAGE).unwrap_or(f64::NAN),
             phases,
-            ac_source: bus.get_i32(SYS, P_AC_SOURCE).unwrap_or(0),
+            ac_source: bus.get_i32(SYS, P_ACIN_SOURCE).unwrap_or(0),
             dvcc: bus.get_bool(SYS, P_DVCC).unwrap_or(false),
             overvoltage_feedin: bus.get_bool(SETTINGS, P_OVERVOLTAGE_FEEDIN).unwrap_or(false),
             always_peakshave: bus.get_bool(SETTINGS, P_ALWAYS_PEAKSHAVE).unwrap_or(false),
             maxfeedin_setting: neg1_nan(bus.get_f64(SETTINGS, P_MAXFEEDIN_SETTING)),
-            acexport_limit: neg1_nan(bus.get_f64(SETTINGS, P_ACEXPORT_LIMIT)),
+            acexport_limit: neg1_nan(bus.get_f64(SETTINGS, P_AC_EXPORT_LIMIT)),
             max_discharge: neg1_nan(bus.get_f64(SETTINGS, P_MAXDISCHARGE)),
             bl_state: bus.get_i32(SETTINGS, P_BL_STATE).unwrap_or(0),
             bl_min_soc: bus.get_f64(SETTINGS, P_BL_MINSOC).unwrap_or(0.0),
@@ -550,7 +538,7 @@ impl Output {
             bus.set_i32(VEBUS, P_DNFIO, v)?;
         }
         if let Some(v) = self.w_tpimfi {
-            bus.set_i32(VEBUS, P_TPIMFI, v)?;
+            bus.set_i32(VEBUS, P_TPIMF, v)?;
         }
         if let Some(v) = self.w_fix_solar {
             bus.set_i32(VEBUS, P_FIX_SOLAR, v)?;
@@ -632,16 +620,16 @@ mod tests {
         b.set(VEBUS, P_NUM_PHASES, 1.0);
         // firmware-support probes present:
         b.set(VEBUS, P_DNFIO, 0.0);
-        b.set(VEBUS, P_TPIMFI, 0.0);
+        b.set(VEBUS, P_TPIMF, 0.0);
         b.set(VEBUS, &p_maxfeedin(1), 0.0);
-        b.set(SYS, P_AC_SOURCE, 1.0); // grid
+        b.set(SYS, P_ACIN_SOURCE, 1.0); // grid
         b.set(SYS, P_DVCC, 1.0);
         b.set(SYS, P_CHARGE_VOLTAGE, 55.0);
         b.set(SETTINGS, P_HUB4MODE, 3.0);
         b.set(SETTINGS, P_OVERVOLTAGE_FEEDIN, 0.0);
         b.set(SETTINGS, P_ALWAYS_PEAKSHAVE, 0.0);
         b.set(SETTINGS, P_MAXFEEDIN_SETTING, -1.0); // unlimited
-        b.set(SETTINGS, P_ACEXPORT_LIMIT, -1.0); // none
+        b.set(SETTINGS, P_AC_EXPORT_LIMIT, -1.0); // none
         b.set(SETTINGS, P_MAXDISCHARGE, -1.0); // unknown => allowed
         b.set(SETTINGS, P_BL_STATE, 0.0);
         b.set(SETTINGS, P_BL_MINSOC, 10.0);
@@ -667,13 +655,13 @@ mod tests {
     fn flag_snapshot_roundtrip_restores_stock_values() {
         let mut bus = base();
         bus.set(VEBUS, P_DISABLE_FEEDIN, 1.0);
-        bus.set(VEBUS, P_TPIMFI, 0.0);
+        bus.set(VEBUS, P_TPIMF, 0.0);
         bus.set(VEBUS, "/Hub4/L1/MaxFeedInPower", 200000.0);
         // L2/L3 unreadable on this single-phase rig: must be skipped by restore.
         let snap = snapshot_flags(&bus);
         restore_flags(&bus, &snap);
         assert_eq!(bus.writes_to(VEBUS, P_DISABLE_FEEDIN), vec![1.0]);
-        assert_eq!(bus.writes_to(VEBUS, P_TPIMFI), vec![0.0]);
+        assert_eq!(bus.writes_to(VEBUS, P_TPIMF), vec![0.0]);
         assert_eq!(bus.writes_to(VEBUS, "/Hub4/L1/MaxFeedInPower"), vec![200000.0]);
         assert!(bus.writes_to(VEBUS, "/Hub4/L2/MaxFeedInPower").is_empty());
         assert!(bus.writes_to(VEBUS, "/Hub4/L3/MaxFeedInPower").is_empty());
@@ -731,7 +719,7 @@ mod tests {
     #[test]
     fn force_charge_without_tpimfi_support_is_force_flat() {
         let mut bus = base();
-        bus.clear(VEBUS, P_TPIMFI); // old firmware: no TPIMFI
+        bus.clear(VEBUS, P_TPIMF); // old firmware: no TPIMFI
         bus.set(SETTINGS, P_BL_STATE, 8.0); // low-SOC recharge => mustForceCharge
         let mut f = FeedIn::new(&bus);
         let o = f.tick(&bus);
@@ -751,7 +739,7 @@ mod tests {
     #[test]
     fn generator_never_backfeeds() {
         let mut bus = base();
-        bus.set(SYS, P_AC_SOURCE, 2.0); // generator, DVCC + TPIMFI => TPIMFI cap
+        bus.set(SYS, P_ACIN_SOURCE, 2.0); // generator, DVCC + TPIMFI => TPIMFI cap
         let mut f = FeedIn::new(&bus);
         let o = f.tick(&bus);
         assert_eq!(o.mode, FeedInMode::Tpimfi);
@@ -952,11 +940,11 @@ mod tests {
     fn dnfio_and_tpimfi_skipped_on_old_firmware() {
         let mut bus = base();
         bus.clear(VEBUS, P_DNFIO);
-        bus.clear(VEBUS, P_TPIMFI);
+        bus.clear(VEBUS, P_TPIMF);
         let mut f = FeedIn::new(&bus);
         f.tick(&bus).write(&bus).unwrap();
         assert!(bus.writes_to(VEBUS, P_DNFIO).is_empty());
-        assert!(bus.writes_to(VEBUS, P_TPIMFI).is_empty());
+        assert!(bus.writes_to(VEBUS, P_TPIMF).is_empty());
         // DisableFeedIn / FixSolarOffset are ungated and still written.
         assert!(!bus.writes_to(VEBUS, P_DISABLE_FEEDIN).is_empty());
         assert!(!bus.writes_to(VEBUS, P_FIX_SOLAR).is_empty());

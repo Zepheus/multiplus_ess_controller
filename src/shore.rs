@@ -31,18 +31,8 @@
 
 use crate::dbus::*;
 
-// --- dbus paths (NEW, local to this subsystem) ---
-/// AC-input (shore/genset) current limit. AMPS; −1 = unlimited (getter -> NaN).
-pub const P_AC_INPUT_LIMIT: &str = "/Settings/CGwacs/AcInputLimit";
-/// AC-export current limit. AMPS (−1 = unlimited); NOT consumed by this filter — its
-/// getter is structurally identical to AcInputLimit's (default −1, NaN-if-negative),
-/// so it is almost certainly the export-direction AC-in *current* limit in Amps. Kept
-/// here only so no caller mistakes it for `CGwacs/MaxFeedInPower` (Watts, subsystem #4).
-#[allow(dead_code)] // kept as documentation: Amps, NOT CGwacs/MaxFeedInPower (Watts)
-pub const P_AC_EXPORT_LIMIT: &str = "/Settings/CGwacs/AcExportLimit";
-/// Always-peak-shave flag (int bool 0/1). Selects the firmware "always vs above-min-SOC"
-/// policy; here it feeds `should_release`.
-pub const P_ALWAYS_PEAKSHAVE: &str = "/Settings/CGwacs/AlwaysPeakShave";
+// D-Bus paths (P_AC_INPUT_LIMIT / P_AC_EXPORT_LIMIT in Amps, P_ALWAYS_PEAKSHAVE) are
+// defined and documented in dbus.rs; P_AC_EXPORT_LIMIT is not consumed by this filter.
 
 // --- IIR constants (the stock spec, stock-verified) ---
 const IIR_RETAIN: f64 = 0.8; // a stock constant — retain coefficient (old value)

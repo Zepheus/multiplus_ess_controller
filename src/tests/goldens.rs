@@ -860,17 +860,17 @@ for (n, line) in lines.enumerate() {
     bus.set(VEBUS, P_DC_VOLTAGE, or(getf(&f, c_vdc), 52.0));
     bus.set(VEBUS, P_SUSTAIN, 0.0);
     bus.set(VEBUS, P_MULTI_MAXCHG_I, or(getf(&f, c_mmci), 140.0));
-    bus.set(VEBUS, socguard::P_TPIMF, 1.0);
+    bus.set(VEBUS, crate::dbus::P_TPIMF, 1.0);
     bus.set(BMS, P_BMS_CCL, or(getf(&f, c_ccl), 280.0));
     bus.set(BMS, P_BMS_DCL, or(getf(&f, c_dcl), 280.0));
-    bus.set(BMS, socguard::P_CHARGE_REQUEST, or(getf(&f, c_chgreq), 0.0));
+    bus.set(BMS, crate::dbus::P_CHARGE_REQUEST, or(getf(&f, c_chgreq), 0.0));
     bus.set(SETTINGS, P_MAXCHARGE, -1.0);
     bus.set(SETTINGS, P_MAXDISCHARGE, -1.0);
     bus.set(SETTINGS, P_MAXCHARGE_PCT, 100.0);
     bus.set(SETTINGS, P_MAXDISCHARGE_PCT, 100.0);
     bus.set(SETTINGS, P_BL_STATE, or(getf(&f, c_bls), 0.0));
     bus.set(SETTINGS, P_BL_MINSOC, or(getf(&f, c_blm), 10.0));
-    bus.set(socguard::HUB4, socguard::P_OVR_FORCECHARGE, if hub4_fc { 1.0 } else { 0.0 });
+    bus.set(crate::dbus::HUB4, crate::dbus::P_OVR_FORCECHARGE, if hub4_fc { 1.0 } else { 0.0 });
 
     let tr = broker.tick(&bus);
     let (lo, hi) = battery_limits::clamp_bounds(tr.enforced, env_lo, env_hi);
