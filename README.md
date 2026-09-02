@@ -380,6 +380,18 @@ optimality, and `--no-smith` is the safe conservative choice until you've measur
   Clean exit / SIGINT / SIGTERM also restore `Hub4Mode`.
 - **Flash-safe logging:** never logs per-tick to eMMC. Per-tick telemetry goes only to a
   bounded RAM (tmpfs) file and refuses flash paths; `--quiet` silences per-tick stdout.
+  For a durable record, `--telemetry-archive-dir /data/...` copies whole telemetry
+  generations to flash as bulk files (on rotation, on restart, plus a periodic live
+  snapshot, `--telemetry-snapshot-hours`, default 6), pruned to `--telemetry-archive-keep`
+  (default 14). A few MB per day of bulk writes; the per-tick stream never touches flash.
+- **Export-limit evidence:** `tools/g100_report.py --mel <W> <telemetry.csv ...>` replays the
+  EREC G100 Issue 2 operational rules (State 2 excursions, 5 s recovery, ≥15 s breaches,
+  the State-3 triggers, lockout) over the raw grid-meter column for any Maximum Export
+  Limit, plus excursion tables by threshold and duration. It is a post-hoc report, not a
+  runtime limiter: an adversarial design review found a runtime state machine either idle
+  (at realistic limits nothing ever trips) or self-locking (at low limits ordinary
+  appliance step-offs trip it), and the firmware feed-in cap bounds inverter output, not
+  grid export.
 
 ## Implementation note — D-Bus transport
 

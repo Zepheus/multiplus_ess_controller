@@ -361,7 +361,29 @@ fn main() {
     // rotation total footprint is at most 2x this. Default 4 MB/file (~48 h @ 1 Hz).
     let telemetry_cap: u64 = args.telemetry_max_mb * 1024 * 1024;
     let mut telemetry = match &args.telemetry {
-        Some(p) => match Telemetry::open(p, telemetry_cap) {
+        Some(p) => match Telemetry::open(
+            p,
+            telemetry_cap,
+            args.telemetry_archive_dir.as_deref().map(|d| {
+                // The archive is the ONE sanctioned flash writer; guard its knobs.
+                if !(args.telemetry_snapshot_hours.is_finite() && args.telemetry_snapshot_hours >= 0.25) {
+                    eprintln!("--telemetry-snapshot-hours must be a finite value >= 0.25 (got {})", args.telemetry_snapshot_hours);
+                    std::process::exit(2);
+                }
+                if args.telemetry_archive_keep == 0 {
+                    eprintln!("--telemetry-archive-keep must be >= 1");
+                    std::process::exit(2);
+                }
+                if !telemetry::is_flash_path(&format!("{d}/x")) {
+                    eprintln!("WARNING: telemetry archive dir '{d}' is not on flash — it will not survive a reboot");
+                }
+                telemetry::Archive::new(
+                    d,
+                    args.telemetry_archive_keep,
+                    Duration::from_secs_f64(args.telemetry_snapshot_hours * 3600.0),
+                )
+            }),
+        ) {
             Ok(t) => {
                 eprintln!("telemetry -> {p} (bounded {}MB x2, tmpfs)", telemetry_cap / 1_048_576);
                 Some(t)
@@ -726,6 +748,11 @@ fn main() {
             }
         }
         Stage::Shadow => {}
+    }
+    // The live telemetry file would otherwise die with tmpfs on a reboot: archive it
+    // now that the system is handed back and there is no deadline.
+    if let Some(tel) = telemetry.as_mut() {
+        tel.archive_now("shutdown");
     }
     eprintln!("stopped.");
 }
