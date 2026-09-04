@@ -40,14 +40,13 @@ fn dispatch_rows() -> &'static [(f64, f64, f64, f64, i64, i32, f64)] {
 }
 
 /// SYNTHETIC replay through the REAL socguard::enact + decide(): the rows are real
-/// telemetry, but they were captured while STOCK owned the loop (the controller of
-/// the day handed back on the raised floor at t=19460 and re-took at 19532). Since
-/// 2026-09-04 a raised floor is NOT a hand-back (a dispatch is normal operation inside
-/// the margins), so the rows are fed to a loop that keeps ownership throughout and the
-/// test pins what OUR loop writes for them. Two caveats keep this honest: under our
-/// ownership systemcalc would report SystemState 252 (not 258/259 — `decide` no longer
-/// reads the state at all), and the 5 kW TPIMF ramp timing at 19462..19470 is the
-/// firmware's under stock's writes; ours would differ by a tick or two. The pins:
+/// telemetry, but they were captured while STOCK owned the loop (from t=19460 to 19532).
+/// A raised floor is a dispatch — normal operation inside the margins, not a hand-back —
+/// so the rows are fed to a loop that keeps ownership throughout and the test pins what
+/// OUR loop writes for them. Two caveats keep this honest: under our ownership systemcalc
+/// would report SystemState 252 (not 258/259 — `decide` does not read the state at all),
+/// and the 5 kW TPIMF ramp timing at 19462..19470 is the firmware's under stock's writes;
+/// ours would differ by a tick or two. The pins:
 ///   t=19460  the raise lands (BL state still 10): our own floor hold binds THAT tick —
 ///            soc 77 ≤ 90 — before batterylife/systemcalc publish state 12 / 258. The
 ///            composed command is the hold (0 = acOut, unread here); the WRITE decays

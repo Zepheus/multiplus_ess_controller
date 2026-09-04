@@ -475,9 +475,9 @@ pub fn composed_command(
     let ac_out = if snap.ac_out_w.is_finite() { snap.ac_out_w } else { 0.0 };
     // Our OWN floor: at or below the live MinimumSocLimit the battery must not discharge
     // further, whatever systemcalc's BatteryLife state machine says this tick (it lags the
-    // floor write by a tick or two, and we no longer cede ownership to stock here). This is
-    // a hold, not a charge: charging below the floor stays systemcalc's call (BL 12 /
-    // scheduled-charge overrides), enacted through the socguard exactly as stock does.
+    // floor write by a tick or two). This is a hold, not a charge: charging below the floor
+    // stays systemcalc's call (BL 12 / scheduled-charge overrides), enacted through the
+    // socguard exactly as stock does.
     let max_dis = if floor_hold(snap) { 0.0 } else { snap.sg.max_discharge_w };
     cmd = cmd.max(-max_dis + ac_out);
     if let Some(fc) = snap.sg.cmd_override {
@@ -569,15 +569,15 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
     let sanity_tripped = grid_tripped || hold_tripped;
 
     // 1. Ownership — we own unless something is actually WRONG: a sanity trip (grid
-    //    persistently off-setpoint while we drive) or an external mode change (1b). SOC at
-    //    or below the floor, recharge, scheduled charge, dispatch holds are all normal
-    //    operation inside the margins: the socguard enacts systemcalc's hold/force-charge
-    //    states and `floor_hold` inhibits discharge on its own, so ceding there would only
-    //    buy a re-entry transient (live 2026-09-03/04: two dispatch hand-backs, each
-    //    re-take stepping into a multi-kW load). Dwell throttles ENTRY only; hand-back is
-    //    never throttled. Each sanity trip doubles the re-entry dwell (latch/backoff): a
-    //    persistently-wrong controller escalates to hour-scale retries instead of
-    //    oscillating mode 3<->1 forever.
+    //    persistently off-setpoint while we drive), a hold breach, or an external mode
+    //    change (1b). SOC at or below the floor, recharge, scheduled charge and dispatch
+    //    holds are all normal operation inside the margins — stock never cedes on them
+    //    either: the socguard enacts systemcalc's hold/force-charge states and `floor_hold`
+    //    inhibits discharge on its own, so ceding there would only buy a re-entry transient
+    //    into whatever load is running. Dwell throttles ENTRY only; hand-back is never
+    //    throttled. Each trip doubles the re-entry dwell (latch/backoff): a persistently-
+    //    wrong controller escalates to hour-scale retries instead of oscillating mode
+    //    3<->1 forever.
     // 1b. External-mode verification (takeover only; read done in sample()). Runs
     // BEFORE the want/dwell computation so a cede takes effect this tick.
     let mut ext_note = "";
@@ -946,8 +946,8 @@ mod tests {
     }
 
     /// At or below the live floor we HOLD (no further discharge) but keep ownership:
-    /// a raised MinimumSocLimit is a dispatch, not a fault (user decision 2026-09-04).
-    /// The hold is ours, independent of systemcalc's BatteryLife state (sg still free).
+    /// a raised MinimumSocLimit is a dispatch, not a fault. The hold is ours, independent
+    /// of systemcalc's BatteryLife state (sg still free).
     #[test]
     fn below_floor_holds_but_keeps_ownership() {
         let c = cfg(Stage::Takeover);
@@ -1159,8 +1159,7 @@ mod tests {
         }
     }
 
-    /// A recharge SystemState is normal operation too: no hand-back, and re-entry is not
-    /// blocked by it (the 258 gate used to cost one tick per dispatch).
+    /// A recharge SystemState is normal operation too: neither a hand-back nor an entry gate.
     #[test]
     fn recharge_state_neither_cedes_nor_blocks_entry() {
         let c = cfg(Stage::Takeover);

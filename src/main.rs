@@ -146,7 +146,7 @@ fn read_sensors(bus: &dyn Bus) -> Option<Sensors> {
         reported: bus.get_f64(VEBUS, P_ACTIVEIN)?,
         target: bus.get_f64(SETTINGS, P_SETPOINT_SETTING)?,
         soc: bus.get_f64(SYS, P_SOC)?,
-        // Telemetry/log only since 2026-09-04 (nothing decides on it): never abort a tick.
+        // Telemetry/log only (nothing decides on it): never abort a tick over it.
         state: bus.get_f64(SYS, P_STATE).map_or(-1, |v| v as i64),
     })
 }
