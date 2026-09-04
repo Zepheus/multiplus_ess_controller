@@ -3,7 +3,7 @@
 
 Replays the G100 Issue 2 operational rules over the RAW grid-meter column of
 controller telemetry CSVs (t,grid,reported,target,soc,state,command,owner,
-actual,fc,maxdis,acout,reason; 1 Hz; grid < 0 = export in W; `t` = seconds since
+actual,fc,maxdis,acout,reason[,minsoc,dcbatt]; 1 Hz; grid < 0 = export in W; `t` = seconds since
 the controller process started, so every file is its own run). Nothing here runs
 at control time; it is the durable evidence layer chosen after the 2026-09-01
 adversarial design review (docs/G100-DESIGN-REVIEW-2026-09-01.md), which rejected

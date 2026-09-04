@@ -88,16 +88,19 @@ pub struct Safety {
     pub slew_clamped: bool,
     /// The sanity supervisor tripped: grid diverged grossly while we drove -> handing back.
     pub sanity_tripped: bool,
+    /// The hold supervisor tripped: the battery kept discharging past an inhibit (our SOC
+    /// floor, a socguard cap, or force-charge) while we drove -> handing back.
+    pub hold_tripped: bool,
 }
 
 impl Safety {
     pub fn any(self) -> bool {
-        self.dt_clamped || self.slew_clamped || self.sanity_tripped
+        self.dt_clamped || self.slew_clamped || self.sanity_tripped || self.hold_tripped
     }
     /// Victron alarm convention (0 = ok, 1 = warning, 2 = alarm), for `/Alarms/EssSafety`.
     /// Sanity handback is an alarm; slew/dt clamps are warnings.
     pub fn alarm_level(self) -> i32 {
-        if self.sanity_tripped {
+        if self.sanity_tripped || self.hold_tripped {
             2
         } else if self.slew_clamped || self.dt_clamped {
             1
@@ -107,7 +110,9 @@ impl Safety {
     }
     /// Stable, greppable reason for the `SAFETY:` log line + the telemetry reason column.
     pub fn reason(self) -> &'static str {
-        if self.sanity_tripped {
+        if self.hold_tripped {
+            "hold-breach"
+        } else if self.sanity_tripped {
             "sanity-handback"
         } else if self.slew_clamped {
             "slew-clamped"
@@ -215,10 +220,15 @@ pub struct Snapshot {
     pub dt: f64,
     /// The raw dt exceeded the clamp and was clamped (set by the caller) — a stall marker.
     pub dt_clamped: bool,
-    /// LIVE `/Settings/CGwacs/BatteryLife/MinimumSocLimit` (%), read each tick — the ownership
-    /// floor. It is UI/VRM/API-controlled and is raised by the user's dispatch automation, so
-    /// it must never be a static value. Falls back to `--min-soc` only if the read fails.
+    /// LIVE `/Settings/CGwacs/BatteryLife/MinimumSocLimit` (%), read each tick — the discharge
+    /// floor (`floor_hold`). It is UI/VRM/API-controlled and is raised by the user's dispatch
+    /// automation, so it must never be a static value. Falls back to `--min-soc` only if the
+    /// read fails — and then that fallback IS the floor we hold at.
     pub min_soc: f64,
+    /// Battery DC power (W, + = charging; system `/Dc/Battery/Power`; NaN = unread). The hold
+    /// supervisor's witness: independent of the setpoint frame (`ac_out_w`) and of the grid
+    /// meter, so a hold enacted through a bad AC-out reading still shows up here.
+    pub dc_batt_w: f64,
     /// Design-capacity-bounded command clamp from the battery broker (W).
     pub lo: f64,
     pub hi: f64,
@@ -300,10 +310,14 @@ pub struct LoopState {
     pub last_out: Option<f64>,
     /// `t` when grid first went out of the sanity band while driving; None while in-band.
     pub oob_since: Option<f64>,
-    /// Previous tick's "grid legitimately diverges" flag: force-charge OR an external
+    /// `t` when the battery first discharged past the active inhibit while driving; None
+    /// while within it (the hold supervisor's timer, see `decide`).
+    pub hold_oob_since: Option<f64>,
+    /// Previous tick's "grid legitimately diverges" flag: force-charge, an external
     /// discharge cap (`/Overrides/MaxDischargePower` — schedule post-target hold — or a
-    /// BL discharged state). The sanity check is suppressed while it was set; using last
-    /// tick avoids an ordering dependency.
+    /// BL discharged state), or our own SOC-floor hold. The grid-error sanity check is
+    /// suppressed while it was set (the hold supervisor covers those regimes instead);
+    /// using last tick avoids an ordering dependency.
     pub prev_force_charge: bool,
     /// Smith-style meter-lag compensation state (see `decide`): a running model
     /// of the Multi's effective drive (`plant::ALPHA` first-order over our own
@@ -341,12 +355,9 @@ pub struct LoopState {
 /// Immutable per-run config for `decide()`.
 pub struct DecideCfg {
     pub stage: Stage,
-    /// SOC hysteresis (%) above the LIVE floor (`Snapshot.min_soc`) before re-taking control.
-    pub soc_hyst: f64,
     pub min_dwell_s: f64,
     pub trim_ki: f64,
     pub orig_mode: i32,
-    pub state_recharge: i64,
     /// Glitch-guard slew (W/s) applied to the actuated value.
     pub slew_w_per_s: f64,
     /// Sanity supervisor band (W) and dwell (s).
@@ -416,6 +427,11 @@ pub struct Decision {
     pub safety: Safety,
 }
 
+/// True while SOC sits at or below the live floor: discharge is inhibited by us directly.
+pub fn floor_hold(snap: &Snapshot) -> bool {
+    snap.s.soc <= snap.min_soc
+}
+
 /// The composed control law: integral fix → SocGuard → feed-in → generator → design clamp.
 /// Pure; factored out so both `decide()` and its unit tests exercise the exact same math.
 pub fn composed_command(
@@ -434,6 +450,7 @@ pub fn composed_command(
     let integrate = actuating
         && !snap.sg.force_charge
         && !snap.sg.max_discharge_w.is_finite()
+        && !floor_hold(snap)
         && !freeze_integral;
     let mut cmd = ctrl.update(
         s.grid + meter_corr_w,
@@ -456,7 +473,13 @@ pub fn composed_command(
     // load + losses for the whole hold. NaN acOut (unread) degrades to the bare clamp.
     // (−INF + acOut is still −INF, so this is a no-op without a cap.)
     let ac_out = if snap.ac_out_w.is_finite() { snap.ac_out_w } else { 0.0 };
-    cmd = cmd.max(-snap.sg.max_discharge_w + ac_out);
+    // Our OWN floor: at or below the live MinimumSocLimit the battery must not discharge
+    // further, whatever systemcalc's BatteryLife state machine says this tick (it lags the
+    // floor write by a tick or two, and we no longer cede ownership to stock here). This is
+    // a hold, not a charge: charging below the floor stays systemcalc's call (BL 12 /
+    // scheduled-charge overrides), enacted through the socguard exactly as stock does.
+    let max_dis = if floor_hold(snap) { 0.0 } else { snap.sg.max_discharge_w };
+    cmd = cmd.max(-max_dis + ac_out);
     if let Some(fc) = snap.sg.cmd_override {
         // Force charge. TPIMF (mode 0): keep writing the normal-law value capped at
         // Σ max-charge — the firmware charges maximally on its own and reinterprets the
@@ -517,13 +540,44 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
         && !capacity_limited
         && (!gerr.is_finite() || gerr.abs() > cfg.sanity_band_w);
     st.oob_since = if oob { Some(st.oob_since.unwrap_or(t)) } else { None };
-    let sanity_tripped = st.oob_since.is_some_and(|t0| t - t0 >= cfg.sanity_secs);
+    let grid_tripped = st.oob_since.is_some_and(|t0| t - t0 >= cfg.sanity_secs);
 
-    // 1. Ownership envelope — may own iff SOC is comfortably above the floor and we're not in
-    //    a recharge state. Hysteresis + dwell prevent thrash; hand-BACK is never throttled.
-    //    A sanity trip forces exit (hand back / neutralise) regardless of dwell, and each trip
-    //    doubles the re-entry dwell (latch/backoff): a persistently-wrong controller escalates
-    //    to hour-scale retries instead of oscillating mode 3<->1 forever.
+    // Hold supervisor. While a discharge inhibit binds — our SOC-floor hold, a socguard cap,
+    // or force-charge — the grid legitimately diverges from the setpoint, so the grid-error
+    // supervisor above is blind (via `prev_force_charge`). We now OWN those regimes for hours
+    // (no hand-back on the floor), so watch the thing the inhibit is about: battery DC power.
+    // Discharging past the allowed cap by more than the sanity band for `sanity_secs` is a
+    // BREACH. While we own it is a trip (hand back, latched like a sanity trip). It is
+    // evaluated regardless of ownership so that a breach persisting under STOCK — the same
+    // frame, so stock cannot fix what we could not — inhibits re-entry instead of producing
+    // a 3<->1 flap at the backoff cadence. Takeover only: trim never owns a hold. Charging
+    // during a hold is not policed: DC solar charging through a hold is normal, and the
+    // only positive write outside a charge regime is the acOut frame itself (accepted).
+    // NaN (unread) = no evidence, no trip — the start-up banner says whether it reads.
+    let allowed_dis_w = if floor_hold(snap) || snap.sg.force_charge {
+        0.0
+    } else {
+        snap.sg.max_discharge_w // +INF when unlimited: never trips
+    };
+    let hold_oob = matches!(cfg.stage, Stage::Takeover)
+        && snap.gm_should_write
+        && snap.dc_batt_w.is_finite()
+        && -snap.dc_batt_w > allowed_dis_w + cfg.sanity_band_w;
+    st.hold_oob_since = if hold_oob { Some(st.hold_oob_since.unwrap_or(t)) } else { None };
+    let hold_breach = st.hold_oob_since.is_some_and(|t0| t - t0 >= cfg.sanity_secs);
+    let hold_tripped = hold_breach && st.owner_us;
+    let sanity_tripped = grid_tripped || hold_tripped;
+
+    // 1. Ownership — we own unless something is actually WRONG: a sanity trip (grid
+    //    persistently off-setpoint while we drive) or an external mode change (1b). SOC at
+    //    or below the floor, recharge, scheduled charge, dispatch holds are all normal
+    //    operation inside the margins: the socguard enacts systemcalc's hold/force-charge
+    //    states and `floor_hold` inhibits discharge on its own, so ceding there would only
+    //    buy a re-entry transient (live 2026-09-03/04: two dispatch hand-backs, each
+    //    re-take stepping into a multi-kW load). Dwell throttles ENTRY only; hand-back is
+    //    never throttled. Each sanity trip doubles the re-entry dwell (latch/backoff): a
+    //    persistently-wrong controller escalates to hour-scale retries instead of
+    //    oscillating mode 3<->1 forever.
     // 1b. External-mode verification (takeover only; read done in sample()). Runs
     // BEFORE the want/dwell computation so a cede takes effect this tick.
     let mut ext_note = "";
@@ -553,10 +607,8 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
         }
     }
 
-    let enter_ok = s.soc >= snap.min_soc + cfg.soc_hyst
-        && s.state != cfg.state_recharge
-        && !st.ceded_external;
-    let exit_now = s.soc <= snap.min_soc || s.state == cfg.state_recharge || sanity_tripped;
+    let enter_ok = !st.ceded_external && !hold_breach;
+    let exit_now = sanity_tripped;
     let want_us = if st.owner_us { !exit_now } else { enter_ok };
     let backoff_s = cfg.min_dwell_s * f64::from(1u32 << st.sanity_trips.min(7)); // 30s .. ~64min
     let dwell_ok = t - st.last_flip_t >= backoff_s;
@@ -578,7 +630,15 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
             // the whole loop.
             Stage::Takeover => {
                 hub4mode = Some(if st.owner_us { HUB4MODE_EXTERNAL } else { cfg.orig_mode });
-                note = if st.owner_us { "TOOK OVER (mode3)" } else { "handed back (mode1)" };
+                // The only hand-back cause left on this path is a sanity trip (an external
+                // mode change cedes in 1b with its own note); say so in the log line.
+                note = if st.owner_us {
+                    "TOOK OVER (mode3)"
+                } else if hold_tripped {
+                    "handed back (mode1): hold breach"
+                } else {
+                    "handed back (mode1): sanity trip"
+                };
                 if st.owner_us {
                     // Seed the write-EMA/slew from stock's LAST written setpoint so the
                     // first write converges from where the Multi already is, instead of
@@ -645,7 +705,8 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
 
     // 3. Per-stage RAW write target (pre-slew).
     let mut display_cmd = cmd;
-    let mut safety = Safety { dt_clamped: snap.dt_clamped, slew_clamped: false, sanity_tripped };
+    let mut safety =
+        Safety { dt_clamped: snap.dt_clamped, slew_clamped: false, sanity_tripped: grid_tripped, hold_tripped };
     let owner_str: &'static str = if !st.owner_us {
         "hub4"
     } else {
@@ -750,7 +811,8 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
 
     // Remember force-charge / external discharge hold for the next tick's sanity
     // suppression (both make the grid legitimately diverge from the setpoint).
-    st.prev_force_charge = snap.sg.force_charge || snap.sg.max_discharge_w.is_finite();
+    st.prev_force_charge =
+        snap.sg.force_charge || snap.sg.max_discharge_w.is_finite() || floor_hold(snap);
 
     Decision {
         command: cmd,
@@ -800,8 +862,9 @@ pub mod testutil {
             gm_should_write: stage_gm,
             shore_out: ShoreOut::default(),
             hub4_actual: None,
-                ac_out_w: f64::NAN,
-                hub4mode_live: None,
+            ac_out_w: f64::NAN,
+            hub4mode_live: None,
+            dc_batt_w: f64::NAN,
         }
     }
 
@@ -813,6 +876,7 @@ pub mod testutil {
             trim_override: None,
             last_out: None,
             oob_since: None,
+            hold_oob_since: None,
             prev_force_charge: false,
             smith_weff: f64::NAN,
             smith_weff_lag: f64::NAN,
@@ -831,11 +895,9 @@ pub mod testutil {
         let sl = SafetyLimits::derive(HARD_CLAMP_W, 1.0, None, None);
         DecideCfg {
             stage,
-            soc_hyst: 3.0,
             min_dwell_s: 30.0,
             trim_ki: 0.02,
             orig_mode: 1,
-            state_recharge: sysstate::RECHARGE,
             slew_w_per_s: sl.slew_w_per_s,
             sanity_band_w: sl.sanity_band_w,
             sanity_secs: sl.sanity_secs,
@@ -883,15 +945,235 @@ mod tests {
         assert_eq!(d.write, Write::Nothing, "no setpoint write when meter unusable");
     }
 
+    /// At or below the live floor we HOLD (no further discharge) but keep ownership:
+    /// a raised MinimumSocLimit is a dispatch, not a fault (user decision 2026-09-04).
+    /// The hold is ours, independent of systemcalc's BatteryLife state (sg still free).
     #[test]
-    fn below_floor_hands_back_immediately() {
+    fn below_floor_holds_but_keeps_ownership() {
+        let c = cfg(Stage::Takeover);
         let mut st = state(Kind::Stock);
         st.owner_us = true;
         let mut sp = snap(true);
-        sp.s.soc = 10.0; // <= min_soc
-        let d = decide(&sp, &mut st, &cfg(Stage::Takeover), 1.0); // dwell not elapsed, but handback is never throttled
-        assert!(!d.owner_us && d.flipped);
-        assert_eq!(d.hub4mode, Some(1));
+        sp.s.grid = 2500.0; // law wants ~-2.4 kW discharge
+        sp.ac_out_w = 40.0;
+        sp.s.soc = 10.0; // == min_soc? no: floor is 15 in snap(); 10 <= 15
+        let d = decide(&sp, &mut st, &c, 1.0);
+        assert!(d.owner_us && !d.flipped, "floor must not cede ownership");
+        assert_eq!(d.hub4mode, None);
+        // Held at the stock frame: clamp + acOut so the BATTERY idles, not the setpoint.
+        assert!((d.command - 40.0).abs() < 1e-9, "held command {}", d.command);
+        assert!(matches!(d.write, Write::Setpoint(_)), "we keep driving the setpoint");
+        // Exactly at the floor is still a hold; one percent above releases it.
+        sp.s.soc = 15.0;
+        let d = decide(&sp, &mut st, &c, 2.0);
+        assert!((d.command - 40.0).abs() < 1e-9, "at the floor: {}", d.command);
+        sp.s.soc = 16.0;
+        let d = decide(&sp, &mut st, &c, 3.0);
+        assert!(d.command < -2000.0, "above the floor discharge resumes: {}", d.command);
+    }
+
+    /// A floor hold under a big house load looks like a huge persistent grid error.
+    /// That is capacity we chose not to use, not a fault: the sanity supervisor must
+    /// stay quiet for far longer than its trip window, and the integral must not wind.
+    #[test]
+    fn floor_hold_is_not_a_sanity_fault_and_does_not_wind() {
+        let c = cfg(Stage::Takeover);
+        let mut st = state(Kind::Pi { ki: 0.02, i_max: 300.0 });
+        st.owner_us = true;
+        st.last_flip_t = -1000.0;
+        let mut sp = snap(true);
+        sp.s.soc = 10.0; // below the 15 % floor
+        sp.s.grid = 4200.0; // live 2026-09-03 09:13-10:59: car on grid, battery held
+        for k in 0..600 {
+            let d = decide(&sp, &mut st, &c, k as f64);
+            assert!(d.owner_us, "t={k}: must never hand back on a held import");
+            assert!(!d.safety.sanity_tripped, "t={k}: hold is not a sanity fault");
+            assert!(d.command >= -1e-9, "t={k}: no discharge while held: {}", d.command);
+        }
+        // Floor released with the same load: the integral carried nothing.
+        sp.s.soc = 16.0;
+        sp.s.grid = 100.0;
+        let d = decide(&sp, &mut st, &c, 600.0);
+        assert!(d.command > -200.0, "post-hold command {} — integral wound during hold", d.command);
+    }
+
+    /// The hold supervisor: a battery that keeps discharging past an inhibit while we drive
+    /// is a fault — tripped, latched and handed back like a sanity trip. Charging through a
+    /// hold (DC solar), an unread DC power, or discharge within an unlimited cap never trip.
+    #[test]
+    fn hold_supervisor_trips_only_on_discharge_past_the_inhibit() {
+        let c = cfg(Stage::Takeover);
+        let run = |soc: f64, sg: SocGuardOut, dc: f64| {
+            let mut st = state(Kind::Stock);
+            st.owner_us = true;
+            st.last_flip_t = -1000.0;
+            let mut sp = snap(true);
+            sp.s.soc = soc;
+            sp.sg = sg;
+            sp.dc_batt_w = dc;
+            let mut out = None;
+            for k in 0..=(c.sanity_secs as i64 + 1) {
+                let d = decide(&sp, &mut st, &c, k as f64);
+                out = Some((d.owner_us, d.safety.hold_tripped, d.note, d.safety.reason(), st.sanity_trips));
+                if !d.owner_us {
+                    break;
+                }
+            }
+            out.unwrap()
+        };
+        let past_band = -(c.sanity_band_w + 200.0);
+        // Below the floor, discharging past the band: trip + hand back, named as such.
+        let (own, hold, note, reason, trips) = run(10.0, sg_free(), past_band);
+        assert!(!own && hold, "must hand back on a floor-hold breach");
+        assert_eq!(note, "handed back (mode1): hold breach");
+        assert_eq!(reason, "hold-breach");
+        assert_eq!(trips, 1, "latched like a sanity trip (doubles re-entry dwell)");
+        // Force-charge with the battery discharging: also a breach.
+        let fc = SocGuardOut { force_charge: true, max_discharge_w: 0.0, cmd_override: Some(4700.0), tpimf: true, charge_floor_w: 0.0 };
+        assert!(!run(60.0, fc, past_band).0, "discharge during force-charge is a breach");
+        // A finite socguard cap is honoured with the band on top.
+        let cap = SocGuardOut { max_discharge_w: 2000.0, ..sg_free() };
+        assert!(!run(60.0, cap, -(2000.0 + c.sanity_band_w + 100.0)).0, "cap + band exceeded");
+        assert!(run(60.0, cap, -(2000.0 + c.sanity_band_w - 100.0)).0, "within cap + band: fine");
+        // Never trips: charging through a hold, unread DC power, unlimited cap.
+        assert!(run(10.0, sg_free(), 3000.0).0, "charging during a hold is normal (DC solar)");
+        assert!(run(10.0, sg_free(), f64::NAN).0, "no evidence, no trip");
+        assert!(run(60.0, sg_free(), -6000.0).0, "unlimited cap: discharge is the job");
+        // Below the band for less than sanity_secs: no trip.
+        let mut st = state(Kind::Stock);
+        st.owner_us = true;
+        st.last_flip_t = -1000.0;
+        let mut sp = snap(true);
+        sp.s.soc = 10.0;
+        sp.dc_batt_w = past_band;
+        for k in 0..(c.sanity_secs as i64 - 1) {
+            assert!(decide(&sp, &mut st, &c, k as f64).owner_us, "t={k}: not yet");
+        }
+        sp.dc_batt_w = -50.0; // back within: timer resets
+        assert!(decide(&sp, &mut st, &c, c.sanity_secs).owner_us);
+        assert!(st.hold_oob_since.is_none());
+    }
+
+    /// A breach that persists while STOCK owns (same hold frame — stock cannot fix it either)
+    /// must inhibit re-entry, not flap 3<->1 at the backoff cadence; it releases when the
+    /// battery is back within the inhibit. Trim never evaluates it.
+    #[test]
+    fn persistent_breach_under_stock_inhibits_reentry() {
+        let c = cfg(Stage::Takeover);
+        let mut st = state(Kind::Stock);
+        st.last_flip_t = -1000.0; // dwell long elapsed: take-over wanted
+        let mut sp = snap(true);
+        sp.s.soc = 10.0;
+        sp.dc_batt_w = -(c.sanity_band_w + 500.0);
+        for k in 0..=(c.sanity_secs as i64 + 5) {
+            let d = decide(&sp, &mut st, &c, k as f64);
+            if (k as f64) < c.sanity_secs {
+                // Not yet a breach: nothing stops the take-over on the very first tick.
+                assert!(d.owner_us, "t={k}: take-over allowed before the breach matures");
+                // …but then we own it and trip once matured.
+            }
+        }
+        assert!(!st.owner_us, "tripped and handed back");
+        assert_eq!(st.sanity_trips, 1);
+        // Breach persists under stock: no re-take even after the (doubled) dwell.
+        for k in 100..400 {
+            let d = decide(&sp, &mut st, &c, k as f64);
+            assert!(!d.owner_us && d.hub4mode.is_none(), "t={k}: inhibited while the breach persists");
+        }
+        // Battery back within the inhibit: re-entry resumes.
+        sp.dc_batt_w = -20.0;
+        let d = decide(&sp, &mut st, &c, 400.0);
+        assert!(d.owner_us && d.flipped, "breach cleared: re-take");
+        // Trim: the same breach is not this stage's business.
+        let ct = cfg(Stage::Trim);
+        let mut st = state(Kind::Stock);
+        st.owner_us = true;
+        st.last_flip_t = -1000.0;
+        sp.dc_batt_w = -(c.sanity_band_w + 500.0);
+        for k in 0..100 {
+            assert!(decide(&sp, &mut st, &ct, k as f64).owner_us, "t={k}: trim ignores the hold supervisor");
+        }
+    }
+
+    /// Same entry under the LIVE pacing config (`--errgain-dead-w 300`, cap 1.0): a 2.5 kW
+    /// error gives the EMA full authority, so the hold is a one-tick step onto acOut (well
+    /// inside the slew guard), not a decay. Pinned so both behaviours are on record.
+    #[test]
+    fn floor_hold_entry_live_pacing_is_one_step() {
+        let mut c = cfg(Stage::Takeover);
+        c.errgain_dead_w = 300.0;
+        c.errgain_slope_w = 2000.0;
+        c.errgain_cap = 1.0;
+        let mut st = state(Kind::Stock);
+        st.owner_us = true;
+        st.last_flip_t = -1000.0;
+        st.last_out = Some(-2400.0);
+        let mut sp = snap(true);
+        sp.ac_out_w = 40.0;
+        sp.s.grid = 2500.0;
+        sp.s.soc = 10.0;
+        let d = decide(&sp, &mut st, &c, 0.0);
+        assert!(!d.safety.slew_clamped, "2440 W step is inside the 3515 W/s guard");
+        match d.write {
+            Write::Setpoint(v) => assert!((v - 40.0).abs() < 1.0, "one-tick hold: {v}"),
+            w => panic!("{w:?}"),
+        }
+    }
+
+    /// The written sequence into and out of a floor hold, in stock's frame with a real
+    /// AC-out reading: entry decays onto acOut through the write EMA (stock does the same —
+    /// the hold is a few-second ramp, not a step), release ramps back out the same way,
+    /// and the slew guard is never needed for either.
+    #[test]
+    fn floor_hold_entry_and_release_write_sequence() {
+        let c = cfg(Stage::Takeover);
+        let mut st = state(Kind::Stock);
+        st.owner_us = true;
+        st.last_flip_t = -1000.0;
+        st.last_out = Some(-2400.0);
+        let mut sp = snap(true);
+        sp.ac_out_w = 40.0;
+        sp.s.grid = 2500.0; // law = 0 + 20 − 2500 = −2480: still wants to discharge
+        sp.s.soc = 10.0; // floor is 15
+        let mut writes = Vec::new();
+        for k in 0..12 {
+            let d = decide(&sp, &mut st, &c, k as f64);
+            assert!(!d.safety.slew_clamped, "t={k}: hold entry must not need the slew guard");
+            match d.write {
+                Write::Setpoint(v) => writes.push(v),
+                w => panic!("t={k}: {w:?}"),
+            }
+        }
+        // EMA 0.5 onto the hold frame (+40): −1180, −570, −265, … then parked at acOut.
+        assert!((writes[0] - -1180.0).abs() < 1.0, "{writes:?}");
+        assert!((writes[1] - -570.0).abs() < 1.0, "{writes:?}");
+        assert!((writes[2] - -265.0).abs() < 1.0, "{writes:?}");
+        assert!(writes[10..].iter().all(|v| (v - 40.0).abs() < 1.5), "parked at acOut: {writes:?}");
+        // Release: floor drops away with the same load; first write is half the step.
+        sp.s.soc = 16.0;
+        let d = decide(&sp, &mut st, &c, 12.0);
+        assert!(!d.safety.slew_clamped);
+        match d.write {
+            Write::Setpoint(v) => assert!((v - (40.0 + 0.5 * (-2480.0 - 40.0))).abs() < 1.0, "{v}"),
+            w => panic!("{w:?}"),
+        }
+    }
+
+    /// A recharge SystemState is normal operation too: no hand-back, and re-entry is not
+    /// blocked by it (the 258 gate used to cost one tick per dispatch).
+    #[test]
+    fn recharge_state_neither_cedes_nor_blocks_entry() {
+        let c = cfg(Stage::Takeover);
+        let mut st = state(Kind::Stock);
+        st.owner_us = true;
+        let mut sp = snap(true);
+        sp.s.state = sysstate::RECHARGE;
+        let d = decide(&sp, &mut st, &c, 1.0);
+        assert!(d.owner_us && !d.flipped);
+        let mut st = state(Kind::Stock);
+        st.last_flip_t = -1000.0;
+        let d = decide(&sp, &mut st, &c, 1.0);
+        assert!(d.owner_us && d.flipped, "258 must not block take-over");
     }
 
     #[test]
@@ -1264,21 +1546,31 @@ mod tests {
         for k in 0..30 {
             decide(&sp, &mut st, &c, k as f64);
         }
-        // Dispatch: automation raises the floor above SOC -> hand back that tick.
+        // Dispatch: automation raises the floor above SOC -> we HOLD, still owning.
         sp.min_soc = 90.0;
         let d = decide(&sp, &mut st, &c, 30.0);
-        assert!(!d.owner_us, "must hand back on the raised floor");
-        // Stock charges the battery for "20 min"; huge import the whole time.
+        assert!(d.owner_us && !d.flipped, "a raised floor is not a hand-back");
+        // systemcalc follows with BL 12: force-charge + discharge inhibit for "20 min";
+        // huge import the whole time.
+        sp.sg = SocGuardOut {
+            force_charge: true,
+            max_discharge_w: 0.0,
+            cmd_override: Some(4700.0),
+            tpimf: true,
+            charge_floor_w: 0.0,
+        };
         sp.s.grid = 5000.0;
         for k in 31..1231 {
-            decide(&sp, &mut st, &c, k as f64);
+            let d = decide(&sp, &mut st, &c, k as f64);
+            assert!(d.owner_us && !d.safety.sanity_tripped, "t={k}: dispatch is not a fault");
         }
-        // Automation restores the floor; dwell has long elapsed -> re-take.
+        // Automation restores the floor and the overrides clear: same owner, no windup.
         sp.min_soc = 10.0;
+        sp.sg = sg_free();
         sp.s.soc = 90.0;
         sp.s.grid = 100.0;
         let d = decide(&sp, &mut st, &c, 1231.0);
-        assert!(d.owner_us, "re-take after the dispatch");
+        assert!(d.owner_us && !d.flipped, "no re-take needed: we never left");
         let d2 = decide(&sp, &mut st, &c, 1232.0);
         assert!(
             d2.command > -200.0 && d2.command < 0.0,
@@ -1386,7 +1678,7 @@ mod tests {
         let mut st = state(Kind::Stock);
         st.owner_us = false;
         let mut sp = snap(true);
-        sp.s.soc = 10.0; // below floor: no take-over wanted
+        st.last_flip_t = 90.0; // inside the entry dwell: no take-over wanted this tick
         sp.hub4mode_live = Some(HUB4MODE_EXTERNAL);
         let d = decide(&sp, &mut st, &cfg(Stage::Takeover), 100.0);
         assert_eq!(d.hub4mode, Some(1), "must re-assert the stock mode");

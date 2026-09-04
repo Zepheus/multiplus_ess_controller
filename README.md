@@ -366,9 +366,21 @@ optimality, and `--no-smith` is the safe conservative choice until you've measur
 ## Safety model
 
 - **Double-gated live:** needs both `--confirm` and env `VENUS_ESS_LIVE=I_UNDERSTAND`.
-- **Envelope:** only discharges/idles within limits; below `--min-soc` (hysteresis) or on
-  a force-charge state it hands control back to the stock firmware so charging / sustain /
-  scheduling still work.
+- **Envelope:** only discharges/idles within limits, never force-charges on its own. At or
+  below the live `BatteryLife/MinimumSocLimit` (`--min-soc` is only the fallback if that
+  read fails) the loop **holds** the battery — no further discharge, written in the stock
+  frame (clamp + measured AC-out) so the battery idles rather than the setpoint. Force-
+  charge, scheduled charge, sustain and an automation raising the floor are all enacted
+  from systemcalc's BatteryLife state and the override items, exactly as the stock loop
+  does; ownership is kept throughout. Control is handed back to the stock firmware only
+  when something is actually wrong: a sanity trip, a hold breach, or an operator changing
+  the mode underneath it. A 30 s dwell throttles re-entry (doubling per trip).
+- **Hold supervisor:** while a discharge inhibit binds (floor hold, socguard cap,
+  force-charge) the grid-error supervisor is deliberately blind, so the battery's DC power
+  (`/Dc/Battery/Power`) is watched instead: discharging past the inhibit by more than the
+  sanity band for 30 s trips and hands back, and a breach that persists under the stock
+  loop inhibits re-entry instead of flapping. The start-up banner says whether the witness
+  reads; unread means the supervisor is inert.
 - **Bounds follow the stock loop:** the command is clamped to the live BMS/user/override
   discharge limit (and the charge override), with the same ±138 kW absurdity ceiling the
   stock writer applies — there is no inverter-capacity clamp; the inverters police their

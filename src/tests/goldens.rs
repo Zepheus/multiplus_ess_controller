@@ -6,7 +6,6 @@
 use crate::control::{AdaptiveCfg, Kind};
 use crate::loop_core::testutil::*;
 use crate::socguard;
-use crate::gridmeter::HUB4MODE_EXTERNAL;
 use crate::loop_core::*;
 use crate::shore::ShoreOut;
 use crate::states::{bl, sysstate};
@@ -14,30 +13,15 @@ use crate::Stage;
 
 /// Live capture 2026-08-16 ~08:07 — an Octopus Intelligent Go dispatch: an HA
 /// automation raised `BatteryLife/MinimumSocLimit` 10 % → 90 % for one minute.
-/// Replayed row-for-row (real telemetry values) through the REAL socguard::enact +
-/// decide(). The captured sequence, which this test pins tick-exactly:
-///   t=19460  the min-SOC raise lands (BL state still 10, SystemState still 256):
-///            hand-back fires THAT tick — min-SOC is sampled live, soc 77 ≤ 90 —
-///            before batterylife/systemcalc publish state 12 / 258 at all.
-///   t=19461  BL state 12 arrives (force-charge + discharge inhibit); state still 256.
-///   t=..19530 SystemState 258; firmware TPIMF-charges at ~5 kW (grid peaks 7.1 kW,
-///            both hub4 override items stay inert — this path is pure BL-state);
-///            we must stay handed-back throughout (soc 77 < 90+hyst, state 258).
-///   t=19531  BL reverts to 10 (fc=0) but SystemState is STILL 258 — the state-258
-///            gate blocks re-entry for exactly this one tick.
-///   t=19532  SystemState 252: re-take (72 s since hand-back > 30 s dwell).
-///   t=19534  one-tick meter lag (reported collapses 4999 → 1252 while grid is still
-///            5.3 kW): raw law −4053 W — the slew guard caps the actuated step.
-#[test]
-fn golden_octopus_dispatch_minsoc_raise_sequence() {
 // (t, grid, reported, soc, sysstate, bl_state, min_soc) — from the live capture.
 #[rustfmt::skip]
-let rows: &[(f64, f64, f64, f64, i64, i32, f64)] = &[
+fn dispatch_rows() -> &'static [(f64, f64, f64, f64, i64, i32, f64)] {
+    &[
     (19456.0,   49.9, -1867.0, 78.0, 256, 10, 10.0),
     (19457.0,   32.1, -1835.0, 78.0, 256, 10, 10.0),
     (19458.0,   82.0, -1851.0, 78.0, 256, 10, 10.0),
     (19459.0,   59.6, -1843.0, 78.0, 256, 10, 10.0),
-    (19460.0,   49.4, -1838.0, 77.0, 256, 10, 90.0), // raise lands -> hand back NOW
+    (19460.0,   49.4, -1838.0, 77.0, 256, 10, 90.0), // raise lands -> our floor hold binds NOW
     (19461.0,   74.4, -1848.0, 77.0, 256, 12, 90.0), // BL 12 leads SystemState
     (19462.0,   54.0, -1820.0, 77.0, 258, 12, 90.0),
     (19465.0, 3178.3,  4648.0, 77.0, 258, 12, 90.0), // charge ramp
@@ -45,23 +29,49 @@ let rows: &[(f64, f64, f64, f64, i64, i32, f64)] = &[
     (19500.0, 6881.0,  4871.0, 78.0, 258, 12, 90.0),
     (19520.0, 5423.1,  5090.0, 78.0, 258, 12, 90.0),
     (19530.0, 5311.9,  4984.0, 78.0, 258, 12, 90.0),
-    (19531.0, 5293.3,  4987.0, 78.0, 258, 10, 10.0), // BL reverts first; 258 blocks
-    (19532.0, 5290.9,  4999.0, 78.0, 252, 10, 10.0), // re-take
+    (19531.0, 5293.3,  4987.0, 78.0, 258, 10, 10.0), // BL reverts + floor drops: law resumes
+    (19532.0, 5290.9,  4999.0, 78.0, 252, 10, 10.0), // (stock re-took here; we never left)
     (19534.0, 5310.4,  1252.0, 78.0, 252, 10, 10.0), // meter-lag transient
     (19535.0,  786.4,   239.0, 78.0, 252, 10, 10.0),
     (19536.0,  430.6,   -49.0, 78.0, 252, 10, 10.0),
     (19538.0,  191.8,  -200.0, 78.0, 252, 10, 10.0),
     (19540.0,   60.6,  -211.0, 78.0, 256, 10, 10.0),
-];
+]
+}
+
+/// SYNTHETIC replay through the REAL socguard::enact + decide(): the rows are real
+/// telemetry, but they were captured while STOCK owned the loop (the controller of
+/// the day handed back on the raised floor at t=19460 and re-took at 19532). Since
+/// 2026-09-04 a raised floor is NOT a hand-back (a dispatch is normal operation inside
+/// the margins), so the rows are fed to a loop that keeps ownership throughout and the
+/// test pins what OUR loop writes for them. Two caveats keep this honest: under our
+/// ownership systemcalc would report SystemState 252 (not 258/259 — `decide` no longer
+/// reads the state at all), and the 5 kW TPIMF ramp timing at 19462..19470 is the
+/// firmware's under stock's writes; ours would differ by a tick or two. The pins:
+///   t=19460  the raise lands (BL state still 10): our own floor hold binds THAT tick —
+///            soc 77 ≤ 90 — before batterylife/systemcalc publish state 12 / 258. The
+///            composed command is the hold (0 = acOut, unread here); the WRITE decays
+///            onto it through the stock write EMA: −1903 → −952 → −476 → −238.
+///   t=19461  BL state 12 arrives (force-charge + discharge inhibit). The firmware
+///            charges at ~5 kW on its own (TPIMF: our write is a feed-in cap, capped at
+///            the Σ max-charge which is unread here, so the raw law passes): +618 on
+///            the ramp tick where grid lags the charge step, then a positive decay
+///            309 → 155 → 78 → 39 with the composed command pinned at 0 throughout.
+///   t=19531  BL reverts to 10 and the floor drops: the normal law (−301) resumes on
+///            that very tick despite SystemState 258, write −131; no mode flap anywhere.
+///   t=19534  one-tick meter lag (reported collapses 4999 → 1252 while grid is still
+///            5.3 kW): raw law −4053. The stock write EMA absorbs it — prev −209 →
+///            write −2131 — and the W/s slew guard is not needed.
+#[test]
+fn golden_octopus_dispatch_minsoc_raise_sequence() {
+let rows = dispatch_rows();
 // Device-derived safety numbers (envelope 7030 W -> slew 3515 W/s), as live.
 let sl = SafetyLimits::derive(7030.0, 1.0, None, None);
 let c = DecideCfg {
     stage: Stage::Takeover,
-    soc_hyst: 3.0,
     min_dwell_s: 30.0,
     trim_ki: 0.02,
     orig_mode: 1,
-    state_recharge: sysstate::RECHARGE,
     slew_w_per_s: sl.slew_w_per_s,
     sanity_band_w: sl.sanity_band_w,
     sanity_secs: sl.sanity_secs,
@@ -109,57 +119,58 @@ for &(t, grid, reported, soc, sysstate, bl, min_soc) in rows {
         hub4_actual: None,
         ac_out_w: f64::NAN,
         hub4mode_live: None,
+        dc_batt_w: f64::NAN,
     };
     let d = decide(&snap, &mut st, &c, t);
 
+    assert!(d.owner_us, "t={t}: a dispatch never costs ownership");
+    assert!(!d.flipped, "t={t}: no ownership flip anywhere in the sequence");
+    assert_eq!(d.hub4mode, None, "t={t}: no mode flapping");
+    assert!(matches!(d.write, Write::Setpoint(_)), "t={t}: we keep driving throughout");
+    assert!(!d.safety.sanity_tripped, "t={t}: a dispatch is not a fault");
+    let written = match d.write {
+        Write::Setpoint(v) => v,
+        w => panic!("t={t}: expected a setpoint write, got {w:?}"),
+    };
+    let pin = |want: f64| assert!((written - want).abs() < 1.0, "t={t}: write {written}, want {want}");
     match t as i64 {
-        19456..=19459 => {
-            assert!(d.owner_us, "t={t}: normal ESS, we own");
-            assert!(matches!(d.write, Write::Setpoint(_)));
-        }
+        19459 => pin(-1903.0),
         19460 => {
-            assert!(d.flipped && !d.owner_us, "t={t}: raised floor must hand back THIS tick");
-            assert_eq!(d.hub4mode, Some(1), "t={t}: restore stock mode");
-            assert!(!sg.force_charge, "t={t}: BL still 10 — the floor alone triggered it");
+            assert!(!sg.force_charge, "t={t}: BL still 10 — the floor alone binds");
+            assert!(d.command.abs() < 1e-9, "t={t}: our floor hold, cmd {}", d.command);
+            pin(-952.0); // −1903 + 0.5·(0 − −1903)
         }
-        19461..=19530 => {
-            assert!(!d.owner_us, "t={t}: handed back for the whole dispatch");
-            assert_eq!(d.write, Write::Nothing, "t={t}: no writes while handed back");
-            assert_eq!(d.hub4mode, None, "t={t}: no mode flapping");
+        19461 => pin(-476.0),
+        19462 => pin(-238.0),
+        19465 => {
+            assert!((d.command - 1474.7).abs() < 0.1, "t={t}: ramp-tick law {}", d.command);
+            pin(618.0); // −238 + 0.5·(1474.7 − −238)
+        }
+        19470..=19530 => {
             assert!(sg.force_charge && sg.tpimf, "t={t}: BL-12 regime");
             assert_eq!(sg.max_discharge_w, 0.0, "t={t}: BL-12 inhibits discharge");
-            if t >= 19470.0 {
-                // Steady charge: law is negative, discharge-inhibited to 0 (matches
-                // the captured telemetry cmd = -0.0 on every one of these rows). On
-                // the ramp tick (19465) the law is legitimately +1474.7 — grid lags
-                // the charge step — also matching the capture, so it is skipped here.
-                assert!(d.command.abs() < 1e-9, "t={t}: cmd {}", d.command);
+            // Steady charge: law is negative, discharge-inhibited to 0 (matches the
+            // captured telemetry cmd = -0.0 on every one of these rows); the write
+            // halves toward it each row: 309, 155, 78, 39.
+            assert!(d.command.abs() < 1e-9, "t={t}: cmd {}", d.command);
+            let prev = last_setpoint.expect("writing throughout");
+            assert!(written >= 0.0 && written <= prev, "t={t}: {prev} -> {written} must decay toward the hold");
+            if t == 19530.0 {
+                pin(39.0);
             }
         }
         19531 => {
-            assert!(!d.owner_us, "t={t}: SystemState 258 must block re-entry this tick");
             assert!(!sg.force_charge, "t={t}: BL already back to 10");
+            assert!((d.command - (-301.3)).abs() < 0.1, "t={t}: law resumes, cmd {}", d.command);
+            pin(-131.0); // 39 + 0.5·(−301.3 − 39)
         }
-        19532 => {
-            assert!(d.flipped && d.owner_us, "t={t}: re-take once 258 clears");
-            assert_eq!(d.hub4mode, Some(HUB4MODE_EXTERNAL));
-        }
+        19532 => pin(-209.0),
         19534 => {
-            // Meter-lag tick: raw law = 1252 + 5 − 5310.4 = −4053.4. The stock
-            // write EMA absorbs it: prev = −287 (the direct first write on
-            // re-take at t=19532), so the write is −287 + 0.5·(−3766.4) ≈ −2170 —
-            // exactly how stock rides out one-tick meter glitches. The W/s slew
-            // guard stays as a backstop and must NOT need to fire here.
-            let prev = last_setpoint.expect("was writing before the transient");
-            assert!((prev - (-287.0)).abs() < 1.0, "t={t}: re-take wrote {prev}");
-            match d.write {
-                Write::Setpoint(v) => {
-                    assert!((v - (-2170.0)).abs() < 2.0,
-                        "t={t}: EMA must halve the step {prev} -> {v} (raw −4053.4)");
-                    assert!(v > -4053.0, "t={t}: raw transient must not pass through");
-                }
-                w => panic!("t={t}: expected a setpoint write, got {w:?}"),
-            }
+            // Meter-lag tick: raw law = 1252 + 5 − 5310.4 = −4053.4. The stock write
+            // EMA absorbs it (−209 → −2131), exactly how stock rides out one-tick meter
+            // glitches; the W/s slew guard stays as a backstop and must NOT fire here.
+            assert!((d.command - (-4053.4)).abs() < 0.1, "t={t}: raw law {}", d.command);
+            pin(-2131.0);
             assert!(!d.safety.slew_clamped,
                 "t={t}: the EMA damping must keep the transient under the slew guard");
         }
@@ -171,8 +182,105 @@ for &(t, grid, reported, soc, sysstate, bl, min_soc) in rows {
 }
 // Grid was back near target by the last rows: no sanity trip may be pending.
 assert!(st.oob_since.is_none(), "recovered grid must clear the out-of-band timer");
-assert!(st.owner_us, "we own again after the dispatch");
+assert!(st.owner_us, "we own throughout the dispatch");
 assert_eq!(st.sanity_trips, 0, "the dispatch must not count as a sanity trip");
+}
+
+/// The same rows under the LIVE pacing config (`--errgain-dead-w 300`, slope 2000, cap 1.0):
+/// multi-kW errors give the write EMA full authority, so the dispatch edges are STEPS, not
+/// decays, and the meter-lag tick at 19534 IS caught by the W/s slew guard (−287 → −3802,
+/// 3515 W/s × dt 1 s), exactly the `slew-clamped` line the service log shows on such ticks.
+/// Both pictures are pinned so nobody mistakes one config's behaviour for the other's.
+#[test]
+fn golden_octopus_dispatch_minsoc_raise_sequence_live_pacing() {
+let rows = dispatch_rows();
+let sl = SafetyLimits::derive(7030.0, 1.0, None, None);
+let c = DecideCfg {
+    stage: Stage::Takeover,
+    min_dwell_s: 30.0,
+    trim_ki: 0.02,
+    orig_mode: 1,
+    slew_w_per_s: sl.slew_w_per_s,
+    sanity_band_w: sl.sanity_band_w,
+    sanity_secs: sl.sanity_secs,
+    ema_adaptive: false,
+    ema_gain_up: 0.5,
+    ema_gain_down: 0.5,
+    errgain_dead_w: 300.0,
+    errgain_slope_w: 2000.0,
+    errgain_cap: 1.0,
+    inverter_nominal_w: f64::INFINITY,
+    smith: false,
+};
+let mut st = state(Kind::Stock);
+st.owner_us = true;
+st.last_flip_t = 19000.0;
+for &(t, grid, reported, soc, sysstate, bl, min_soc) in rows {
+    let sg = socguard::enact(&socguard::Inputs {
+        bl_state: bl,
+        min_soc,
+        charge_request: false,
+        dc_voltage: 52.0,
+        eff_max_charge_w: f64::NAN,
+        multi_supports_tpimf: true,
+        override_force_charge: false,
+        ovr_max_discharge_w: f64::NAN,
+    });
+    let snap = Snapshot {
+        s: Sensors { grid, reported, target: 5.0, soc, state: sysstate },
+        dt: 1.0,
+        dt_clamped: false,
+        min_soc,
+        lo: -7030.0,
+        hi: 7030.0,
+        effective_target: 5.0,
+        sg,
+        feed_block_charge: false,
+        feed_force_flat: false,
+        gen_disable_export: false,
+        gm_should_write: true,
+        shore_out: ShoreOut::default(),
+        hub4_actual: None,
+        ac_out_w: f64::NAN,
+        hub4mode_live: None,
+        dc_batt_w: f64::NAN,
+    };
+    let d = decide(&snap, &mut st, &c, t);
+    assert!(d.owner_us && !d.flipped && d.hub4mode.is_none(), "t={t}: ownership kept, no flap");
+    assert!(!d.safety.sanity_tripped, "t={t}: a dispatch is not a fault");
+    let written = match d.write {
+        Write::Setpoint(v) => v,
+        w => panic!("t={t}: expected a setpoint write, got {w:?}"),
+    };
+    let pin = |want: f64| assert!((written - want).abs() < 1.0, "t={t}: write {written}, want {want}");
+    match t as i64 {
+        19460 => {
+            // err 44 W: inside the deadband, base 0.5 gain — the hold still decays here.
+            assert!(d.command.abs() < 1e-9);
+            pin(-952.0);
+            assert!(!d.safety.slew_clamped);
+        }
+        19465 => {
+            // err 3173 W: full authority — the ramp-tick law is written as is.
+            pin(1475.0);
+            assert!(!d.safety.slew_clamped);
+        }
+        19470..=19530 => {
+            assert!(d.command.abs() < 1e-9);
+            pin(0.0); // full authority: parked exactly on the hold
+        }
+        19531 => pin(-301.0),
+        19532 => pin(-287.0),
+        19534 => {
+            // err 5305 W: full authority asks for the raw −4053 from −287 — a 3766 W step,
+            // beyond the 3515 W/s guard, which binds: this is the live `slew-clamped`.
+            pin(-287.0 - sl.slew_w_per_s);
+            assert!(d.safety.slew_clamped, "t={t}: the slew guard is what bounds this tick live");
+        }
+        _ => {}
+    }
+}
+assert!(st.owner_us && st.sanity_trips == 0);
 }
 /// Live capture 2026-08-17 — the full scheduled-charge window edge sequence (SystemState
 /// 259), replayed row-for-row through the REAL socguard::enact + decide(). Two boundary
@@ -213,11 +321,9 @@ let rows: &[(f64, f64, f64, f64, i64, bool, f64)] = &[
 let sl = SafetyLimits::derive(7030.0, 1.0, None, None);
 let c = DecideCfg {
     stage: Stage::Takeover,
-    soc_hyst: 3.0,
     min_dwell_s: 30.0,
     trim_ki: 0.02,
     orig_mode: 1,
-    state_recharge: sysstate::RECHARGE,
     slew_w_per_s: sl.slew_w_per_s,
     sanity_band_w: sl.sanity_band_w,
     sanity_secs: sl.sanity_secs,
@@ -264,6 +370,7 @@ for &(t, grid, reported, soc, sysstate, ovr_fc, ovr_maxdis) in rows {
         hub4_actual: None,
         ac_out_w: f64::NAN,
         hub4mode_live: None,
+        dc_batt_w: f64::NAN,
     };
     let d = decide(&snap, &mut st, &c, t);
 
@@ -375,11 +482,9 @@ let rows: &[Row] = &[
 let sl = SafetyLimits::derive(7030.0, 1.0, None, None);
 let c = DecideCfg {
     stage: Stage::Shadow, // real write path, exactly as captured
-    soc_hyst: 3.0,
     min_dwell_s: 30.0,
     trim_ki: 0.02,
     orig_mode: 1,
-    state_recharge: sysstate::RECHARGE,
     slew_w_per_s: sl.slew_w_per_s,
     sanity_band_w: sl.sanity_band_w,
     sanity_secs: sl.sanity_secs,
@@ -442,6 +547,7 @@ for &(t, grid, reported, soc, ovr_fc, ovr_maxdis, acout, expect) in &rows[1..] {
         hub4_actual: None,
         ac_out_w: acout,
         hub4mode_live: None,
+        dc_batt_w: f64::NAN,
     };
     let d = decide(&snap, &mut st, &c, t);
     if t >= 55929.0 {
@@ -460,12 +566,10 @@ fn sim_decide_plant(load: &[f64], errgain: bool) -> (Vec<f64>, bool) {
     let sl = SafetyLimits::derive(7030.0, 1.0, None, None);
     let c = DecideCfg {
         stage: Stage::Takeover,
-        soc_hyst: 3.0,
-        min_dwell_s: 30.0,
+            min_dwell_s: 30.0,
         trim_ki: 0.02,
         orig_mode: 1,
-        state_recharge: sysstate::RECHARGE,
-        slew_w_per_s: sl.slew_w_per_s,
+            slew_w_per_s: sl.slew_w_per_s,
         sanity_band_w: sl.sanity_band_w,
         sanity_secs: sl.sanity_secs,
         ema_adaptive: false,
@@ -518,6 +622,7 @@ fn sim_decide_plant(load: &[f64], errgain: bool) -> (Vec<f64>, bool) {
             hub4_actual: None,
             ac_out_w: 20.0,
             hub4mode_live: None,
+            dc_batt_w: f64::NAN,
         };
         let d = decide(&snap, &mut st, &c, k as f64);
         saw_cycling |= st.cycling;
@@ -629,11 +734,9 @@ let rows: &[Row] = &[
 let sl = SafetyLimits::derive(7030.0, 1.0, None, None);
 let c = DecideCfg {
     stage: Stage::Takeover, // the capture is a LIVE takeover: the integral runs
-    soc_hyst: 3.0,
     min_dwell_s: 30.0,
     trim_ki: 0.02,
     orig_mode: 1,
-    state_recharge: sysstate::RECHARGE,
     slew_w_per_s: sl.slew_w_per_s,
     sanity_band_w: sl.sanity_band_w,
     sanity_secs: sl.sanity_secs,
@@ -691,6 +794,7 @@ for &(t, grid, reported, soc, ovr_fc, ovr_maxdis, acout, expect) in &rows[1..] {
         hub4_actual: None,
         ac_out_w: acout,
         hub4mode_live: None,
+        dc_batt_w: f64::NAN,
     };
     let d = decide(&snap, &mut st, &c, t);
     if t >= 45597.0 {
@@ -736,11 +840,9 @@ let rows: &[TailRow] = &[
 let sl = SafetyLimits::derive(7030.0, 1.0, None, None);
 let c = DecideCfg {
     stage: Stage::Shadow, // exactly as captured; shadow runs the real write path
-    soc_hyst: 3.0,
     min_dwell_s: 30.0,
     trim_ki: 0.02,
     orig_mode: 1,
-    state_recharge: sysstate::RECHARGE,
     slew_w_per_s: sl.slew_w_per_s,
     sanity_band_w: sl.sanity_band_w,
     sanity_secs: sl.sanity_secs,
@@ -788,6 +890,7 @@ for &(t, grid, reported, soc, ovr_fc, ovr_maxdis, acout, expect) in rows {
         hub4_actual: None,
         ac_out_w: acout,
         hub4mode_live: None,
+        dc_batt_w: f64::NAN,
     };
     let d = decide(&snap, &mut st, &c, t);
     assert_eq!(d.write, Write::Nothing, "t={t}: shadow never writes");
@@ -902,6 +1005,7 @@ for (n, line) in lines.enumerate() {
         hub4_actual: None,
         ac_out_w: f64::NAN,
         hub4mode_live: None,
+        dc_batt_w: f64::NAN,
     };
     let d = decide(&snap, &mut st, &c, n as f64 * 20.0);
 

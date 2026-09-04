@@ -17,6 +17,9 @@ pub const P_ACTIVEIN: &str = "/Ac/ActiveIn/L1/P";
 pub const P_ACOUT: &str = "/Ac/Out/L1/P";
 pub const P_STATE: &str = "/SystemState/State";
 pub const P_SOC: &str = "/Dc/Battery/Soc";
+/// Battery DC power (W, + = charging) as systemcalc aggregates it; the hold supervisor's
+/// independent witness that a discharge inhibit is actually being honoured.
+pub const P_DC_BATTERY_POWER: &str = "/Dc/Battery/Power";
 pub const P_SETPOINT_SETTING: &str = "/Settings/CGwacs/AcPowerSetPoint";
 pub const P_HUB4MODE: &str = "/Settings/CGwacs/Hub4Mode";
 pub const P_MAXDISCHARGE: &str = "/Settings/CGwacs/MaxDischargePower";

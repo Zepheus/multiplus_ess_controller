@@ -9,7 +9,6 @@ pub struct Args {
     pub kind: Kind,
     pub interval: f64,
     pub min_soc: f64,
-    pub soc_hyst: f64,
     pub max_discharge: f64,
     pub max_charge: f64,
     pub seconds: u64,
@@ -37,7 +36,6 @@ pub fn parse_args() -> Result<Args, String> {
         kind: Kind::Pi { ki: 0.05, i_max: 300.0 },
         interval: 1.0,
         min_soc: 15.0,
-        soc_hyst: 3.0,
         max_discharge: 0.0, // 0 => read from settings / default
         errgain_dead_w: f64::INFINITY,
         errgain_slope_w: 2000.0,
@@ -220,8 +218,11 @@ adaptive: PI + a continuously-learned feed-forward leak(throughput) ~= a + b*|re
     sigma at which the model gets 50% authority. The learned model is logged periodically as
     `MODEL: a=.. b=.. conf=..`; hard safety (write phase) is independent of anything learned.
 
-Live ESS settings (read every tick, UI/VRM/API-controlled — never hardcoded): the ownership
-floor is BatteryLife/MinimumSocLimit (--min-soc is only a fallback if that read fails); the
+Live ESS settings (read every tick, UI/VRM/API-controlled — never hardcoded): the discharge
+floor is BatteryLife/MinimumSocLimit — at or below it we hold the battery (no further discharge)
+but keep driving; a raised floor is a dispatch/force-charge request enacted via systemcalc's
+BatteryLife state, never a hand-back. --min-soc is the floor ONLY while that read fails (and then
+it is the floor we hold at, whatever the real setting says); the
 charge/discharge power limits are MaxChargePower/MaxDischargePower, enforced per-tick by the
 battery broker alongside the live BMS DCL/CCL. --max-* set the fixed inverter design envelope.
 

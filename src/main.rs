@@ -44,8 +44,10 @@
 //!                  inline at the bottom of the module they test)
 //! Safety envelope (live):
 //!   * We only ever discharge/idle within limits. We NEVER force-charge.
-//!   * Below the SOC floor, or on an explicit recharge state, we hand control back
-//!     to the stock daemon (Hub4Mode=1) so SocGuard/sustain/scheduling still work.
+//!   * At/below the SOC floor we HOLD (no further discharge) but keep the loop;
+//!     SocGuard/sustain/scheduling are enacted from systemcalc's state like stock.
+//!     Control is handed back to the stock daemon (Hub4Mode=1) only on a sanity trip,
+//!     a hold breach, or an external mode change.
 //!   * Commands are clamped to the configured charge/discharge power limits and a
 //!     hard sanity bound.
 //!   * If the process dies for any reason, it stops writing; the Multi reverts to
@@ -144,7 +146,8 @@ fn read_sensors(bus: &dyn Bus) -> Option<Sensors> {
         reported: bus.get_f64(VEBUS, P_ACTIVEIN)?,
         target: bus.get_f64(SETTINGS, P_SETPOINT_SETTING)?,
         soc: bus.get_f64(SYS, P_SOC)?,
-        state: bus.get_f64(SYS, P_STATE)? as i64,
+        // Telemetry/log only since 2026-09-04 (nothing decides on it): never abort a tick.
+        state: bus.get_f64(SYS, P_STATE).map_or(-1, |v| v as i64),
     })
 }
 
@@ -271,6 +274,7 @@ fn sample(
         gm_should_write: sub.gm_cached.should_write_setpoint,
         shore_out,
         hub4_actual: bus.get_f64(VEBUS, P_HUB4_SETPOINT),
+        dc_batt_w: bus.get_f64(SYS, P_DC_BATTERY_POWER).unwrap_or(f64::NAN),
         ac_out_w: bus.get_f64(VEBUS, P_ACOUT).unwrap_or(f64::NAN),
         hub4mode_live: bus.get_i32(SETTINGS, P_HUB4MODE),
     })
@@ -452,6 +456,7 @@ fn main() {
         smith_weff_lag: f64::NAN,
         smith_prev_write: f64::NAN,
         oob_since: None,
+        hold_oob_since: None,
         prev_force_charge: false,        ceded_external: false,
         cyc_edges: [f64::NEG_INFINITY; loop_core::CYC_EDGES_MAX],
         cyc_prev_load: f64::NAN,
@@ -470,13 +475,23 @@ fn main() {
         inverter_nominal_w * loop_core::CAPACITY_MARGIN,
         loop_core::ABSURD_CLAMP_W
     );
+    // The hold supervisor's witness. NaN/None here means it stays inert for the whole run
+    // (no evidence, no trip) — say so up front rather than let a silent gap pass as "fine".
+    let dc0 = bus.get_f64(SYS, P_DC_BATTERY_POWER);
+    eprintln!(
+        "hold supervisor: /Dc/Battery/Power={} (discharge past the active inhibit by >{:.0} W for {:.0} s trips; None => supervisor INERT); err-gain pacing: dead={} W slope={} W cap={}",
+        dc0.map_or("None".to_string(), |v| format!("{v:.0}W")),
+        safety.sanity_band_w,
+        safety.sanity_secs,
+        args.errgain_dead_w,
+        args.errgain_slope_w,
+        args.errgain_cap
+    );
     let cfg = loop_core::DecideCfg {
         stage: args.stage,
-        soc_hyst: args.soc_hyst,
         min_dwell_s: 30.0, // anti-thrash on ownership flips
         trim_ki: args.trim_ki,
         orig_mode,
-        state_recharge: states::sysstate::RECHARGE,
         slew_w_per_s: safety.slew_w_per_s,
         sanity_band_w: safety.sanity_band_w,
         sanity_secs: safety.sanity_secs,
@@ -583,8 +598,8 @@ fn main() {
         // Ownership transitions are rare events -> stderr, so a --quiet service records them.
         if dec.flipped {
             eprintln!(
-                "[t={t:.0}] {} (soc={:.0}% state={} grid={:.0}W)",
-                dec.note, snap.s.soc, snap.s.state, snap.s.grid
+                "[t={t:.0}] {} (soc={:.0}% min-soc={:.0}% state={} grid={:.0}W)",
+                dec.note, snap.s.soc, snap.min_soc, snap.s.state, snap.s.grid
             );
         }
 
@@ -595,11 +610,15 @@ fn main() {
         // /Overrides/Setpoint. (Tier-B additionally publishes /Alarms/EssSafety.)
         if dec.safety.any() && dec.safety != last_safety {
             eprintln!(
-                "[t={t:.0}] SAFETY: {} (grid={:.0}W target={:.0}W soc={:.0}% alarm={})",
+                "[t={t:.0}] SAFETY: {} (grid={:.0}W target={:.0}W soc={:.0}% min-soc={:.0}% dc={:.0}W maxdis={:.0}W fc={} alarm={})",
                 dec.safety.reason(),
                 snap.s.grid,
                 snap.s.target,
                 snap.s.soc,
+                snap.min_soc,
+                snap.dc_batt_w,
+                snap.sg.max_discharge_w,
+                snap.sg.force_charge as u8,
                 dec.safety.alarm_level()
             );
         }
@@ -664,6 +683,12 @@ fn main() {
             // empty = unlimited. fc: the force-charge regime. Both exist so a charge-window
             // capture is replayable as a golden fixture without a separate capture tool.
             // acout: measured Multi AC-out (the clamp feedforward); empty = unread.
+            // dcbatt: battery DC power (+ = charging), the hold supervisor's witness; empty = unread.
+            let dcbatt = if snap.dc_batt_w.is_finite() {
+                format!("{:.0}", snap.dc_batt_w)
+            } else {
+                String::new()
+            };
             let acout = if snap.ac_out_w.is_finite() {
                 format!("{:.0}", snap.ac_out_w)
             } else {
@@ -675,7 +700,7 @@ fn main() {
                 String::new()
             };
             let _ = tel.write_line(&format!(
-                "{t:.0},{:.1},{:.1},{:.1},{:.0},{},{:.1},{},{actual},{},{maxdis},{acout},{reason}",
+                "{t:.0},{:.1},{:.1},{:.1},{:.0},{},{:.1},{},{actual},{},{maxdis},{acout},{reason},{:.0},{dcbatt}",
                 snap.s.grid,
                 snap.s.reported,
                 snap.s.target,
@@ -683,7 +708,8 @@ fn main() {
                 snap.s.state,
                 dec.display_cmd,
                 dec.owner_str,
-                snap.sg.force_charge as u8
+                snap.sg.force_charge as u8,
+                snap.min_soc
             ));
         }
 

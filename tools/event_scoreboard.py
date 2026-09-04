@@ -35,7 +35,9 @@ ALPHA = FIT["dynamics"]["first_order_alpha"]; DELAY = FIT["dynamics"]["transport
 METER_LAG = FIT["meter"]["lag_s"]
 EDGE_W, PRE_S, POST_S, TARGET = 1000.0, 20, 45, 5.0
 
-COLS = "t,grid,reported,target,soc,state,command,owner,actual,fc,maxdis,acout,reason".split(",")
+# minsoc (live BatteryLife floor, %) and dcbatt (battery DC W, + charging) are absent on captures
+# before 2026-09-04; zip() tolerates it.
+COLS = "t,grid,reported,target,soc,state,command,owner,actual,fc,maxdis,acout,reason,minsoc,dcbatt".split(",")
 
 def load_capture(fn):
     rows = {}
