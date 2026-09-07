@@ -306,7 +306,7 @@ writing faster than the meter refreshes just chases stale readings.
   from target (0.5 inside the deadband, up to 1.0 at multi-kW errors, both
   directions) — arresting isolated appliance step-offs/ons faster. A built-in
   detector counts large *load-estimate* edges (battery-side movement cancels, so
-  the loop's own actuation never trips it); two or more edges in 30 s means a
+  the loop's own actuation never trips it); three or more edges in 30 s (two can be a staged ramp-up) means a
   modulating load (induction hob), where near-Nyquist cycles cannot be chased —
   pacing reverts to stock-parity 0.5 and the integrator freezes so aliased
   residue cannot walk it. Values are from a literature-and-sweep study over live

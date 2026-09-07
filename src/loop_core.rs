@@ -262,7 +262,8 @@ pub struct Snapshot {
 pub const CYC_EDGE_W: f64 = 300.0; // load-estimate jump that counts as an edge
 pub const CYC_DEBOUNCE_S: f64 = 3.0; // a multi-tick ramp is ONE edge
 pub const CYC_WINDOW_S: f64 = 30.0; // trailing window
-pub const CYC_COUNT: usize = 2; // >= this many edges in the window => cycling
+pub const CYC_COUNT: usize = 3; // >= this many edges in the window => cycling (the shortest
+                                // on/off/on train; two edges can be a staged ramp)
 pub const CYC_EDGES_MAX: usize = 8;
 
 /// Update the cycling detector with this tick's load estimate (lag-corrected grid
@@ -1759,6 +1760,60 @@ mod tests {
             t += 1.0;
         }
         assert_eq!(st.ctrl.integral_w(), i_before, "integral must freeze in cycling");
+    }
+
+    /// A load that comes ON in stages and then drops is a step, not a cycle: two
+    /// same-direction edges must not gate the step-off's fast arrest (live 2026-09-06
+    /// 15:26: 3.1 -> 4.7 -> 5.3 kW then -3.8 kW eight seconds later). Three edges in
+    /// the window, the shortest on/off/on train, still do.
+    #[test]
+    fn staged_ramp_then_stepoff_is_not_cycling_but_three_edges_are() {
+        let mut c = cfg(Stage::Takeover);
+        c.errgain_dead_w = 300.0;
+        let mut st = state(Kind::Stock);
+        st.owner_us = true;
+        st.last_flip_t = 0.0;
+        st.last_out = Some(-3100.0);
+        let mut t = 100.0;
+        let tick = |st: &mut LoopState, grid: f64, rep: f64, t: f64| {
+            let mut sp = snap(true);
+            sp.s.grid = grid;
+            sp.s.reported = rep;
+            decide(&sp, st, &c, t)
+        };
+        for _ in 0..5 {
+            tick(&mut st, 20.0, -3100.0, t);
+            t += 1.0;
+        }
+        // Stage 1 (+1.6 kW) and, after the debounce, stage 2 (+0.6 kW): two edges.
+        for _ in 0..4 {
+            tick(&mut st, 1620.0, -3100.0, t);
+            t += 1.0;
+        }
+        for _ in 0..4 {
+            tick(&mut st, 2220.0, -3100.0, t);
+            t += 1.0;
+        }
+        // The step-off tick: must still get full authority.
+        let d = tick(&mut st, -1600.0, -3100.0, t);
+        assert!(!st.cycling, "two same-direction edges are a staged ramp, not a cycle");
+        let w = match d.write {
+            Write::Setpoint(v) => v,
+            w => panic!("{w:?}"),
+        };
+        // Full authority asks for the raw law (−1480) from −5300: the slew guard bounds
+        // that at 3515 W/tick (≈ −1785). Half-step pacing would have written ≈ −3390.
+        assert!(w > -2000.0, "step-off must be arrested at full authority, wrote {w}");
+        t += 1.0;
+        // Third edge inside the window: now it is a cycle.
+        for _ in 0..4 {
+            tick(&mut st, -1600.0, -3100.0, t);
+            t += 1.0;
+        }
+        tick(&mut st, 1600.0, -3100.0, t);
+        t += 1.0;
+        tick(&mut st, 1600.0, -3100.0, t);
+        assert!(st.cycling, "three edges in the window are a cycling regime");
     }
 
     #[test]
