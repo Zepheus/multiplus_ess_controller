@@ -21,3 +21,7 @@ lto = true
 codegen-units = 1
 panic = "abort"     # a panic must not leave us mid-write; abort -> watchdog -> passthru
 strip = true
+
+[dev-dependencies]
+# Peer-to-peer connections let tests run a real D-Bus peer over a socket pair.
+zbus = { version = "5", features = ["p2p"] }

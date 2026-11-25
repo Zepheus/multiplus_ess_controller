@@ -138,6 +138,18 @@ pub trait Bus {
     fn set_i32(&self, service: &str, path: &str, value: i32) -> Result<(), String>;
     fn set_f64(&self, service: &str, path: &str, value: f64) -> Result<(), String>;
 
+    /// Whether the item exists on the bus, valid or not. An item published as invalid
+    /// (empty array) exists; a path the service does not have does not.
+    fn exists(&self, service: &str, path: &str) -> bool {
+        self.get_f64(service, path).is_some()
+    }
+    /// The first transport fault (timeout, lost connection) since the previous call, if
+    /// any. After a fault, reads may have answered "absent" for values that are present,
+    /// so nothing read since the previous call may be acted on.
+    fn take_fault(&self) -> Option<BusFault> {
+        None
+    }
+
     // Thin coercions over get_f64 (BusItem bools/ints arrive numeric).
     fn get_bool(&self, service: &str, path: &str) -> Option<bool> {
         self.get_f64(service, path).map(|v| v.is_finite() && v != 0.0)
@@ -147,22 +159,100 @@ pub trait Bus {
     }
 }
 
+/// Longest a single bus call may wait for its reply. A peer that is hung but still
+/// connected then surfaces as a transport fault instead of freezing the loop.
+pub const METHOD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Persistent system-bus connection.
 pub struct SystemBus {
     conn: Connection,
+    fault: std::cell::RefCell<Option<BusFault>>,
+}
+
+/// A transport fault: the call got no answer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BusFault {
+    pub what: String,
+    /// The connection itself is gone (e.g. dbus-daemon restarted): only a new one helps.
+    pub connection_lost: bool,
+}
+
+impl std::fmt::Display for BusFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.what)
+    }
+}
+
+/// zbus reports a method timeout and a lost connection as `InputOutput`. Error replies
+/// from the peer (unknown service or object, invalid value) are answers, not faults.
+fn is_fault(e: &zbus::Error) -> bool {
+    matches!(e, zbus::Error::InputOutput(_))
+}
+
+fn is_connection_lost(e: &zbus::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(e, zbus::Error::InputOutput(io)
+        if matches!(io.kind(), BrokenPipe | ConnectionReset | ConnectionAborted | NotConnected | UnexpectedEof))
 }
 
 impl SystemBus {
     pub fn connect() -> Result<Self, String> {
-        let conn = Connection::system().map_err(|e| format!("system bus connect: {e}"))?;
-        Ok(SystemBus { conn })
+        let conn = zbus::blocking::connection::Builder::system()
+            .map(|b| b.method_timeout(METHOD_TIMEOUT))
+            .and_then(|b| b.build())
+            .map_err(|e| format!("system bus connect: {e}"))?;
+        Ok(SystemBus { conn, fault: std::cell::RefCell::new(None) })
+    }
+
+    /// Run one call unless a fault is already latched (the tick is void then, and every
+    /// further call would only add another timeout), recording a new fault.
+    fn guarded(
+        &self,
+        what: &str,
+        service: &str,
+        path: &str,
+        call: impl FnOnce() -> zbus::Result<zbus::Message>,
+    ) -> Option<zbus::Message> {
+        if self.fault.borrow().is_some() {
+            return None;
+        }
+        self.note(what, service, path, call())
+    }
+
+    /// Pass a call result through, recording a transport fault for `take_fault`.
+    fn note(
+        &self,
+        what: &str,
+        service: &str,
+        path: &str,
+        r: zbus::Result<zbus::Message>,
+    ) -> Option<zbus::Message> {
+        match r {
+            Ok(m) => Some(m),
+            Err(e) => {
+                if is_fault(&e) {
+                    self.fault.borrow_mut().get_or_insert_with(|| BusFault {
+                        what: format!("{what} {service}{path}: {e}"),
+                        connection_lost: is_connection_lost(&e),
+                    });
+                }
+                None
+            }
+        }
+    }
+
+    fn get_value(&self, service: &str, path: &str) -> Option<zbus::Message> {
+        self.guarded("GetValue", service, path, || {
+            self.conn.call_method(Some(service), path, Some(IFACE), "GetValue", &())
+        })
     }
 
     fn set_variant(&self, service: &str, path: &str, v: Value) -> Result<(), String> {
         let reply = self
-            .conn
-            .call_method(Some(service), path, Some(IFACE), "SetValue", &v)
-            .map_err(|e| format!("SetValue {service}{path}: {e}"))?;
+            .guarded("SetValue", service, path, || {
+                self.conn.call_method(Some(service), path, Some(IFACE), "SetValue", &v)
+            })
+            .ok_or_else(|| format!("SetValue {service}{path} failed"))?;
         let ret: i32 = reply
             .body()
             .deserialize()
@@ -177,38 +267,41 @@ impl SystemBus {
 
 impl Bus for SystemBus {
     fn get_f64(&self, service: &str, path: &str) -> Option<f64> {
-        let reply = self
-            .conn
-            .call_method(Some(service), path, Some(IFACE), "GetValue", &())
-            .ok()?;
+        let reply = self.get_value(service, path)?;
         let body = reply.body();
         let v: Value = body.deserialize().ok()?;
         value_to_f64(&v)
     }
 
     fn get_str(&self, service: &str, path: &str) -> Option<String> {
-        let reply = self
-            .conn
-            .call_method(Some(service), path, Some(IFACE), "GetValue", &())
-            .ok()?;
+        let reply = self.get_value(service, path)?;
         let body = reply.body();
         let v: Value = body.deserialize().ok()?;
         value_to_str(&v)
     }
 
     fn list_services(&self, prefix: &str) -> Vec<String> {
-        let reply = match self.conn.call_method(
-            Some("org.freedesktop.DBus"),
-            "/org/freedesktop/DBus",
-            Some("org.freedesktop.DBus"),
-            "ListNames",
-            &(),
-        ) {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
+        let Some(reply) = self.guarded("ListNames", "org.freedesktop.DBus", "", || {
+            self.conn.call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "ListNames",
+                &(),
+            )
+        }) else {
+            return Vec::new();
         };
         let names: Vec<String> = reply.body().deserialize().unwrap_or_default();
         names.into_iter().filter(|n| n.starts_with(prefix)).collect()
+    }
+
+    fn exists(&self, service: &str, path: &str) -> bool {
+        self.get_value(service, path).is_some()
+    }
+
+    fn take_fault(&self) -> Option<BusFault> {
+        self.fault.borrow_mut().take()
     }
 
     fn set_i32(&self, service: &str, path: &str, value: i32) -> Result<(), String> {
@@ -244,5 +337,56 @@ fn value_to_str(v: &Value) -> Option<String> {
         Value::Str(s) => Some(s.to_string()),
         Value::Value(inner) => value_to_str(inner),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeouts_and_lost_connections_are_faults_peer_replies_are_not() {
+        let io = |k| zbus::Error::from(std::io::Error::new(k, "x"));
+        assert!(is_fault(&io(std::io::ErrorKind::TimedOut)));
+        assert!(is_fault(&io(std::io::ErrorKind::BrokenPipe)));
+        assert!(!is_fault(&zbus::Error::Failure("no such object".into())));
+        assert!(!is_fault(&zbus::Error::InvalidReply));
+    }
+
+    /// A real zbus connection to a peer that never answers: the method timeout must
+    /// surface as a fault, and a peer that went away likewise.
+    #[test]
+    fn a_silent_or_vanished_peer_is_a_fault_through_real_zbus() {
+        use zbus::blocking::connection::Builder;
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let guid = zbus::Guid::generate();
+        let server = std::thread::spawn(move || {
+            Builder::async_io_unix_stream(b).server(guid).unwrap().p2p().build().unwrap()
+        });
+        let conn = Builder::async_io_unix_stream(a)
+            .p2p()
+            .method_timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let peer = server.join().unwrap(); // connected, never serves the object
+        let bus = SystemBus { conn, fault: std::cell::RefCell::new(None) };
+
+        // The peer runs no object server, so the call goes unanswered and must time out.
+        let t0 = std::time::Instant::now();
+        assert_eq!(bus.get_f64("org.example", "/x"), None);
+        // While the fault is latched the tick is void: further calls return at once.
+        let t1 = std::time::Instant::now();
+        assert_eq!(bus.get_f64("org.example", "/y"), None);
+        assert!(bus.set_i32("org.example", "/y", 1).is_err());
+        assert!(t1.elapsed() < std::time::Duration::from_millis(50));
+        let f = bus.take_fault().expect("timeout is a fault");
+        assert!(f.what.contains("GetValue") && !f.connection_lost, "{f:?}");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+
+        drop(peer);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(bus.get_f64("org.example", "/x"), None);
+        let f = bus.take_fault().expect("a vanished peer is a fault");
+        assert!(f.connection_lost, "{f:?}");
     }
 }

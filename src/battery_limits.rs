@@ -72,7 +72,7 @@ pub struct BatteryBroker {
     mode: Mode,
     latched_ccl: bool, // once BMS CCL has ever been finite
     latched_dcl: bool, // once BMS DCL has ever been finite (persisted -> never un-blocks)
-    bms_service: Option<String>,
+    bms_service: BmsService,
 }
 
 fn keep_charged(i: &Inputs) -> bool {
@@ -113,19 +113,51 @@ fn detect_mode_opt(bus: &dyn Bus) -> Option<Mode> {
     })
 }
 
-fn resolve_bms(bus: &dyn Bus) -> Option<String> {
-    if let Some(s) = bus.get_str(SYS, P_ACTIVE_BMS) {
-        if !s.is_empty() {
-            return Some(s);
+/// The active BMS service: systemcalc's `/ActiveBmsService`, else the first `battery.*`
+/// on the bus. Until systemcalc names one (it may publish after we start at GX boot), it
+/// is resolved again on every `refresh`.
+pub struct BmsService {
+    name: Option<String>,
+    named: bool,
+}
+
+impl BmsService {
+    pub fn new(bus: &dyn Bus) -> Self {
+        let mut s = BmsService { name: None, named: false };
+        s.refresh(bus);
+        s
+    }
+
+    pub fn refresh(&mut self, bus: &dyn Bus) {
+        if self.named {
+            return;
+        }
+        if let Some(n) = bus.get_str(SYS, P_ACTIVE_BMS).filter(|n| !n.is_empty()) {
+            if self.name.is_some() {
+                eprintln!("bms: {n} (named by systemcalc)");
+            }
+            self.name = Some(n);
+            self.named = true;
+        } else if self.name.is_none() {
+            self.name = bus.list_services(BATTERY_PREFIX).into_iter().next();
         }
     }
-    bus.list_services(BATTERY_PREFIX).into_iter().next()
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+}
+
+impl std::fmt::Debug for BmsService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}{}", self.name, if self.named { "" } else { " (not yet named by systemcalc)" })
+    }
 }
 
 impl BatteryBroker {
     pub fn new(bus: &dyn Bus) -> Self {
         let (mode, fw, dvcc) = detect_mode(bus);
-        let bms_service = resolve_bms(bus);
+        let bms_service = BmsService::new(bus);
         eprintln!(
             "battery broker: mode={mode:?} fw={fw:#x} dvcc={dvcc} bms={bms_service:?}"
         );
@@ -145,10 +177,8 @@ impl BatteryBroker {
                 self.mode = mode;
             }
         }
-        if self.bms_service.is_none() {
-            self.bms_service = resolve_bms(bus);
-        }
-        let bms = self.bms_service.as_deref();
+        self.bms_service.refresh(bus);
+        let bms = self.bms_service.name();
         let from_bms = |p: &str| bms.and_then(|b| bus.get_f64(b, p));
         // -1 is Victron's "off/unset" sentinel for the power settings -> NaN.
         let neg1_nan = |v: Option<f64>| match v {
@@ -234,7 +264,7 @@ impl BatteryBroker {
             } else {
                 0.0 // DCL latched then went to 0 => hard block
             }
-        } else if self.bms_service.is_some() || self.mode == Mode::Regular {
+        } else if self.bms_service.name().is_some() || self.mode == Mode::Regular {
             // Managed install (a BMS is expected) but its DCL has not been read finite
             // yet — e.g. a GX boot race where our process starts before the battery
             // service. BLOCK discharge until the real limit latches; never discharge at

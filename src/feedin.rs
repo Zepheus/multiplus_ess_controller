@@ -96,10 +96,12 @@ pub fn snapshot_flags(bus: &dyn Bus) -> FlagSnapshot {
 
 /// Best-effort restore (unreadable-at-capture items are skipped; write errors are
 /// reported but do not abort the remaining restores).
-pub fn restore_flags(bus: &dyn Bus, snap: &FlagSnapshot) {
+pub fn restore_flags(bus: &dyn Bus, snap: &FlagSnapshot, deadline: std::time::Instant) {
     let put_i32 = |path: &str, v: Option<i32>| {
         if let Some(v) = v {
-            if let Err(e) = bus.set_i32(VEBUS, path, v) {
+            if std::time::Instant::now() >= deadline {
+                eprintln!("flag restore {path}={v} skipped: restore budget spent");
+            } else if let Err(e) = bus.set_i32(VEBUS, path, v) {
                 eprintln!("flag restore {path}={v} failed: {e}");
             }
         }
@@ -111,7 +113,9 @@ pub fn restore_flags(bus: &dyn Bus, snap: &FlagSnapshot) {
     for (n, v) in snap.maxfeedin.iter().enumerate() {
         if let Some(v) = *v {
             let path = p_maxfeedin(n + 1);
-            if let Err(e) = bus.set_f64(VEBUS, &path, v) {
+            if std::time::Instant::now() >= deadline {
+                eprintln!("flag restore {path}={v} skipped: restore budget spent");
+            } else if let Err(e) = bus.set_f64(VEBUS, &path, v) {
                 eprintln!("flag restore {path}={v} failed: {e}");
             }
         }
@@ -197,19 +201,32 @@ pub struct FeedIn {
     ov_accum: f64,                     // DC-overvoltage integrator, init 0
     last: LastWritten,                 // write-if-changed cache
     overrides: Overrides,              // filled by the hub4 server; default = none
-    // Firmware-support gates, probed once at startup: writes to paths an old Multi does
-    // not publish must be skipped forever.
+    // Firmware-support gates: writes to paths the Multi does not publish are skipped
+    // Re-probed while any is missing, because at GX boot the vebus service can
+    // register its items after we start.
     has_dnfio: bool,
     has_tpimfi: bool,
     has_maxfeedin: bool,
+    next_probe: std::time::Instant,
+}
+
+/// How often missing firmware gates are probed again.
+const GATE_REPROBE: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn probe_gates(bus: &dyn Bus) -> (bool, bool, bool) {
+    // As stock gates them: DoNotFeedInOvervoltage when the item exists on the bus,
+    // TargetPowerIsMaxFeedIn when it is valid (its validity is the firmware-support
+    // signal), MaxFeedInPower when valid.
+    (
+        bus.exists(VEBUS, P_DNFIO),
+        bus.get_f64(VEBUS, P_TPIMF).is_some(),
+        bus.get_f64(VEBUS, &p_maxfeedin(1)).is_some(),
+    )
 }
 
 impl FeedIn {
     pub fn new(bus: &dyn Bus) -> Self {
-        // A path present on the bus answers GetValue; a missing item errors -> None.
-        let has_dnfio = bus.get_f64(VEBUS, P_DNFIO).is_some();
-        let has_tpimfi = bus.get_f64(VEBUS, P_TPIMF).is_some();
-        let has_maxfeedin = bus.get_f64(VEBUS, &p_maxfeedin(1)).is_some();
+        let (has_dnfio, has_tpimfi, has_maxfeedin) = probe_gates(bus);
         eprintln!(
             "feedin: fw-gates dnfio={has_dnfio} tpimfi={has_tpimfi} maxfeedin={has_maxfeedin}"
         );
@@ -222,7 +239,30 @@ impl FeedIn {
             has_dnfio,
             has_tpimfi,
             has_maxfeedin,
+            next_probe: std::time::Instant::now() + GATE_REPROBE,
         }
+    }
+
+    /// Re-probe the firmware gates if any is still missing and the probe is due.
+    fn reprobe_gates(&mut self, bus: &dyn Bus, now: std::time::Instant) {
+        if (self.has_dnfio && self.has_tpimfi && self.has_maxfeedin) || now < self.next_probe {
+            return;
+        }
+        self.next_probe = now + GATE_REPROBE;
+        let gates = probe_gates(bus);
+        if gates != (self.has_dnfio, self.has_tpimfi, self.has_maxfeedin) {
+            eprintln!(
+                "feedin: fw-gates now dnfio={} tpimfi={} maxfeedin={}",
+                gates.0, gates.1, gates.2
+            );
+            (self.has_dnfio, self.has_tpimfi, self.has_maxfeedin) = gates;
+        }
+    }
+
+    /// A flag write failed part-way: forget what was written so every gated flag is
+    /// planned again on the next tick.
+    pub fn forget_written(&mut self) {
+        self.last = LastWritten::default();
     }
 
     /// Update the cached `/Overrides/*` (called by the hub4 server). Until
@@ -366,6 +406,7 @@ impl FeedIn {
     /// `Output` (flag snapshot + a `write` method). Pure of side effects on the bus:
     /// the caller decides whether to `Output::write` (live) or discard it (shadow).
     pub fn tick(&mut self, bus: &dyn Bus) -> Output {
+        self.reprobe_gates(bus, std::time::Instant::now());
         let i = self.read(bus);
 
         // Gate: Multi /State unreadable => invalid => write nothing, hold last flags,
@@ -566,10 +607,16 @@ mod tests {
         f: HashMap<(String, String), f64>,
         s: HashMap<(String, String), String>,
         writes: RefCell<Vec<(String, String, f64)>>,
+        fail_writes: std::cell::Cell<bool>,
     }
     impl RecBus {
         fn new() -> Self {
-            RecBus { f: HashMap::new(), s: HashMap::new(), writes: RefCell::new(Vec::new()) }
+            RecBus {
+                f: HashMap::new(),
+                s: HashMap::new(),
+                writes: RefCell::new(Vec::new()),
+                fail_writes: std::cell::Cell::new(false),
+            }
         }
         fn set(&mut self, svc: &str, path: &str, v: f64) {
             self.f.insert((svc.into(), path.into()), v);
@@ -601,6 +648,9 @@ mod tests {
             Vec::new()
         }
         fn set_i32(&self, svc: &str, path: &str, v: i32) -> Result<(), String> {
+            if self.fail_writes.get() {
+                return Err("timed out".into());
+            }
             self.writes.borrow_mut().push((svc.into(), path.into(), v as f64));
             Ok(())
         }
@@ -636,6 +686,45 @@ mod tests {
         b
     }
 
+    // ---- write-if-changed cache and firmware gates under failure ----
+
+    #[test]
+    fn a_failed_flag_write_resends_every_flag_next_tick() {
+        let bus = base();
+        let mut f = FeedIn::new(&bus);
+        bus.fail_writes.set(true);
+        let o = f.tick(&bus);
+        assert!(o.write(&bus).is_err());
+        f.forget_written();
+        bus.fail_writes.set(false);
+        let o = f.tick(&bus);
+        o.write(&bus).unwrap();
+        for p in [P_DISABLE_FEEDIN, P_DNFIO, P_TPIMF, P_FIX_SOLAR] {
+            assert_eq!(bus.writes_to(VEBUS, p).len(), 1, "{p} re-sent");
+        }
+        assert_eq!(bus.writes_to(VEBUS, &p_maxfeedin(1)).len(), 1);
+    }
+
+    #[test]
+    fn gates_follow_stock_semantics_and_are_reprobed_until_present() {
+        use crate::testbus::MockBus;
+        let mut bus = MockBus::new();
+        bus.invalid.push((VEBUS.into(), P_DNFIO.into())); // exists, value invalid
+        bus.invalid.push((VEBUS.into(), P_TPIMF.into()));
+        let mut f = FeedIn::new(&bus);
+        assert!(f.has_dnfio, "DNFIO: existing is enough");
+        assert!(!f.has_tpimfi, "TPIMFI: invalid means unsupported");
+        assert!(!f.has_maxfeedin, "not registered yet");
+        bus.invalid.clear();
+        bus.set(VEBUS, P_TPIMF, 0.0);
+        bus.set(VEBUS, &p_maxfeedin(1), 0.0);
+        let t0 = std::time::Instant::now();
+        f.reprobe_gates(&bus, t0);
+        assert!(!f.has_tpimfi, "not due yet");
+        f.reprobe_gates(&bus, t0 + GATE_REPROBE + std::time::Duration::from_secs(1));
+        assert!(f.has_tpimfi && f.has_maxfeedin);
+    }
+
     // ---- mode selection & the flags derived from it ----
 
     #[test]
@@ -652,6 +741,14 @@ mod tests {
     }
 
     #[test]
+    fn flag_restore_stops_once_its_budget_is_spent() {
+        let bus = base();
+        let snap = snapshot_flags(&bus);
+        restore_flags(&bus, &snap, std::time::Instant::now());
+        assert_eq!(bus.write_count(), 0);
+    }
+
+    #[test]
     fn flag_snapshot_roundtrip_restores_stock_values() {
         let mut bus = base();
         bus.set(VEBUS, P_DISABLE_FEEDIN, 1.0);
@@ -659,7 +756,7 @@ mod tests {
         bus.set(VEBUS, "/Hub4/L1/MaxFeedInPower", 200000.0);
         // L2/L3 unreadable on this single-phase rig: must be skipped by restore.
         let snap = snapshot_flags(&bus);
-        restore_flags(&bus, &snap);
+        restore_flags(&bus, &snap, std::time::Instant::now() + std::time::Duration::from_secs(3));
         assert_eq!(bus.writes_to(VEBUS, P_DISABLE_FEEDIN), vec![1.0]);
         assert_eq!(bus.writes_to(VEBUS, P_TPIMF), vec![0.0]);
         assert_eq!(bus.writes_to(VEBUS, "/Hub4/L1/MaxFeedInPower"), vec![200000.0]);

@@ -373,7 +373,6 @@ impl Controller {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn update_adaptive(
         &mut self,
         c: AdaptiveCfg,

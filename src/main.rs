@@ -61,6 +61,8 @@ mod dess;
 mod feedin;
 mod generator;
 mod gridmeter;
+mod handback;
+mod health;
 mod loop_core;
 mod pv;
 mod shore;
@@ -140,12 +142,14 @@ impl Stage {
 
 use loop_core::Sensors;
 
-fn read_sensors(bus: &dyn Bus) -> Option<Sensors> {
-    Some(Sensors {
-        grid: bus.get_f64(SYS, P_GRID)?,
-        reported: bus.get_f64(VEBUS, P_ACTIVEIN)?,
-        target: bus.get_f64(SETTINGS, P_SETPOINT_SETTING)?,
-        soc: bus.get_f64(SYS, P_SOC)?,
+/// The core inputs, or the first one that could not be read.
+fn read_sensors(bus: &dyn Bus) -> Result<Sensors, String> {
+    let need = |svc: &str, path: &str| bus.get_f64(svc, path).ok_or_else(|| format!("{svc}{path}"));
+    Ok(Sensors {
+        grid: need(SYS, P_GRID)?,
+        reported: need(VEBUS, P_ACTIVEIN)?,
+        target: need(SETTINGS, P_SETPOINT_SETTING)?,
+        soc: need(SYS, P_SOC)?,
         // Telemetry/log only (nothing decides on it): never abort a tick over it.
         state: bus.get_f64(SYS, P_STATE).map_or(-1, |v| v as i64),
     })
@@ -185,7 +189,7 @@ fn sample(
     now: Instant,
     dt: f64,
     dt_clamped: bool,
-) -> Option<loop_core::Snapshot> {
+) -> Result<loop_core::Snapshot, String> {
     // The takeover stage IS the legitimate mode-3 (external-control) owner: the
     // grid-meter guard must not treat our own mode write as "someone else owns it".
     let mode3_is_ours = matches!(stage, Stage::Takeover);
@@ -259,7 +263,7 @@ fn sample(
     // Keep the diagnostic-only module outputs "used".
     let _ = (pv_out.pv_disable, sub.gm_cached.alarm_no_grid_meter);
 
-    Some(loop_core::Snapshot {
+    Ok(loop_core::Snapshot {
         s,
         dt,
         dt_clamped,
@@ -280,6 +284,15 @@ fn sample(
     })
 }
 
+/// What the write phase did.
+#[derive(Default)]
+struct Writes {
+    /// A setpoint or feed-in flag write was rejected or got no answer.
+    failed: bool,
+    /// The feed-in flag plan of this tick was sent in full.
+    flags_sent: bool,
+}
+
 /// The WRITE phase: the single place every actuation happens. Write-phase safety checks
 /// belong here. `st` is `&mut` only so a Hub4Mode write-failure can fail safe to not-owner.
 fn actuate(
@@ -288,7 +301,8 @@ fn actuate(
     snap: &loop_core::Snapshot,
     dec: &loop_core::Decision,
     st: &mut loop_core::LoopState,
-) {
+) -> Writes {
+    let mut out = Writes::default();
     let mut mode_ok = true;
     if let Some(m) = dec.hub4mode {
         if let Err(e) = bus.set_i32(SETTINGS, P_HUB4MODE, m) {
@@ -302,7 +316,8 @@ fn actuate(
         // own mode and writing — never race it with a second writer, even for one tick.
         loop_core::Write::Setpoint(v) if mode_ok && v.is_finite() => {
             if let Err(e) = bus.set_f64(VEBUS, P_HUB4_SETPOINT, v) {
-                eprintln!("setpoint write failed: {e} (Multi will passthru if persistent)");
+                eprintln!("setpoint write failed: {e}");
+                out.failed = true;
             }
         }
         loop_core::Write::Setpoint(v) => {
@@ -320,10 +335,17 @@ fn actuate(
     }
     if dec.feed_shore_write {
         if let Some(f) = &sub.last_feed {
-            let _ = f.write(bus);
+            match f.write(bus) {
+                Ok(()) => out.flags_sent = true,
+                Err(e) => {
+                    eprintln!("feed-in flag write failed: {e}");
+                    out.failed = true;
+                }
+            }
         }
         let _ = sub.shore.write(bus, &snap.shore_out);
     }
+    out
 }
 
 fn main() {
@@ -354,7 +376,7 @@ fn main() {
         signal(15, on_signal as *const () as usize); // SIGTERM
     }
 
-    let bus = match SystemBus::connect() {
+    let mut bus = match SystemBus::connect() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("dbus connect failed: {e}");
@@ -464,22 +486,20 @@ fn main() {
         prev_saturated: 0,
         sanity_trips: 0,
     };
-    // Saturation reference: the pair's advertised nominal power. Unknown => INFINITY
-    // (saturation then only detectable at the clamp bounds).
-    let inverter_nominal_w = bus
-        .get_f64(VEBUS, P_NOMINAL_INVERTER)
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .unwrap_or(f64::INFINITY);
+    // Saturation reference: the pair's advertised nominal power, kept current by
+    // `NominalPower` (vebus can publish it after we start). Unknown => INFINITY:
+    // saturation is then only detectable at the clamp bounds.
+    let mut nominal = NominalPower::default();
+    let inverter_nominal_w = nominal.refresh(&bus, Instant::now()).unwrap_or(f64::INFINITY);
     eprintln!(
         "inverter nominal {inverter_nominal_w:.0} W (saturation beyond {:.0} W); bounds follow stock: BMS/user/override, +-{:.0} W ceiling",
         inverter_nominal_w * loop_core::CAPACITY_MARGIN,
         loop_core::ABSURD_CLAMP_W
     );
-    // The hold supervisor's witness. NaN/None here means it stays inert for the whole run
-    // (no evidence, no trip) — say so up front rather than let a silent gap pass as "fine".
+    // The hold supervisor's witness, read every tick; a tick without it cannot trip.
     let dc0 = bus.get_f64(SYS, P_DC_BATTERY_POWER);
     eprintln!(
-        "hold supervisor: /Dc/Battery/Power={} (discharge past the active inhibit by >{:.0} W for {:.0} s trips; None => supervisor INERT); err-gain pacing: dead={} W slope={} W cap={}",
+        "hold supervisor: /Dc/Battery/Power={} at start, read every tick (discharge past the active inhibit by >{:.0} W for {:.0} s trips; ticks without a reading never trip); err-gain pacing: dead={} W slope={} W cap={}",
         dc0.map_or("None".to_string(), |v| format!("{v:.0}W")),
         safety.sanity_band_w,
         safety.sanity_secs,
@@ -487,7 +507,7 @@ fn main() {
         args.errgain_slope_w,
         args.errgain_cap
     );
-    let cfg = loop_core::DecideCfg {
+    let mut cfg = loop_core::DecideCfg {
         stage: args.stage,
         min_dwell_s: 30.0, // anti-thrash on ownership flips
         trim_ki: args.trim_ki,
@@ -550,6 +570,9 @@ fn main() {
     // (stock's write-if-changed cache can otherwise leave OUR last flag values stuck).
     let mut flag_snap: Option<feedin::FlagSnapshot> = None;
 
+    let mut health = health::Health::default();
+    let takeover = matches!(args.stage, Stage::Takeover);
+
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
             break;
@@ -564,13 +587,32 @@ fn main() {
         let t = (now - start).as_secs_f64();
 
         // --- sample: every bus read for this tick -------------------------------
-        let snap = match sample(
+        let sampled = sample(
             &bus, &mut sub, args.stage, st.owner_us, env_lo, env_hi, args.min_soc, now, dt,
             dt_clamped,
-        ) {
-            Some(snap) => snap,
-            None => {
-                println!("{t:6.0} {:>8} read-fail: skipping tick (no write)", "");
+        );
+        if let Some(w) = nominal.refresh(&bus, now) {
+            cfg.inverter_nominal_w = w;
+        }
+        // A transport fault means a read may have answered "absent" for a value that
+        // exists (a limit, a hold, the floor): nothing read this tick may be acted on.
+        if let Some(fault) = bus.take_fault() {
+            handback::on_failure(&bus, &mut st, &mut flag_snap, orig_mode, takeover, t, &format!("bus fault: {fault}"));
+            if fault.connection_lost {
+                reconnect(&mut bus);
+            }
+            sub.feedin.forget_written();
+            sleep_or_break(args.interval);
+            continue;
+        }
+        if let Err(why) = health.check_read(now, sampled.as_ref().err().map(String::as_str), st.owner_us) {
+            handback::on_failure(&bus, &mut st, &mut flag_snap, orig_mode, takeover, t, &why);
+        }
+        let snap = match sampled {
+            Ok(snap) => snap,
+            Err(missing) => {
+                println!("{t:6.0} {:>8} read-fail ({missing}): skipping tick (no write)", "");
+                sub.feedin.forget_written();
                 sleep_or_break(args.interval);
                 continue;
             }
@@ -586,12 +628,33 @@ fn main() {
             if matches!(args.stage, Stage::Takeover) && dec.flipped && dec.owner_us {
                 flag_snap = Some(feedin::snapshot_flags(&bus));
             }
-            actuate(&bus, &sub, &snap, &dec, &mut st);
+            // Flags go back before the mode write that resumes stock (see handback).
             if matches!(args.stage, Stage::Takeover) && dec.flipped && !dec.owner_us {
                 if let Some(fs) = flag_snap.take() {
-                    feedin::restore_flags(&bus, &fs);
-                    eprintln!("feed-in flags restored to stock's captured values");
+                    feedin::restore_flags(&bus, &fs, Instant::now() + handback::FLAG_RESTORE_BUDGET);
                 }
+            }
+            let ready = match bus.take_fault() {
+                Some(fault) => Err(format!("bus fault: {fault}")),
+                None => health.check_pace(now.elapsed(), st.owner_us),
+            };
+            if let Err(why) = ready {
+                handback::on_failure(&bus, &mut st, &mut flag_snap, orig_mode, takeover, t, &why);
+                sub.feedin.forget_written();
+                sleep_or_break(args.interval);
+                continue;
+            }
+            let writes = actuate(&bus, &sub, &snap, &dec, &mut st);
+            // The flag cache must only remember what reached the Multi.
+            if !writes.flags_sent {
+                sub.feedin.forget_written();
+            }
+            let written = match bus.take_fault() {
+                Some(fault) => Err(format!("bus fault: {fault}")),
+                None => health.check_writes(writes.failed, st.owner_us),
+            };
+            if let Err(why) = written {
+                handback::on_failure(&bus, &mut st, &mut flag_snap, orig_mode, takeover, t, &why);
             }
         }
 
@@ -724,23 +787,7 @@ fn main() {
         // Takeover: restore the original Hub4Mode (we flipped it to EXTERNAL) and
         // stock's captured feed-in flags.
         Stage::Takeover => {
-            if let Some(fs) = flag_snap.take() {
-                feedin::restore_flags(&bus, &fs);
-                eprintln!("feed-in flags restored to stock's captured values");
-            }
-            eprintln!("restoring Hub4Mode={orig_mode} ...");
-            for attempt in 1..=5 {
-                match bus.set_i32(SETTINGS, P_HUB4MODE, orig_mode) {
-                    Ok(()) => {
-                        eprintln!("Hub4Mode restored to {orig_mode}.");
-                        break;
-                    }
-                    Err(e) => {
-                        eprintln!("restore attempt {attempt} failed: {e}");
-                        std::thread::sleep(Duration::from_millis(500));
-                    }
-                }
-            }
+            handback::release(&bus, orig_mode, flag_snap.take(), 5);
         }
         // Trim: neutralise our override so stock resumes immediately; the 300 s override
         // watchdog is the backstop if this final write doesn't land.
@@ -754,6 +801,45 @@ fn main() {
         Stage::Shadow => {}
     }
     eprintln!("stopped.");
+}
+
+/// The inverter pair's advertised nominal power, if published and plausible.
+fn read_inverter_nominal(bus: &dyn Bus) -> Option<f64> {
+    bus.get_f64(VEBUS, P_NOMINAL_INVERTER)
+        .filter(|v| v.is_finite() && *v > 0.0)
+}
+
+/// The inverters' nominal power, retried every 10 s until vebus publishes it (it can
+/// register after we start), then kept: it does not change at runtime.
+#[derive(Default)]
+struct NominalPower {
+    known: Option<f64>,
+    next_try: Option<Instant>,
+}
+
+impl NominalPower {
+    /// Returns the value the first time it becomes known.
+    fn refresh(&mut self, bus: &dyn Bus, now: Instant) -> Option<f64> {
+        if self.known.is_some() || self.next_try.is_some_and(|due| now < due) {
+            return None;
+        }
+        self.next_try = Some(now + Duration::from_secs(10));
+        let w = read_inverter_nominal(bus)?;
+        self.known = Some(w);
+        eprintln!("inverter nominal: {w:.0} W");
+        Some(w)
+    }
+}
+
+/// Replace a lost bus connection; retried on later ticks while the bus is down.
+fn reconnect(bus: &mut SystemBus) {
+    match SystemBus::connect() {
+        Ok(b) => {
+            *bus = b;
+            eprintln!("bus connection re-established");
+        }
+        Err(e) => eprintln!("bus reconnect failed: {e}"),
+    }
 }
 
 fn pick_limit(arg: f64, setting: Option<f64>, default: f64) -> f64 {
@@ -773,5 +859,32 @@ fn sleep_or_break(interval: f64) {
         let slice = left.min(0.1);
         std::thread::sleep(Duration::from_secs_f64(slice));
         left -= slice;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testbus::MockBus;
+
+    #[test]
+    fn nominal_power_is_retried_until_published_then_kept() {
+        let t0 = Instant::now();
+        let mut bus = MockBus::new();
+        let mut n = NominalPower::default();
+        assert_eq!(n.refresh(&bus, t0), None, "not published yet");
+        bus.set(VEBUS, P_NOMINAL_INVERTER, 9000.0);
+        assert_eq!(n.refresh(&bus, t0 + Duration::from_secs(5)), None, "not due yet");
+        assert_eq!(n.refresh(&bus, t0 + Duration::from_secs(10)), Some(9000.0));
+        bus.clear(VEBUS, P_NOMINAL_INVERTER); // a faulted or invalid read later on
+        assert_eq!(n.refresh(&bus, t0 + Duration::from_secs(100)), None, "kept");
+        assert_eq!(n.known, Some(9000.0));
+    }
+
+    #[test]
+    fn read_sensors_names_the_missing_input() {
+        let mut bus = MockBus::new();
+        bus.set(SYS, P_GRID, 10.0);
+        assert_eq!(read_sensors(&bus).err().as_deref(), Some("com.victronenergy.vebus.ttyS3/Ac/ActiveIn/L1/P"));
     }
 }

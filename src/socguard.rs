@@ -178,38 +178,24 @@ pub fn enact(inp: &Inputs) -> SocGuardOut {
     }
 }
 
-/// Resolve the active BMS service (mirrors `battery_limits::resolve_bms`): prefer
-/// `com.victronenergy.system /ActiveBmsService`, else the first battery service.
-fn resolve_bms(bus: &dyn Bus) -> Option<String> {
-    if let Some(s) = bus.get_str(SYS, P_ACTIVE_BMS) {
-        if !s.is_empty() {
-            return Some(s);
-        }
-    }
-    bus.list_services(BATTERY_PREFIX).into_iter().next()
-}
-
 /// SocGuard/BatteryLife enactor. Holds only the resolved BMS service name; the
 /// enactment itself is a near-pure function of the per-tick reads.
 pub struct SocGuard {
-    bms_service: Option<String>,
+    bms_service: crate::battery_limits::BmsService,
 }
 
 impl SocGuard {
     pub fn new(bus: &dyn Bus) -> Self {
-        let bms_service = resolve_bms(bus);
+        let bms_service = crate::battery_limits::BmsService::new(bus);
         eprintln!("socguard: bms={bms_service:?}");
         SocGuard { bms_service }
     }
 
     fn read(&mut self, bus: &dyn Bus) -> Inputs {
-        // Late-appearing BMS (GX boot race): keep trying to resolve until found.
-        if self.bms_service.is_none() {
-            self.bms_service = resolve_bms(bus);
-        }
+        self.bms_service.refresh(bus);
         let charge_request = self
             .bms_service
-            .as_deref()
+            .name()
             .and_then(|b| bus.get_bool(b, P_CHARGE_REQUEST))
             .unwrap_or(false);
 
