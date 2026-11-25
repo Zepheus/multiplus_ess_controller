@@ -1,19 +1,28 @@
 #!/bin/sh
 # venus-ess-guard: independent authoritative-mode watchdog.
-# INVARIANT: if our controller is not running, the stock daemon must be
-# authoritative. Hub4Mode=EXTERNAL(3) with no external controller process alive
-# means a crashed/stopped takeover left the persistent setting behind — restore 1
-# so stock resumes ESS. Runs supervised, independent of the main service.
+# INVARIANT: if our controller is not making progress, the stock daemon must be
+# authoritative. Hub4Mode=EXTERNAL(3) with no controller process alive, or with
+# the controller alive but its per-tick telemetry stale (a hang the controller
+# cannot detect itself), means nothing is steering the Multi: stop the controller
+# and restore 1 so stock resumes ESS. Runs supervised, independent of the main
+# service.
+TEL=/run/venus-ess.csv   # the controller appends a row after every completed tick
+STALE_S=30               # a healthy owning loop writes every ~1.1 s
 exec 2>&1
-echo "*** venus-ess-guard: watching Hub4Mode vs controller liveness ***"
+echo "*** venus-ess-guard: watching Hub4Mode vs controller progress ***"
 while true; do
-  sleep 60
+  sleep 10
   MODE=$(dbus -y com.victronenergy.settings /Settings/CGwacs/Hub4Mode GetValue 2>/dev/null)
-  if [ "$MODE" = "3" ]; then
-    ALIVE=$(ps | grep "[v]enus-ess/venus-ess-controller" | wc -l)
-    if [ "$ALIVE" = "0" ]; then
-      echo "Hub4Mode=EXTERNAL with controller dead -> restoring stock mode 1"
-      dbus -y com.victronenergy.settings /Settings/CGwacs/Hub4Mode SetValue 1
-    fi
+  [ "$MODE" = "3" ] || continue
+  PIDS=$(ps | grep "[v]enus-ess/venus-ess-controller" | awk '{print $1}')
+  if [ -z "$PIDS" ]; then
+    echo "Hub4Mode=EXTERNAL with controller dead -> restoring stock mode 1"
+  else
+    MTIME=$(stat -c %Y "$TEL" 2>/dev/null) || continue
+    AGE=$(( $(date +%s) - MTIME ))
+    [ "$AGE" -gt "$STALE_S" ] || continue
+    echo "Hub4Mode=EXTERNAL with controller stalled (telemetry ${AGE} s old) -> stopping it, restoring stock mode 1"
+    kill -9 $PIDS
   fi
+  dbus -y com.victronenergy.settings /Settings/CGwacs/Hub4Mode SetValue 1
 done
