@@ -165,8 +165,9 @@ impl GridMeterGuard {
         self
     }
 
-    /// The grid service currently adopted (if any) — diagnostics only.
-    #[cfg_attr(not(test), allow(dead_code))] // test-consumed API
+    /// The grid-meter service currently adopted (if any): the first in list order with a
+    /// finite power reading, re-checked at each presence refresh. The meter grid source
+    /// reads its power from here.
     pub fn meter_service(&self) -> Option<&str> {
         self.meter_service.as_deref()
     }

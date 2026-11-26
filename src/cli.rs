@@ -8,6 +8,12 @@ pub struct Args {
     pub stage: Stage,
     pub kind: Kind,
     pub interval: f64,
+    /// Tick on grid-meter publishes (failsafe timer behind them), or on the timer alone.
+    pub pacing: crate::pacing::Mode,
+    /// Grid reading (and, with event pacing, the publish the loop ticks on).
+    pub grid_source: crate::gridsource::GridSource,
+    /// Publish the status/alarm service (off with --no-status, e.g. for a second instance).
+    pub status: bool,
     pub min_soc: f64,
     pub max_discharge: f64,
     pub max_charge: f64,
@@ -18,6 +24,8 @@ pub struct Args {
     pub telemetry_max_mb: u64,
     /// Smith-style meter-lag compensation (default on; --no-smith to disable).
     pub smith: bool,
+    /// Smith lag setting in ticks (0..=2); unset: `default_smith_lag` for the source and pacing.
+    pub smith_lag: f64,
     pub trim_ki: f64,
     /// Error-magnitude pacing (see loop_core::DecideCfg::errgain_dead_w).
     /// Default OFF (deadband INFINITY); enable with --errgain-dead-w (300 is the
@@ -30,11 +38,29 @@ pub struct Args {
     pub sanity_band_w: Option<f64>,
 }
 
+/// Smith lag setting for a source and pacing. 2.0 is the setting validated live on the
+/// systemcalc copy with timer pacing, before systemcalc's tick was aligned to whole
+/// seconds; that copy was then on average ~0.5 s older than the meter's. Reading the meter
+/// itself is that much fresher, and ticking on its publish another ~0.5 s on average.
+pub fn default_smith_lag(source: crate::gridsource::GridSource, pacing: crate::pacing::Mode) -> f64 {
+    use crate::gridsource::GridSource::{Meter, System};
+    use crate::pacing::Mode::{Events, Timer};
+    match (source, pacing) {
+        (System, Timer) => 2.0,
+        (System, Events) => 2.0,
+        (Meter, Timer) => 1.5,
+        (Meter, Events) => 1.0,
+    }
+}
+
 pub fn parse_args() -> Result<Args, String> {
     let mut a = Args {
         stage: Stage::Shadow,
         kind: Kind::Pi { ki: 0.05, i_max: 300.0 },
         interval: 1.0,
+        pacing: crate::pacing::Mode::Timer,
+        grid_source: crate::gridsource::GridSource::Meter,
+        status: true,
         min_soc: 15.0,
         max_discharge: 0.0, // 0 => read from settings / default
         errgain_dead_w: f64::INFINITY,
@@ -47,6 +73,7 @@ pub fn parse_args() -> Result<Args, String> {
         telemetry: None,
         telemetry_max_mb: 4,
         smith: true,
+        smith_lag: f64::NAN, // resolved after parsing
         // Outer-integral gain for Stage-1 trim: override_delta = trim_ki * grid_error_W * dt_s.
         // Small + slow — it only trims steady-state bias on top of stock's fast inner loop.
         trim_ki: 0.02,
@@ -96,6 +123,24 @@ pub fn parse_args() -> Result<Args, String> {
                 ff_conf_scale = Some(val()?.parse().map_err(|_| "bad --ff-conf-scale-w")?)
             }
             "--interval" => a.interval = val()?.parse().map_err(|_| "bad --interval")?,
+            "--smith-lag" => {
+                a.smith_lag = val()?.parse().map_err(|_| "bad --smith-lag")?;
+                if !(0.0..=2.0).contains(&a.smith_lag) {
+                    return Err("--smith-lag must be within 0..=2".into());
+                }
+            }
+            "--no-status" => a.status = false,
+            "--grid-source" => {
+                a.grid_source = crate::gridsource::GridSource::parse(&val()?)
+                    .ok_or("--grid-source must be meter or systemcalc")?
+            }
+            "--pacing" => {
+                a.pacing = match val()?.as_str() {
+                    "events" => crate::pacing::Mode::Events,
+                    "timer" => crate::pacing::Mode::Timer,
+                    _ => return Err("--pacing must be events or timer".into()),
+                }
+            }
             "--min-soc" => a.min_soc = val()?.parse().map_err(|_| "bad --min-soc")?,
             "--max-discharge" => a.max_discharge = val()?.parse().map_err(|_| "bad")?,
             "--max-charge" => a.max_charge = val()?.parse().map_err(|_| "bad")?,
@@ -193,15 +238,27 @@ pub fn parse_args() -> Result<Args, String> {
         }
         o => return Err(format!("unknown controller {o}")),
     };
+    if a.smith_lag.is_nan() {
+        a.smith_lag = default_smith_lag(a.grid_source, a.pacing);
+    }
     Ok(a)
 }
 
 pub fn help() -> String {
     "\
 venus-ess-controller [--stage shadow|trim|takeover] [--controller stock|pi|true-integral|adaptive]
-  [--ki F] [--i-max F] [--trim-ki F] [--slew-w-per-s F] [--sanity-band-w F] [--interval S]
+  [--ki F] [--i-max F] [--trim-ki F] [--slew-w-per-s F] [--sanity-band-w F] [--interval S] [--grid-source meter|systemcalc] [--pacing events|timer] [--smith-lag 0..2] [--no-status]
   [--min-soc %] [--max-discharge W] [--max-charge W] [--seconds N] [--confirm] [--quiet]
   [--telemetry PATH]
+
+Grid reading and pacing: --grid-source meter (default) reads the grid-meter service directly;
+systemcalc reads its republished copy, one meter update (~1 s) older. --pacing timer (default)
+sleeps one interval after each tick; events ticks on that source's publish, with a failsafe
+timer 1.5 intervals after the previous tick. --smith-lag (0..2 ticks) sets the Smith
+correction; it cancels our own drive changes exactly at the reading's real lag. Default
+per source and pacing: systemcalc+timer 2.0 (the setting validated before the source
+choice existed), meter+timer 1.5, systemcalc+events 2.0, meter+events 1.0. --no-status skips the status/alarm service
+(com.victronenergy.essctl.controller); use it for a second, diagnostic instance.
 
 adaptive: PI + a continuously-learned feed-forward leak(throughput) ~= a + b*|reported|
   (RLS, in-memory, no persistence). The model is taught by the integral and earns actuation

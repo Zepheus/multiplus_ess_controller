@@ -61,12 +61,15 @@ mod dess;
 mod feedin;
 mod generator;
 mod gridmeter;
+mod gridsource;
 mod handback;
 mod health;
 mod loop_core;
+mod pacing;
 mod pv;
 mod shore;
 mod socguard;
+mod status;
 mod states;
 mod telemetry;
 mod cli;
@@ -140,13 +143,16 @@ impl Stage {
 }
 
 
+use gridsource::GridSource;
 use loop_core::Sensors;
 
-/// The core inputs, or the first one that could not be read.
-fn read_sensors(bus: &dyn Bus) -> Result<Sensors, String> {
+/// The core inputs, or the first one that could not be read. `meter` is the grid-meter
+/// guard's adopted service (see `gridsource` for what each source reads).
+fn read_sensors(bus: &dyn Bus, source: GridSource, meter: Option<&str>) -> Result<Sensors, String> {
     let need = |svc: &str, path: &str| bus.get_f64(svc, path).ok_or_else(|| format!("{svc}{path}"));
+    let grid = gridsource::read(bus, source, meter)?;
     Ok(Sensors {
-        grid: need(SYS, P_GRID)?,
+        grid,
         reported: need(VEBUS, P_ACTIVEIN)?,
         target: need(SETTINGS, P_SETPOINT_SETTING)?,
         soc: need(SYS, P_SOC)?,
@@ -164,6 +170,10 @@ struct Subsystems {
     feedin: feedin::FeedIn,
     generator: generator::Generator,
     gridmeter: gridmeter::GridMeterGuard,
+    /// Where the grid reading comes from (the guard's adopted meter, or systemcalc).
+    grid_source: GridSource,
+    /// The service the grid was last read from, to log every change of it.
+    grid_read_from: String,
     shore: shore::ShoreLimiter,
     pv: pv::PvLimiter,
     socguard: socguard::SocGuard,
@@ -193,7 +203,13 @@ fn sample(
     // The takeover stage IS the legitimate mode-3 (external-control) owner: the
     // grid-meter guard must not treat our own mode write as "someone else owns it".
     let mode3_is_ours = matches!(stage, Stage::Takeover);
-    let s = read_sensors(bus)?;
+    let meter = sub.gridmeter.meter_service();
+    let (from, _) = sub.grid_source.read_path(meter);
+    if from != sub.grid_read_from {
+        eprintln!("grid reading from {from}");
+        sub.grid_read_from = from.to_string();
+    }
+    let s = read_sensors(bus, sub.grid_source, meter)?;
 
     // LIVE ownership floor: the UI/VRM/API-controlled MinimumSocLimit (raised by the user's
     // dispatch automation), read every tick. --min-soc is only the fallback if the read fails.
@@ -291,6 +307,8 @@ struct Writes {
     failed: bool,
     /// The feed-in flag plan of this tick was sent in full.
     flags_sent: bool,
+    /// A setpoint reached the Multi this tick.
+    setpoint_sent: bool,
 }
 
 /// The WRITE phase: the single place every actuation happens. Write-phase safety checks
@@ -315,9 +333,12 @@ fn actuate(
         // Skip the setpoint when this tick's mode flip failed: stock is still in its
         // own mode and writing — never race it with a second writer, even for one tick.
         loop_core::Write::Setpoint(v) if mode_ok && v.is_finite() => {
-            if let Err(e) = bus.set_f64(VEBUS, P_HUB4_SETPOINT, v) {
-                eprintln!("setpoint write failed: {e}");
-                out.failed = true;
+            match bus.set_f64(VEBUS, P_HUB4_SETPOINT, v) {
+                Ok(()) => out.setpoint_sent = true,
+                Err(e) => {
+                    eprintln!("setpoint write failed: {e}");
+                    out.failed = true;
+                }
             }
         }
         loop_core::Write::Setpoint(v) => {
@@ -453,6 +474,8 @@ fn main() {
     let mut gridmeter = gridmeter::GridMeterGuard::new();
     let gm0 = gridmeter.tick(&bus, matches!(args.stage, Stage::Takeover)); // seed the presence cache
     let mut sub = Subsystems {
+        grid_source: args.grid_source,
+        grid_read_from: String::new(),
         broker: battery_limits::BatteryBroker::new(&bus),
         dess: dess::Dess::new(&bus),
         feedin: feedin::FeedIn::new(&bus),
@@ -526,6 +549,7 @@ fn main() {
         errgain_cap: args.errgain_cap,
         inverter_nominal_w,
         smith: args.smith,
+        smith_lag: args.smith_lag,
     };
     // Edge-triggered safety logging state (only log a trip when it newly fires).
     let mut last_safety = loop_core::Safety::default();
@@ -572,6 +596,34 @@ fn main() {
 
     let mut health = health::Health::default();
     let takeover = matches!(args.stage, Stage::Takeover);
+    let stage_code = match args.stage {
+        Stage::Shadow => 0,
+        Stage::Trim => 1,
+        Stage::Takeover => 2,
+    };
+    let status = std::sync::Arc::new(std::sync::Mutex::new(status::Status::new(
+        start,
+        stage_code,
+        args.grid_source,
+        args.pacing == pacing::Mode::Events,
+    )));
+    if args.status {
+        status::spawn(status.clone());
+    }
+    let mut pacer = pacing::Pacer::new(args.interval, args.pacing, args.grid_source);
+    match args.pacing {
+        pacing::Mode::Timer => eprintln!(
+            "grid source: {:?}; pacing: timer ({:.1} s after each tick); smith lag {:.2}",
+            args.grid_source, args.interval, args.smith_lag
+        ),
+        pacing::Mode::Events => eprintln!(
+            "grid source: {:?}; pacing: on its publishes (failsafe {:.1} s after the previous tick, publishes within {:.1} s of the previous one coalesced); smith lag {:.2}",
+            args.grid_source,
+            args.interval * pacing::FALLBACK_FACTOR,
+            args.interval * pacing::MIN_SPACING_FACTOR,
+            args.smith_lag
+        ),
+    }
 
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
@@ -602,7 +654,7 @@ fn main() {
                 reconnect(&mut bus);
             }
             sub.feedin.forget_written();
-            sleep_or_break(args.interval);
+            pace(&mut pacer, &status, &st, now, None);
             continue;
         }
         if let Err(why) = health.check_read(now, sampled.as_ref().err().map(String::as_str), st.owner_us) {
@@ -613,7 +665,7 @@ fn main() {
             Err(missing) => {
                 println!("{t:6.0} {:>8} read-fail ({missing}): skipping tick (no write)", "");
                 sub.feedin.forget_written();
-                sleep_or_break(args.interval);
+                pace(&mut pacer, &status, &st, now, None);
                 continue;
             }
         };
@@ -622,6 +674,7 @@ fn main() {
         let dec = loop_core::decide(&snap, &mut st, &cfg, t);
 
         // --- actuate: the single write phase (writing stages only) --------------
+        let mut wrote_setpoint = false;
         if args.stage.writes() {
             // Capture stock's feed-in flags BEFORE our first write of them (take-over
             // tick); put them back the moment we hand back.
@@ -641,10 +694,11 @@ fn main() {
             if let Err(why) = ready {
                 handback::on_failure(&bus, &mut st, &mut flag_snap, orig_mode, takeover, t, &why);
                 sub.feedin.forget_written();
-                sleep_or_break(args.interval);
+                pace(&mut pacer, &status, &st, now, None);
                 continue;
             }
             let writes = actuate(&bus, &sub, &snap, &dec, &mut st);
+            wrote_setpoint = writes.setpoint_sent;
             // The flag cache must only remember what reached the Multi.
             if !writes.flags_sent {
                 sub.feedin.forget_written();
@@ -779,7 +833,7 @@ fn main() {
         if args.seconds != 0 && t >= args.seconds as f64 {
             break;
         }
-        sleep_or_break(args.interval);
+        pace(&mut pacer, &status, &st, now, Some((snap.s.grid, wrote_setpoint)));
     }
 
     // --- clean shutdown: hand the system back to stock -------------------------
@@ -801,6 +855,32 @@ fn main() {
         Stage::Shadow => {}
     }
     eprintln!("stopped.");
+}
+
+/// Report this iteration to the status service, then wait for the next tick. `tick`: the
+/// grid reading and whether a setpoint write reached the Multi, when the tick read every
+/// core input.
+fn pace(
+    pacer: &mut pacing::Pacer,
+    status: &status::Shared,
+    st: &loop_core::LoopState,
+    tick_start: Instant,
+    tick: Option<(f64, bool)>,
+) {
+    {
+        let mut s = status::lock(status);
+        let now = Instant::now();
+        s.ticks = s.ticks.wrapping_add(1);
+        s.loop_alive = Some(now);
+        if let Some((grid, wrote)) = tick {
+            s.good_tick(now, grid, wrote);
+        }
+        s.owner_us = st.owner_us;
+        s.ceded_external = st.ceded_external;
+        s.sanity_trips = st.sanity_trips;
+    }
+    let wake = pacer.wait(tick_start, &SHUTDOWN);
+    status::lock(status).on_events = wake == pacing::Wake::Event;
 }
 
 /// The inverter pair's advertised nominal power, if published and plausible.
@@ -852,15 +932,6 @@ fn pick_limit(arg: f64, setting: Option<f64>, default: f64) -> f64 {
     }
 }
 
-fn sleep_or_break(interval: f64) {
-    // Sleep in small slices so a signal is noticed within ~100 ms.
-    let mut left = interval;
-    while left > 0.0 && !SHUTDOWN.load(Ordering::SeqCst) {
-        let slice = left.min(0.1);
-        std::thread::sleep(Duration::from_secs_f64(slice));
-        left -= slice;
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -885,6 +956,28 @@ mod tests {
     fn read_sensors_names_the_missing_input() {
         let mut bus = MockBus::new();
         bus.set(SYS, P_GRID, 10.0);
-        assert_eq!(read_sensors(&bus).err().as_deref(), Some("com.victronenergy.vebus.ttyS3/Ac/ActiveIn/L1/P"));
+        assert_eq!(read_sensors(&bus, GridSource::Meter, None).err().as_deref(), Some("com.victronenergy.vebus.ttyS3/Ac/ActiveIn/L1/P"));
+    }
+
+    #[test]
+    fn grid_comes_from_the_adopted_meter_not_systemcalc() {
+        const METER: &str = "com.victronenergy.grid.cgwacs_ttyUSB0_mb1";
+        let mut bus = MockBus::new();
+        bus.set(SYS, P_GRID, 900.0); // systemcalc's copy, one meter update behind
+        bus.set(METER, P_METER_L1_POWER, 120.0);
+        bus.set(VEBUS, P_ACTIVEIN, -500.0);
+        bus.set(SETTINGS, P_SETPOINT_SETTING, 5.0);
+        bus.set(SYS, P_SOC, 60.0);
+        assert_eq!(read_sensors(&bus, GridSource::Meter, Some(METER)).unwrap().grid, 120.0);
+        assert_eq!(read_sensors(&bus, GridSource::Meter, None).unwrap().grid, 900.0, "before a meter is adopted");
+        assert_eq!(read_sensors(&bus, GridSource::System, Some(METER)).unwrap().grid, 900.0, "--grid-source systemcalc");
+
+        let mut gone = MockBus::new();
+        gone.set(SYS, P_GRID, 900.0);
+        assert_eq!(
+            read_sensors(&gone, GridSource::Meter, Some(METER)).err().as_deref(),
+            Some("com.victronenergy.grid.cgwacs_ttyUSB0_mb1/Ac/L1/Power"),
+            "a failing meter read is a read failure, not a switch to systemcalc's older copy"
+        );
     }
 }

@@ -395,6 +395,10 @@ pub struct DecideCfg {
     /// stock on export (-11%), import (-30%) AND export duration (-15%);
     /// without it, slow pacing alone exported MORE than stock.
     pub smith: bool,
+    /// How many ticks the grid reading trails the drive model (0..=2, fractions blend
+    /// neighbouring ticks). The correction cancels our own drive changes exactly when
+    /// this equals the reading's real lag.
+    pub smith_lag: f64,
 }
 
 /// What `actuate()` should write this tick.
@@ -518,6 +522,17 @@ pub fn composed_command(
 
 /// The pure per-tick decision. `t` is seconds-since-start (used only for the dwell timer, so
 /// the function stays free of `Instant` and is fully deterministic in tests).
+/// The drive model as the grid reading saw it, `lag` ticks back (0..=2): `w0` is this
+/// tick's model, `w1` and `w2` the two before it.
+pub fn smith_lagged(w0: f64, w1: f64, w2: f64, lag: f64) -> f64 {
+    let lag = lag.clamp(0.0, 2.0);
+    if lag <= 1.0 {
+        (1.0 - lag) * w0 + lag * w1
+    } else {
+        (2.0 - lag) * w1 + (lag - 1.0) * w2
+    }
+}
+
 pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> Decision {
     let s = snap.s;
 
@@ -690,10 +705,10 @@ pub fn decide(snap: &Snapshot, st: &mut LoopState, cfg: &DecideCfg, t: f64) -> D
             st.smith_weff_lag = w0;
             st.smith_prev_write = st.last_out.unwrap_or(w0);
         }
-        let lagged = st.smith_weff_lag;
-        st.smith_weff_lag = st.smith_weff; // METER_LAG_S == 1 tick history
+        let (w1, w2) = (st.smith_weff, st.smith_weff_lag); // drive model 1 and 2 ticks back
+        st.smith_weff_lag = st.smith_weff;
         st.smith_weff += plant::ALPHA * (st.smith_prev_write - st.smith_weff);
-        plant::B * (st.smith_weff - lagged)
+        plant::B * (st.smith_weff - smith_lagged(st.smith_weff, w1, w2, cfg.smith_lag))
     } else {
         st.smith_weff = f64::NAN;
         0.0
@@ -913,6 +928,7 @@ pub mod testutil {
             inverter_nominal_w: f64::INFINITY, // captured pre-feature: conditional pacing off
             // Captures predate the Smith compensation - replay without it.
             smith: false,
+            smith_lag: 2.0,
         }
     }
 }

@@ -84,6 +84,7 @@ let c = DecideCfg {
     inverter_nominal_w: f64::INFINITY,
     // Captures predate the Smith compensation - replay without it.
     smith: false,
+    smith_lag: 2.0,
 };
 let mut st = state(Kind::Stock);
 st.owner_us = true; // had owned for hours before the dispatch
@@ -210,6 +211,7 @@ let c = DecideCfg {
     errgain_cap: 1.0,
     inverter_nominal_w: f64::INFINITY,
     smith: false,
+    smith_lag: 2.0,
 };
 let mut st = state(Kind::Stock);
 st.owner_us = true;
@@ -336,6 +338,7 @@ let c = DecideCfg {
     inverter_nominal_w: f64::INFINITY,
     // Captures predate the Smith compensation - replay without it.
     smith: false,
+    smith_lag: 2.0,
 };
 let mut st = state(Kind::Stock);
 st.owner_us = true;
@@ -495,6 +498,7 @@ let c = DecideCfg {
     errgain_cap: 1.0,
     inverter_nominal_w: f64::INFINITY,
     smith: true, // live config: Smith on
+    smith_lag: 2.0,
 };
 // Live controller: frozen FF at the identified leak curve, ki 0.02.
 let mut acfg = crate::control::AdaptiveCfg::tuned();
@@ -561,6 +565,13 @@ assert!(worst <= 2.0, "window-exit replay drifted from the live capture: worst {
 /// Smith) over a synthetic load on the identified plant. Returns the grid
 /// trace and whether the cycling regime ever engaged.
 fn sim_decide_plant(load: &[f64], errgain: bool) -> (Vec<f64>, bool) {
+    sim_plant(load, errgain, Some(2.0), crate::loop_core::plant::METER_LAG_S as f64)
+}
+
+/// The identified plant under the full `decide()` path. `meter_lag`: how many ticks the
+/// grid reading trails the plant (fractions blend neighbouring ticks). `smith`: the Smith
+/// lag setting, or `None` for no Smith correction.
+fn sim_plant(load: &[f64], errgain: bool, smith: Option<f64>, meter_lag: f64) -> (Vec<f64>, bool) {
     use crate::loop_core::plant;
     let sl = SafetyLimits::derive(7030.0, 1.0, None, None);
     let c = DecideCfg {
@@ -578,7 +589,8 @@ fn sim_decide_plant(load: &[f64], errgain: bool) -> (Vec<f64>, bool) {
         errgain_slope_w: 2000.0,
         errgain_cap: 1.0,
         inverter_nominal_w: f64::INFINITY,
-        smith: true,
+        smith: smith.is_some(),
+        smith_lag: smith.unwrap_or(2.0),
     };
     let mut st = state(Kind::Pi { ki: 0.02, i_max: 300.0 });
     st.owner_us = true;
@@ -592,8 +604,11 @@ fn sim_decide_plant(load: &[f64], errgain: bool) -> (Vec<f64>, bool) {
         let rep = plant::A + plant::B * weff;
         let grid_true = ld + rep;
         grid_ring.push(grid_true);
-        let lag = plant::METER_LAG_S;
-        let gm = if grid_ring.len() > lag { grid_ring[grid_ring.len() - 1 - lag] } else { grid_true };
+        let n = grid_ring.len();
+        let whole = meter_lag.floor() as usize;
+        let frac = meter_lag - whole as f64;
+        let back = |j: usize| if n > j { grid_ring[n - 1 - j] } else { grid_true };
+        let gm = (1.0 - frac) * back(whole) + frac * back(whole + 1);
         let sg = socguard::enact(&socguard::Inputs {
             bl_state: bl::SOCG_DEFAULT,
             min_soc: 10.0,
@@ -631,6 +646,67 @@ fn sim_decide_plant(load: &[f64], errgain: bool) -> (Vec<f64>, bool) {
         trace.push(grid_true);
     }
     (trace, saw_cycling)
+}
+
+/// Load pattern for the Smith-lag tests: slow 2.2 kW on/off cycles, then a 1 kW staircase.
+fn smith_test_load() -> Vec<f64> {
+    let mut load = vec![300.0; 60];
+    for c in 0..40 {
+        let on = if c % 2 == 0 { 2500.0 } else { 300.0 };
+        load.extend(std::iter::repeat_n(on, 37));
+    }
+    for c in 0..40 {
+        load.extend(std::iter::repeat_n(300.0 + 1000.0 * ((c % 4) as f64), 23));
+    }
+    load
+}
+
+/// Total variation of the true grid after warm-up: how much the loop moves the grid.
+fn total_variation(trace: &[f64]) -> f64 {
+    trace[60..].windows(2).map(|w| (w[1] - w[0]).abs()).sum()
+}
+
+/// Smith's contract: with the setting equal to the reading's real lag, the correction
+/// removes our own drive changes from the reading exactly, so the loop behaves as if the
+/// meter had no lag at all. With the setting off by a tick it does not.
+#[test]
+fn smith_cancels_the_lag_it_is_set_to() {
+    let load = smith_test_load();
+    let (ideal, _) = sim_plant(&load, false, None, 0.0);
+    let ideal_tv = total_variation(&ideal);
+    for lag in [0.0, 0.5, 1.0, 1.5, 2.0] {
+        let (tr, _) = sim_plant(&load, false, Some(lag), lag);
+        let tv = total_variation(&tr);
+        assert!((tv - ideal_tv).abs() / ideal_tv < 1e-3, "lag {lag}: {tv:.0} vs lag-free {ideal_tv:.0}");
+    }
+    let export = |tr: &[f64]| -> f64 { tr[60..].iter().filter(|g| **g < 0.0).map(|g| -g / 3600.0).sum() };
+    let (matched, _) = sim_plant(&load, false, Some(1.0), 1.0);
+    let (too_high, _) = sim_plant(&load, false, Some(2.0), 1.0);
+    assert!(
+        export(&too_high) > export(&matched) * 1.1,
+        "a setting a tick too high over-corrects: {:.1} vs {:.1} Wh",
+        export(&too_high),
+        export(&matched)
+    );
+}
+
+/// Identification table: export and time below -300 W for each (real lag, setting).
+/// `cargo test smith_lag_table -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn smith_lag_table() {
+    let load = smith_test_load();
+    for lag in [0.5, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5] {
+        let mut line = format!("real lag {lag:4.2} |");
+        for set in [None, Some(0.5), Some(1.0), Some(1.25), Some(1.5), Some(1.75), Some(2.0)] {
+            let (tr, _) = sim_plant(&load, false, set, lag);
+            let exp: f64 = tr[60..].iter().filter(|g| **g < 0.0).map(|g| -g / 3600.0).sum();
+            let dur = tr[60..].iter().filter(|g| **g < -300.0).count();
+            let label = set.map_or("off".to_string(), |v| format!("{v:.2}"));
+            line += &format!(" {label}: {exp:5.1}Wh/{dur:4}s |");
+        }
+        println!("{line}");
+    }
 }
 
 /// Err-gain regime behavior on the identified plant: (a) a modulating (hob-like)
@@ -747,6 +823,7 @@ let c = DecideCfg {
     errgain_cap: 1.0,
     inverter_nominal_w: f64::INFINITY,
     smith: true,
+    smith_lag: 2.0,
 };
 let mut acfg = crate::control::AdaptiveCfg::tuned();
 acfg.mode = crate::control::FfMode::Frozen;
@@ -855,6 +932,7 @@ let c = DecideCfg {
     inverter_nominal_w: f64::INFINITY,
     // Captures predate the Smith compensation - replay without it.
     smith: false,
+    smith_lag: 2.0,
 };
 let mut st = state(Kind::Stock);
 st.owner_us = true;

@@ -127,7 +127,7 @@ pub const P_STATUSCODE: &str = "/StatusCode";
 /// BMS charge request (int → bool).
 pub const P_CHARGE_REQUEST: &str = "/Info/ChargeRequest";
 
-const IFACE: &str = "com.victronenergy.BusItem";
+pub const IFACE: &str = "com.victronenergy.BusItem";
 
 pub trait Bus {
     fn get_f64(&self, service: &str, path: &str) -> Option<f64>;
